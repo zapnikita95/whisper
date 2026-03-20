@@ -3,11 +3,28 @@ cd "$(dirname "$0")"
 
 TAILSCALE_IP="100.115.68.2"
 
-# Читаем порт из server_port.txt (туда пишет start-server.bat)
+# Пробуем найти рабочий порт: сначала из файла, потом перебор 8000-8010
+PORT=""
 if [ -f "server_port.txt" ]; then
     PORT=$(tr -d '[:space:]' < server_port.txt)
-else
-    PORT="8000"
+fi
+
+# Если файла нет или порт не работает - пробуем найти рабочий
+if [ -z "$PORT" ] || ! curl -s --connect-timeout 2 "http://${TAILSCALE_IP}:${PORT}/" > /dev/null 2>&1; then
+    echo "Поиск сервера на портах 8000-8010..."
+    for p in {8000..8010}; do
+        if curl -s --connect-timeout 2 "http://${TAILSCALE_IP}:${p}/" > /dev/null 2>&1; then
+            PORT=$p
+            echo "Найден сервер на порту $PORT"
+            break
+        fi
+    done
+    if [ -z "$PORT" ]; then
+        echo "ОШИБКА: Сервер не найден на портах 8000-8010"
+        echo "Убедись, что start-server.bat запущен на Windows"
+        read -p "Нажми Enter для выхода..."
+        exit 1
+    fi
 fi
 
 SERVER_URL="http://${TAILSCALE_IP}:${PORT}"
