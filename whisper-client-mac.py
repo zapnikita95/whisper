@@ -65,10 +65,11 @@ class WhisperClientMac:
 
     def _start_recording(self) -> None:
         with self._lock:
-            if self._recording or self._busy:
-                if self._busy:
-                    print("[Client] Обработка предыдущей записи, пропуск.", flush=True)
+            # Если уже идёт запись - не начинаем новую
+            if self._recording:
                 return
+            # Если обработка идёт - всё равно разрешаем новую запись (как на Windows)
+            # Старая обработка продолжит в фоне, но результат может быть проигнорирован
             self._recording = True
         self._stop_record.clear()
         self._audio_chunks.clear()
