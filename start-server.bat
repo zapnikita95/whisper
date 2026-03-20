@@ -7,7 +7,7 @@ echo ║   Whisper GPU Server — для Mac клиента   ║
 echo ╚══════════════════════════════════════════╝
 echo.
 
-REM Запрос прав администратора (нужен для открытия порта в брандмауэре)
+REM Запрос прав администратора
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Запрос прав администратора...
@@ -18,30 +18,35 @@ if %errorlevel% neq 0 (
 set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
 if not exist "%PY%" (
     echo [ОШИБКА] Не найден Python: %PY%
-    echo Установи venv согласно README.
     pause
     exit /b 1
 )
 
-REM Открываем порт 8000 в брандмауэре (если правило ещё не создано)
-netsh advfirewall firewall show rule name="Whisper Server 8000" >nul 2>&1
+REM Находим свободный порт начиная с 8000
+for /f %%p in ('powershell -NoProfile -Command "$port=8000; while((Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue)) { $port++ }; $port"') do set "PORT=%%p"
+
+REM Открываем найденный порт в брандмауэре
+netsh advfirewall firewall show rule name="Whisper Server %PORT%" >nul 2>&1
 if %errorlevel% neq 0 (
-    echo Открываю порт 8000 в брандмауэре...
-    netsh advfirewall firewall add rule name="Whisper Server 8000" dir=in action=allow protocol=TCP localport=8000 >nul
-    echo Порт 8000 открыт.
-) else (
-    echo Порт 8000 уже открыт.
+    netsh advfirewall firewall add rule name="Whisper Server %PORT%" dir=in action=allow protocol=TCP localport=%PORT% >nul
 )
 
+REM Сохраняем порт в файл, чтобы client-mac.command мог его прочитать
+echo %PORT% > "%~dp0server_port.txt"
+
+echo ┌─────────────────────────────────────────┐
+echo │  Подключись с Мака:                     │
+echo │                                         │
+echo │  python3 whisper-client-mac.py \        │
+echo │    --server http://100.115.68.2:%PORT%       │
+echo │                                         │
+echo │  ИЛИ просто запусти start-client-mac.command│
+echo └─────────────────────────────────────────┘
 echo.
-echo Сервер доступен с Мака по адресу:
-echo   http://100.115.68.2:8000
-echo.
-echo Запуск сервера... (модель загрузится при первом запросе)
 echo Для остановки: Ctrl+C
 echo.
 
-"%PY%" "%~dp0whisper-server.py" --host 0.0.0.0 --port 8000
+"%PY%" "%~dp0whisper-server.py" --host 0.0.0.0 --port %PORT%
 
 echo.
 pause
