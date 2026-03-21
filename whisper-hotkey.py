@@ -10,6 +10,8 @@ from __future__ import annotations
 
 
 
+import ctypes
+
 import os
 
 import re
@@ -202,6 +204,21 @@ def _filter_hallucinations(text: str) -> str:
     return text
 
 
+def _win32_paste_once() -> None:
+    """Один Ctrl+V через user32.keybd_event — без дублей от библиотеки keyboard."""
+    VK_CONTROL = 0x11
+    VK_V = 0x56
+    KEYEVENTF_KEYUP = 0x0002
+    u = ctypes.windll.user32
+    u.keybd_event(VK_CONTROL, 0, 0, 0)
+    time.sleep(0.02)
+    u.keybd_event(VK_V, 0, 0, 0)
+    time.sleep(0.02)
+    u.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.02)
+    u.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
 class WhisperHotkey:
 
     def __init__(
@@ -261,6 +278,8 @@ class WhisperHotkey:
         self._audio_chunks: list[bytes] = []
 
         self._chunk_lock = threading.Lock()
+
+        self._insert_lock = threading.Lock()
 
 
 
@@ -663,33 +682,36 @@ class WhisperHotkey:
 
             return
 
-        # Логируем полный текст перед вставкой
-        print(f"[Whisper] Вставляю текст ({len(text)} символов): {text}", flush=True)
+        with self._insert_lock:
 
-        # Копируем в буфер обмена
-        pyperclip.copy(text)
+            print(f"[Whisper] Вставляю текст ({len(text)} символов): {text}", flush=True)
 
-        try:
-            # Принудительно отпускаем все модификаторы перед вставкой.
-            # Иначе keyboard.write при зажатом Ctrl/Win превратит каждый символ
-            # в шорткат — и некоторые приложения напечатают текст дважды.
-            for mod in ("ctrl", "left windows", "right windows", "windows", "shift", "alt"):
-                try:
-                    keyboard.release(mod)
-                except Exception:
-                    pass
+            pyperclip.copy(text)
 
-            time.sleep(0.15)  # ждём, пока приложение обработало отпускание
+            time.sleep(0.25)  # буфер обмена должен успеть обновиться
 
-            # Вставляем через буфер обмена — это атомарно (один Ctrl+V, один вставленный блок)
-            keyboard.press_and_release("ctrl+v")
-            time.sleep(0.05)
+            try:
 
-            print("[Whisper] Текст вставлен.", flush=True)
+                for mod in ("ctrl", "left windows", "right windows", "windows", "shift", "alt"):
+                    try:
+                        keyboard.release(mod)
+                    except Exception:
+                        pass
 
-        except Exception as e:
-            print(f"[Whisper] Вставка не удалась, текст в буфере обмена.", flush=True)
-            print("[Whisper] Нажми Ctrl+V вручную.", flush=True)
+                time.sleep(0.12)
+
+                if sys.platform == "win32":
+                    _win32_paste_once()
+                else:
+                    keyboard.press_and_release("ctrl+v")
+
+                time.sleep(0.05)
+
+                print("[Whisper] Текст вставлен.", flush=True)
+
+            except Exception:
+                print("[Whisper] Вставка не удалась, текст в буфере обмена.", flush=True)
+                print("[Whisper] Нажми Ctrl+V вручную.", flush=True)
 
 
 
