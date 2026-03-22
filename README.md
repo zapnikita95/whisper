@@ -239,10 +239,48 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 ### Упаковка: exe без консоли (Windows)
 
+#### С нуля: окружение и сборка (копируй в PowerShell)
+
+Нужны **Python 3.10+** (в PATH) и **NVIDIA + драйвер** для GPU. Виртуальное окружение лучше держать **вне OneDrive** (иначе pip часто ломается на блокировках файлов).
+
+```powershell
+# 1) Путь к клону репозитория (подставь свой, если другой)
+$Repo = "$env:USERPROFILE\OneDrive\Desktop\whisper"
+
+# 2) Каталог для venv (не в OneDrive)
+$VenvDir = "$env:USERPROFILE\.venvs\faster-whisper"
+$Py    = "$VenvDir\Scripts\python.exe"
+$Pip   = "$VenvDir\Scripts\pip.exe"
+
+# 3) Создать venv и обновить pip
+New-Item -ItemType Directory -Force -Path (Split-Path $VenvDir) | Out-Null
+python -m venv $VenvDir
+& $Pip install -U pip
+
+# 4) Зависимости проекта (из корня репо)
+Set-Location $Repo
+& $Pip install -r .\requirements.txt
+
+# 5) PyInstaller (только для сборки exe)
+& $Pip install pyinstaller
+
+# 6) Сборка GUI-сервера (батник сам вызовет PyInstaller из этого venv)
+.\packaging\build-server-gui-exe.bat
+```
+
+После успешной сборки:
+
+- Запускай **`dist\WhisperServer\WhisperServer.exe`**.
+- Рядом обязательно лежит папка **`_internal`** — копируй/переноси **всю** папку `dist\WhisperServer`, а не один файл.
+
+Повторные сборки: шаги 4–6 (или только 6, если зависимости не менялись).
+
+#### Коротко по шагам
+
 1. В том же venv, где стоят `fastapi`, `faster-whisper`, `uvicorn`: `pip install pyinstaller`.
-2. В репозитории должен быть `assets\app_icon.ico` (собирается на Mac: `packaging/regenerate_icons.sh` или кладётся вручную).
-3. Запусти `packaging\build-server-gui-exe.bat` — получишь **onedir** `dist\WhisperServer\WhisperServer.exe` с иконкой (рядом папка `_internal`; не переноси только один exe). Первый запуск может быть долгим из‑за CTranslate2 и загрузки модели.
-4. Запуск **двойным кликом по WhisperServer.exe** — окно с портом и списком HTTP‑клиентов; `server_port.txt` создаётся в той же папке, что и exe. Для автозагрузки — ярлык на этот exe.
+2. В репозитории желательно есть `assets\app_icon.ico` (собирается на Mac: `packaging/regenerate_icons.sh` или кладётся вручную); без иконки сборка всё равно пройдёт, если в батнике нет файла.
+3. Запусти `packaging\build-server-gui-exe.bat` — получишь **onedir** `dist\WhisperServer\WhisperServer.exe` (рядом папка `_internal`). Первый запуск exe может быть долгим из‑за CTranslate2 и загрузки модели.
+4. Запуск **двойным кликом по WhisperServer.exe** — окно с выбором модели, портом и списком HTTP‑клиентов; `server_port.txt` создаётся в той же папке, что и exe. Для автозагрузки — ярлык на этот exe.
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 
