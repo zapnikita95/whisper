@@ -56,4 +56,18 @@ else
 	URL="http://100.115.68.2:8000"
 fi
 
-exec "$PY" "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt "$@"
+# Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения (например после open из Терминала со старым export).
+# Свой вариант: поменяй строку ниже (формат как в README: shift+ctrl+grave, alt+ctrl, …).
+export WHISPER_MAC_HOTKEY="shift+ctrl+grave"
+
+# Finder / Launch Services передаёт в .app аргумент -psn_0_… — argparse в Python падает и процесс мгновенно выходит (иконка в Dock «прыгает»).
+# Собираем argv в массив: при set -u пустой EXTRA[@] в exec ломает bash («unbound variable»).
+CMD=( "$PY" "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt )
+for a in "$@"; do
+	case "$a" in
+		-psn_*) ;;
+		*) CMD+=("$a") ;;
+	esac
+done
+export WHISPER_FROM_APP_BUNDLE=1
+exec "${CMD[@]}"

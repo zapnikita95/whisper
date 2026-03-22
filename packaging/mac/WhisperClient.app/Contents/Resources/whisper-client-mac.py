@@ -4,13 +4,17 @@
 Запуск: python3 whisper-client-mac.py --server http://192.168.1.100:8000
 Горячая клавиша: при запуске в терминале спросит строку (Enter = ⌃+⇧+`), либо --hotkey, либо --bind-hotkey
 
-Рядом с Portal (⌘+⌃+P/C/V): по умолчанию ⌃+⇧+` — не трогает Cmd и не совпадает с хоткеями Портала.
-Переопределение: переменная WHISPER_MAC_HOTKEY (например shift+ctrl+]) или флаг --hotkey.
+Рядом с Portal (⌘+⌃+P/C/V): по умолчанию ⌃+⇧+` — редко пересекается с ⌘+W / ⌃⇧W в приложениях.
+Переопределение: WHISPER_MAC_HOTKEY или флаг --hotkey; в WhisperClient.app хоткей задаётся в packaging/mac/run.sh.
 См. PORTAL_AND_WHISPER_MAC.md
+
+Журнал (вставка/сервер): ~/Library/Logs/WhisperMacClient.log — в Console фильтр «WHISPER_MAC».
+Полный текст распознавания в лог: WHISPER_MAC_DEBUG=1.
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import subprocess
@@ -19,6 +23,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 try:
     import requests
     import sounddevice as sd
@@ -33,6 +38,37 @@ except ImportError as e:
     print(f"Ошибка импорта: {e}", file=sys.stderr)
     print("Установи: pip3 install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip", file=sys.stderr)
     sys.exit(1)
+
+
+_MAC_LOGGER = logging.getLogger("whisper_mac")
+
+
+def configure_whisper_mac_logging() -> Path:
+    """Файл ~/Library/Logs/WhisperMacClient.log + в терминале — строки с префиксом [WHISPER_MAC] (фильтр в Console)."""
+    log_dir = Path.home() / "Library" / "Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "WhisperMacClient.log"
+    _MAC_LOGGER.setLevel(logging.DEBUG)
+    _MAC_LOGGER.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [WHISPER_MAC] %(levelname)s %(message)s")
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+    _MAC_LOGGER.addHandler(fh)
+    if sys.stdout.isatty():
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        sh.setLevel(logging.INFO)
+        _MAC_LOGGER.addHandler(sh)
+    return log_path
+
+
+def _mac_log(level: str, msg: str, *args: object) -> None:
+    log_fn = getattr(_MAC_LOGGER, level.lower(), None)
+    if log_fn:
+        log_fn(msg, *args)
+    else:
+        _MAC_LOGGER.info(msg, *args)
 
 
 def _check_pynput_py313() -> None:
@@ -170,7 +206,7 @@ class HotkeySpec:
 
     @staticmethod
     def default_mac_with_portal() -> HotkeySpec:
-        """⌃+⇧+` — не пересекается с Portal (⌘+⌃+P / C / V)."""
+        """⌃+⇧+` — мало конфликтов с Portal (⌘+⌃+P / C / V) и с ⌘+W."""
         return HotkeySpec(frozenset({"m:shift", "m:ctrl", "c:`"}))
 
     @staticmethod
@@ -310,6 +346,8 @@ class WhisperClientMac:
         self._listener_ref: keyboard.Listener | None = None
         self._run_stop = False
         self._work_lock = threading.Lock()
+        # PID процесса с полем ввода (frontmost при старте записи) — перед Cmd+V возвращаем фокус туда.
+        self._paste_target_unix_id: int | None = None
 
     def _reset_hotkey_tracker(self) -> None:
         """Сброс модели «какие клавиши зажаты» — после вставки и после цикла распознавания."""
@@ -359,13 +397,111 @@ class WhisperClientMac:
             timeout=5.0,
         )
 
+    def _clipboard_preview(self, max_len: int = 120) -> str:
+        try:
+            r = subprocess.run(
+                ["pbpaste"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if r.returncode != 0:
+                return ""
+            s = (r.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+            if len(s) > max_len:
+                return s[:max_len] + "…"
+            return s
+        except Exception:
+            return ""
+
+    def _clipboard_matches_expected(self, expected: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["pbpaste"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if r.returncode != 0:
+                return False
+            got = (r.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+            exp = expected.replace("\r\n", "\n").replace("\r", "\n")
+            return got == exp
+        except Exception:
+            return False
+
+    def _snapshot_frontmost_unix_pid(self) -> int | None:
+        """Кто был активным при зажатии хоткея — туда же шлём Cmd+V после распознавания."""
+        try:
+            r = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to return unix id of first process whose frontmost is true',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if r.returncode != 0:
+                _mac_log(
+                    "warning",
+                    "snapshot_frontmost_failed code=%s err=%s",
+                    r.returncode,
+                    (r.stderr or "").strip(),
+                )
+                return None
+            pid = int((r.stdout or "").strip())
+        except (ValueError, subprocess.TimeoutExpired, OSError) as e:
+            _mac_log("warning", "snapshot_frontmost_parse_error %s", e)
+            return None
+        mine = os.getpid()
+        if pid == mine:
+            _mac_log(
+                "warning",
+                "frontmost_pid=%s совпадает с клиентом — кликни в поле ввода и повтори (иначе Cmd+V уйдёт не туда)",
+                pid,
+            )
+            return None
+        _mac_log("info", "paste_target_captured unix_pid=%s", pid)
+        return pid
+
+    def _activate_process_by_unix_id(self, uid: int) -> bool:
+        if uid <= 0 or uid == os.getpid():
+            return False
+        try:
+            r = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "System Events" to set frontmost of first process whose unix id is {uid} to true',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            if r.returncode != 0:
+                _mac_log(
+                    "warning",
+                    "activate_pid=%s failed code=%s err=%s",
+                    uid,
+                    r.returncode,
+                    (r.stderr or "").strip(),
+                )
+                return False
+            time.sleep(0.35)
+            return True
+        except (subprocess.TimeoutExpired, OSError) as e:
+            _mac_log("warning", "activate_pid=%s exception=%s", uid, e)
+            return False
+
     def _paste_via_system_events(self) -> bool:
         """Cmd+V через key code 9 (клавиша V), без keystroke — стабильнее при разных раскладках."""
         r = subprocess.run(
             [
                 "osascript",
                 "-e",
-                "delay 0.12",
+                "delay 0.18",
                 "-e",
                 'tell application "System Events" to key code 9 using command down',
             ],
@@ -373,6 +509,13 @@ class WhisperClientMac:
             text=True,
             timeout=3.0,
         )
+        if r.returncode != 0:
+            _mac_log(
+                "warning",
+                "paste_keycode_failed code=%s err=%s",
+                r.returncode,
+                (r.stderr or "").strip(),
+            )
         return r.returncode == 0
 
     def _record_worker(self, max_duration: float = 120.0) -> None:
@@ -413,6 +556,7 @@ class WhisperClientMac:
         except Exception:
             print("\a", end="", flush=True)  # Fallback: ASCII bell
         print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
+        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         self._record_thread = threading.Thread(target=self._record_worker, daemon=True)
         self._record_thread.start()
 
@@ -446,20 +590,23 @@ class WhisperClientMac:
                 self._busy = False
             return
 
+        # Снимок до фонового потока — пока не началась следующая запись, PID цели стабилен для этой сессии.
+        paste_target_pid = self._paste_target_unix_id
+
         def work() -> None:
             # Один поток обработки за раз — иначе два kick подряд убивают свежий Listener.
             with self._work_lock:
                 with self._lock:
                     self._busy = True
                 try:
-                    _work_body()
+                    _work_body(paste_target_pid)
                 finally:
                     self._reset_hotkey_tracker()
                     with self._lock:
                         self._busy = False
                     self._kick_listener_restart()
 
-        def _work_body() -> None:
+        def _work_body(paste_pid: int | None) -> None:
             try:
                 # Сохраняем во временный WAV
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -472,14 +619,22 @@ class WhisperClientMac:
                         health_check = requests.get(f"{self.server_url}/", timeout=5.0)
                         if health_check.status_code != 200:
                             print(f"[Client] Сервер недоступен (код {health_check.status_code})", flush=True)
+                            _mac_log(
+                                "error",
+                                "health_check status=%s url=%s",
+                                health_check.status_code,
+                                self.server_url,
+                            )
                             raise ConnectionError("Сервер недоступен")
                     except requests.exceptions.RequestException as e:
                         print(f"[Client] Не удаётся подключиться к серверу: {e}", flush=True)
                         print(f"[Client] Проверь, что сервер запущен на {self.server_url}", flush=True)
+                        _mac_log("error", "health_check_request_error %s url=%s", e, self.server_url)
                         raise
 
                     # Отправляем на сервер с повторными попытками
                     print("[Client] Отправка на сервер…", flush=True)
+                    _mac_log("info", "transcribe_upload_start url=%s paste_target_pid=%s", self.server_url, paste_pid)
                     max_retries = 3
                     response = None
 
@@ -516,8 +671,23 @@ class WhisperClientMac:
                     if response is None:
                         raise ConnectionError("Не удалось получить ответ от сервера")
 
-                    result = response.json()
+                    try:
+                        result = response.json()
+                    except ValueError:
+                        body = (response.text or "")[:400]
+                        _mac_log("error", "transcribe_bad_json status=%s body_prefix=%r", response.status_code, body)
+                        print("[Client] Ответ сервера не JSON — см. ~/Library/Logs/WhisperMacClient.log", flush=True)
+                        raise
                     text = result.get("text", "").strip()
+                    _mac_log(
+                        "info",
+                        "transcribe_ok chars=%d preview=%r language=%r",
+                        len(text),
+                        text[:160],
+                        result.get("language"),
+                    )
+                    if os.environ.get("WHISPER_MAC_DEBUG"):
+                        _mac_log("debug", "transcribe_full_text=%r", text)
 
                     if text:
                         # Не даём synthetic release от Controller/osascript попасть в pressed — иначе hotkey ломается.
@@ -526,11 +696,36 @@ class WhisperClientMac:
                         try:
                             self._release_sticky_modifiers()
                             time.sleep(0.15)
+                            if paste_pid is not None:
+                                activated = self._activate_process_by_unix_id(paste_pid)
+                                _mac_log(
+                                    "info",
+                                    "restore_focus pid=%s ok=%s",
+                                    paste_pid,
+                                    activated,
+                                )
+                            else:
+                                _mac_log(
+                                    "warning",
+                                    "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно",
+                                )
+                            time.sleep(0.08)
                             self._copy_to_clipboard_mac(text)
+                            time.sleep(0.06)
+                            if self._clipboard_matches_expected(text):
+                                _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(text))
+                            else:
+                                _mac_log(
+                                    "warning",
+                                    "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
+                                    text[:80],
+                                    self._clipboard_preview(100),
+                                )
                             time.sleep(0.12)
                             ok = self._paste_via_system_events()
                             if ok:
                                 print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
+                                _mac_log("info", "paste_cmd_v_ok")
                             else:
                                 pyperclip.copy(text)
                                 print(
@@ -538,6 +733,7 @@ class WhisperClientMac:
                                     flush=True,
                                 )
                                 print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
+                                _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
                         except Exception as e:
                             try:
                                 pyperclip.copy(text)
@@ -545,10 +741,12 @@ class WhisperClientMac:
                                 pass
                             print(f"[Client] Вставка не удалась ({e}), текст в буфере: {text[:60]}…", flush=True)
                             print("[Client] Нажми Cmd+V для вставки.", flush=True)
+                            _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
                         finally:
                             self._reset_hotkey_tracker()
                     else:
                         print("[Client] Текст не распознан.", flush=True)
+                        _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
                 finally:
                     try:
                         import os
@@ -639,11 +837,19 @@ class WhisperClientMac:
 
 
 def main() -> int:
+    log_path = configure_whisper_mac_logging()
+    _mac_log("info", "=== старт whisper-client-mac ===")
+
+    # macOS при запуске .app из Finder добавляет -psn_0_… в argv; иначе parse_args() падает и приложение сразу завершается.
+    sys.argv = [sys.argv[0]] + [
+        a for a in sys.argv[1:] if not a.startswith("-psn_")
+    ]
+
     p = argparse.ArgumentParser(
         description="Whisper клиент для Mac",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-В терминале при старте (если не указан --hotkey) спросит сочетание; Enter = ⌥+⌃.
+В терминале при старте (если не указан --hotkey) спросит сочетание; Enter = ⌃+⇧+`.
 Примеры:
   %(prog)s --server URL
   %(prog)s --server URL --hotkey ctrl+grave
@@ -686,6 +892,9 @@ def main() -> int:
         help="Секунд ожидания при --bind-hotkey (по умолчанию 90)",
     )
     args = p.parse_args()
+    _mac_log("info", "server=%s log_file=%s", args.server, log_path)
+    if not sys.stdout.isatty():
+        print(f"[Client] Подробный лог: {log_path}", flush=True)
 
     def _default_hotkey_str() -> str:
         raw = (os.environ.get("WHISPER_MAC_HOTKEY") or "").strip()
@@ -698,11 +907,11 @@ def main() -> int:
             flush=True,
         )
         print(
-            "[Client] Примеры:  shift+ctrl+grave   alt+ctrl   ctrl+grave   cmd+alt+period",
+            "[Client] Примеры:  shift+ctrl+grave   alt+ctrl   ctrl+grave   cmd+alt+period   shift+ctrl+rbracket",
             flush=True,
         )
         print(
-            f"[Client] Пустой Enter = по умолчанию ({dflt}; задай WHISPER_MAC_HOTKEY чтобы поменять).",
+            f"[Client] Пустой Enter = по умолчанию ({dflt}; задай WHISPER_MAC_HOTKEY или --hotkey чтобы поменять).",
             flush=True,
         )
         print(
@@ -731,6 +940,30 @@ def main() -> int:
         return 2
 
     print(f"[Client] Активное сочетание: {describe_hotkey(hotkey)}", flush=True)
+
+    if os.environ.get("WHISPER_FROM_APP_BUNDLE"):
+        subprocess.run(
+            [
+                "logger",
+                "-t",
+                "WhisperClient",
+                "Старт pid=%s server=%s hotkey=%s"
+                % (os.getpid(), args.server, describe_hotkey(hotkey)),
+            ],
+            check=False,
+        )
+        if not sys.stdin.isatty():
+            hk_safe = describe_hotkey(hotkey).replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "Клиент в фоне. Удерживай {hk_safe} — запись; отпусти все клавиши сочетания — распознавание." '
+                    'with title "Whisper Client"',
+                ],
+                check=False,
+                capture_output=True,
+            )
 
     client = WhisperClientMac(
         server_url=args.server,

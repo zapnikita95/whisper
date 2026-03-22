@@ -182,12 +182,15 @@ Whisper иногда пишет фразу с ошибкой («восклица
    python3 whisper-client-mac.py --server 'http://TAILSCALE_IP:ПОРТ'
    ```
 
-5. При запуске **в терминале** клиент спросит сочетание одной строкой (через `+`); **Enter** без ввода = **⌃+⇧+`** (`shift+ctrl+grave`) — **не пересекается с Portal** (⌘+⌃+P/C/V). Удерживай сочетание — запись, отпусти все клавиши — распознавание. Альтернативы:
+5. При запуске **в терминале** клиент спросит сочетание одной строкой (через `+`); **Enter** без ввода = **⌃+⇧+`** (`shift+ctrl+grave`) — **не пересекается с Portal** (⌘+⌃+P/C/V) и не путается с **⌘+W** / **⌃⇧W**. Удерживай сочетание — запись, отпусти все клавиши — распознавание. Альтернативы:
    - без вопроса: `--no-hotkey-prompt` (или переменная **`WHISPER_MAC_HOTKEY`**);
-   - сразу строкой: `--hotkey 'shift+ctrl+grave'`, `--hotkey 'alt+ctrl'` (старое ⌥+⌃), `--hotkey 'ctrl+]'`;
+   - сразу строкой: `--hotkey 'shift+ctrl+grave'` (умолчание в коде), `--hotkey 'alt+ctrl'` (старое ⌥+⌃), `--hotkey 'ctrl+]'`;
+   - **WhisperClient.app:** хоткей по умолчанию задаётся в `packaging/mac/run.sh` (`export WHISPER_MAC_HOTKEY=…`), чтобы не тянуть случайный export из Терминала.
    - «нажми и запомни»: `--bind-hotkey`.
 
    **Вместе с [Portal](https://github.com/zapnikita95/portal) на том же Mac:** см. **[PORTAL_AND_WHISPER_MAC.md](PORTAL_AND_WHISPER_MAC.md)** (права «Мониторинг ввода», порядок запуска, pynput 1.8+).
+
+   **Отладка вставки / сервера:** файл **`~/Library/Logs/WhisperMacClient.log`** (строки с **`[WHISPER_MAC]`**). Вставка идёт в приложение, которое было **активным в момент начала записи** (перед Cmd+V фокус возвращается туда). Если в буфере мусор — в логе будет `clipboard_mismatch` или `paste_target_captured`. Полный текст распознавания в лог: `WHISPER_MAC_DEBUG=1`.
 
 ### Опции клиента
 
