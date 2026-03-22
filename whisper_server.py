@@ -54,10 +54,13 @@ except ImportError:
 
 # Локальная запись на Windows (whisper-hotkey.py) — не HTTP, для подсказок в GUI/API
 WINDOWS_LOCAL_HOTKEY_DESC = (
-    "whisper-hotkey.py на этом ПК: зажми Ctrl+Win — запись с микрофона, отпусти — распознавание и вставка в активное окно."
+    "Whisper Hotkey (трей / Ctrl+Win) на этом ПК: запись в микрофон → текст в активное окно. Лог: whisper_hotkey.log."
 )
 
+from whisper_file_log import configure
 from whisper_models import resolve_model
+
+log = configure("whisper.server", "whisper_server.log")
 
 app = FastAPI(title="Whisper API Server")
 
@@ -108,8 +111,17 @@ def get_model() -> WhisperModel:
     global _model
     if _model is None:
         print(f"[Server] Загрузка модели {_model_name} ({_device}, {_compute_type})...", flush=True)
-        _model = WhisperModel(_model_name, device=_device, compute_type=_compute_type)
+        log.info("Загрузка модели %s (%s, %s)", _model_name, _device, _compute_type)
+        try:
+            _model = WhisperModel(_model_name, device=_device, compute_type=_compute_type)
+        except OSError:
+            log.exception("Модель: OSError (сеть/диск/Hugging Face)")
+            raise
+        except Exception:
+            log.exception("Модель: ошибка загрузки")
+            raise
         print("[Server] Модель загружена.", flush=True)
+        log.info("Модель загружена")
     return _model
 
 
@@ -206,8 +218,11 @@ async def transcribe(
             except Exception:
                 pass
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
+        log.exception("POST /transcribe")
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}") from e
 
 
 def main() -> int:

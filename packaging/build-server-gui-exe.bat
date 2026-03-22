@@ -15,7 +15,7 @@ if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
 "%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperServer ^
   %ICONLINE% ^
   --collect-all uvicorn --collect-all fastapi --collect-all starlette ^
-  --hidden-import whisper_server --hidden-import whisper_models ^
+  --hidden-import whisper_server --hidden-import whisper_models --hidden-import whisper_file_log ^
   --hidden-import faster_whisper ^
   --hidden-import whisper_version --hidden-import whisper_update_check ^
   --add-data "packaging\VERSION;packaging" ^

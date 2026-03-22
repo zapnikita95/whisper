@@ -22,6 +22,8 @@ import sys
 
 import tempfile
 
+import logging
+
 import threading
 
 import time
@@ -29,6 +31,9 @@ import time
 from pathlib import Path
 
 from collections.abc import Callable
+
+
+log = logging.getLogger("whisper.hotkey")
 
 
 
@@ -245,6 +250,8 @@ class WhisperHotkey:
 
         status_callback: Callable[[str], None] | None = None,
 
+        toast_callback: Callable[[str, str, bool], None] | None = None,
+
     ):
 
         self.model_name = model
@@ -264,6 +271,8 @@ class WhisperHotkey:
         self.spoken_punctuation = spoken_punctuation
 
         self._status_callback = status_callback
+
+        self._toast_callback = toast_callback
 
         self.model = None
 
@@ -300,6 +309,24 @@ class WhisperHotkey:
         try:
 
             cb(msg)
+
+        except Exception:
+
+            pass
+
+
+
+    def _emit_toast(self, title: str, body: str, error: bool = False) -> None:
+
+        cb = self._toast_callback
+
+        if cb is None:
+
+            return
+
+        try:
+
+            cb(title, body, error)
 
         except Exception:
 
@@ -345,17 +372,55 @@ class WhisperHotkey:
 
         print(f"[Whisper] Загрузка модели {self.model_name}...", flush=True)
 
-        self.model = WhisperModel(
+        log.info("Загрузка модели %s (%s, %s)", self.model_name, self.device, self.compute_type)
 
-            self.model_name,
+        try:
 
-            device=self.device,
+            self.model = WhisperModel(
 
-            compute_type=self.compute_type,
+                self.model_name,
 
-        )
+                device=self.device,
+
+                compute_type=self.compute_type,
+
+            )
+
+        except OSError as e:
+
+            log.exception("Модель: OSError")
+
+            self._emit_toast(
+
+                "Сеть или диск",
+
+                "Не удалось загрузить модель (сеть, Hugging Face или место на диске).",
+
+                True,
+
+            )
+
+            raise
+
+        except Exception as e:
+
+            log.exception("Модель: ошибка")
+
+            self._emit_toast(
+
+                "Модель",
+
+                f"Не удалось загрузить веса: {type(e).__name__}",
+
+                True,
+
+            )
+
+            raise
 
         print("[Whisper] Модель загружена.", flush=True)
+
+        log.info("Модель загружена")
 
 
 
@@ -373,19 +438,47 @@ class WhisperHotkey:
 
         try:
 
-            stream = p.open(
+            try:
 
-                format=pyaudio.paFloat32,
+                stream = p.open(
 
-                channels=self.channels,
+                    format=pyaudio.paFloat32,
 
-                rate=self.sample_rate,
+                    channels=self.channels,
 
-                input=True,
+                    rate=self.sample_rate,
 
-                frames_per_buffer=1024,
+                    input=True,
 
-            )
+                    frames_per_buffer=1024,
+
+                )
+
+            except OSError as e:
+
+                log.exception("Микрофон недоступен")
+
+                print(f"[Ошибка] Микрофон: {e}", file=sys.stderr, flush=True)
+
+                self._emit_toast(
+
+                    "Микрофон",
+
+                    "Нет доступа к микрофону, устройство занято или не найдено.",
+
+                    True,
+
+                )
+
+                with self._lock:
+
+                    self._busy = False
+
+                    self._hold_recording = False
+
+                self._emit_status("Готов · Ctrl+Win")
+
+                return
 
             max_chunks = int(self.sample_rate / 1024 * self.max_hold_seconds) + 1
 
@@ -393,7 +486,17 @@ class WhisperHotkey:
 
             while not self._stop_record.is_set() and n < max_chunks:
 
-                data = stream.read(1024, exception_on_overflow=False)
+                try:
+
+                    data = stream.read(1024, exception_on_overflow=False)
+
+                except OSError as e:
+
+                    log.exception("Ошибка чтения микрофона")
+
+                    self._emit_toast("Микрофон", f"Сбой записи: {e}", True)
+
+                    break
 
                 with self._chunk_lock:
 
@@ -460,6 +563,8 @@ class WhisperHotkey:
         print("[Запись] Зажато Ctrl+Win — говори…", flush=True)
 
         self._emit_status("Запись… (отпусти Ctrl+Win)")
+
+        self._emit_toast("Запись", "Говори… Отпусти Ctrl+Win, когда закончишь.", False)
 
         self._record_thread = threading.Thread(target=self._record_worker, daemon=True)
 
@@ -552,6 +657,18 @@ class WhisperHotkey:
 
                         print(f"[Ошибка транскрипции] {e}", file=sys.stderr, flush=True)
 
+                        log.exception("Транскрипция")
+
+                        self._emit_toast(
+
+                            "Распознавание",
+
+                            f"Ошибка: {type(e).__name__}: {str(e)[:160]}",
+
+                            True,
+
+                        )
+
                         return None
 
                 # Запускаем транскрипцию в отдельном потоке с таймаутом
@@ -575,6 +692,10 @@ class WhisperHotkey:
                 if transcribe_thread.is_alive():
 
                     print("[Whisper] Таймаут транскрипции (60 сек), отмена.", flush=True)
+
+                    log.warning("Таймаут транскрипции 60 с")
+
+                    self._emit_toast("Таймаут", "Распознавание длилось дольше 60 с — отменено.", True)
 
                     self._cancel_processing.set()
 
@@ -602,15 +723,27 @@ class WhisperHotkey:
 
                         self._insert_text(text)
 
+                        preview = (text[:220] + "…") if len(text) > 220 else text
+
+                        self._emit_toast("Готово", preview, False)
+
                 elif not self._cancel_processing.is_set():
 
                     print("[Whisper] Текст не распознан.", flush=True)
+
+                    log.info("Пустой результат распознавания")
+
+                    self._emit_toast("Нет текста", "Речь не распознана или слишком тихо.", False)
 
             except Exception as e:
 
                 if not self._cancel_processing.is_set():
 
                     print(f"[Ошибка] {e}", file=sys.stderr, flush=True)
+
+                    log.exception("Обработка записи")
+
+                    self._emit_toast("Ошибка", str(e)[:200], True)
 
                     import traceback
 
@@ -748,6 +881,8 @@ class WhisperHotkey:
             except Exception:
                 print("[Whisper] Вставка не удалась, текст в буфере обмена.", flush=True)
                 print("[Whisper] Нажми Ctrl+V вручную.", flush=True)
+                log.warning("Вставка через Ctrl+V не удалась")
+                self._emit_toast("Вставка текста", "Ctrl+V не сработал — вставь вручную из буфера.", True)
 
 
 
@@ -773,6 +908,10 @@ class WhisperHotkey:
 
             self._emit_status("Ошибка: нет перехвата клавиш (нужен админ?)")
 
+            log.exception("Перехват клавиш")
+
+            self._emit_toast("Клавиши", "Нет перехвата Ctrl+Win — запусти от имени администратора.", True)
+
             raise
 
         self._emit_status("Готов · Ctrl+Win")
@@ -793,7 +932,10 @@ def main() -> int:
 
     import argparse
 
+    from whisper_file_log import configure
     from whisper_models import resolve_model
+
+    configure("whisper.hotkey", "whisper_hotkey.log")
 
 
 

@@ -245,7 +245,7 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 | Файл в релизе | Назначение |
 |---------------|------------|
 | **`WhisperSetup-{версия}.exe`** | **Сервер** — GPU HTTP API для Mac и других клиентов (`WhisperServer.exe`). |
-| **`WhisperHotkeySetup-{версия}.exe`** | **Локальный клиент** — окно + Ctrl+Win, запись с микрофона и вставка текста на **этом** ПК (`WhisperHotkey.exe`). |
+| **`WhisperHotkeySetup-{версия}.exe`** | **Локальный клиент** — трей + Ctrl+Win, уведомления, лог `whisper_hotkey.log` (`WhisperHotkey.exe`). |
 
 Локально после PyInstaller: `ISCC.exe packaging\windows\WhisperServer.iss` и `ISCC.exe packaging\windows\WhisperHotkey.iss` (см. ниже).
 
@@ -255,13 +255,43 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 Нужны **Python 3.10+** (команда `python` в PATH) и **NVIDIA + драйвер** для GPU. Venv создаётся в **`%USERPROFILE%\.venvs\faster-whisper`** (вне OneDrive).
 
-**Самый простой вариант — один раз запустить скрипт** (путь поправь, если репозиторий не на рабочем столе):
+**Скрипт `packaging\setup-venv-and-build.ps1`** (путь к репо поправь при необходимости):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\OneDrive\Desktop\whisper\packaging\setup-venv-and-build.ps1"
+$W = "$env:USERPROFILE\OneDrive\Desktop\whisper"
+
+# Только venv + pip + pyinstaller (без сборки exe)
+powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1" -Build None
+
+# Сборка только сервера (WhisperServer.exe)
+powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1" -Build Server
+
+# Сборка только hotkey (WhisperHotkey.exe, трей)
+powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1" -Build Hotkey
+
+# Оба exe подряд
+powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1" -Build Both
+
+# Скачать все пресеты в кэш Hugging Face + оба exe (долго, нужен интернет)
+powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1" -Build Both -DownloadModels
 ```
 
-Скрипт сам находит корень репозитория относительно своей папки `packaging\`, создаёт venv при необходимости, ставит `requirements.txt`, `pyinstaller` и вызывает `build-server-gui-exe.bat`.
+Скачать модели отдельно (venv уже есть):
+
+```powershell
+& "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" "$W\scripts\download_whisper_models.py" --device cuda --compute-type int8
+```
+
+#### Логи отладки
+
+| Файл | Когда |
+|------|--------|
+| **`whisper_server.log`** | HTTP-сервер (`whisper_server.py` / `WhisperServer.exe`), ротация ~2 МБ. |
+| **`whisper_hotkey.log`** | Hotkey (консоль и трей / `WhisperHotkey.exe`). |
+
+Каталог логов: рядом с exe или скриптом; переопределение: **`WHISPER_LOG_DIR=C:\путь`**.
+
+Hotkey: отключить всплывающие уведомления — **меню трея «Уведомления»** или **`WHISPER_HOTKEY_NO_NOTIFICATIONS=1`**.
 
 ---
 
@@ -276,6 +306,7 @@ Set-Location $Repo
 & "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" -m pip install -r .\requirements.txt
 & "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" -m pip install pyinstaller
 .\packaging\build-server-gui-exe.bat
+.\packaging\build-hotkey-gui-exe.bat
 ```
 
 После успешной сборки:
@@ -293,9 +324,9 @@ Set-Location $Repo
 .\packaging\build-hotkey-gui-exe.bat
 ```
 
-Результат: **`dist\WhisperHotkey\WhisperHotkey.exe`** (+ `_internal`). Запуск **от имени администратора** (иначе перехват Ctrl+Win может не работать). Без сборки: **`start-whisper-hotkey-gui.bat`** из venv.
+Результат: **`dist\WhisperHotkey\WhisperHotkey.exe`** (+ `_internal`): **иконка в трее**, уведомления (старт, запись, результат, ошибки). Запуск **от имени администратора**. Без сборки: **`start-whisper-hotkey-gui.bat`**.
 
-Консольный вариант без окна по-прежнему: `whisper-hotkey.py` / `start-whisper-hotkey.bat` (логика в модуле `whisper_hotkey_core.py`).
+Консольный вариант: `whisper-hotkey.py` / `start-whisper-hotkey.bat` → тот же **`whisper_hotkey.log`**.
 
 #### Коротко по шагам (сервер)
 
@@ -320,9 +351,9 @@ Set-Location $Repo
 
 При push тега вида **`v1.2.3`** workflow [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
-1. Собирает **Windows**: PyInstaller → **Inno Setup** → `dist/release/WhisperSetup-{версия}.exe`.
+1. Собирает **Windows**: PyInstaller → **Inno Setup** → `WhisperSetup-{версия}.exe` и **`WhisperHotkeySetup-{версия}.exe`**.
 2. Собирает **macOS**: `build_mac_app.sh` → **create-dmg** → `dist/release/WhisperClient-{версия}.dmg`.
-3. Прикрепляет оба файла к **GitHub Release** для этого тега.
+3. Прикрепляет **WhisperSetup**, **WhisperHotkeySetup** и DMG к **GitHub Release** для этого тега.
 
 Локально Inno: установи [Inno Setup](https://jrsoftware.org/isinfo.php), затем после PyInstaller:
 
@@ -369,7 +400,10 @@ Set-Location $Repo
 | `packaging/mac/whisper_stub.c` | Mach-O загрузчик для .app (Finder) |
 | `assets/app_icon.png` | исходник иконки; `AppIcon.icns`, `app_icon.ico` — для .app / exe |
 | `packaging/regenerate_icons.sh` | PNG → icns + ico |
-| `packaging/setup-venv-and-build.ps1` | venv + pip + PyInstaller + вызов `build-server-gui-exe.bat` одной командой |
+| `packaging/setup-venv-and-build.ps1` | venv + pip; параметры `-Build Server|Hotkey|Both|None`, `-DownloadModels` |
+| `scripts/download_whisper_models.py` | скачать в кэш HF все пресеты из `whisper_models.py` |
+| `whisper_file_log.py` | ротационные `whisper_server.log` / `whisper_hotkey.log` |
+| `whisper_hotkey_tray.py` | hotkey в трее (точка входа `WhisperHotkey.exe`) |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
 | `packaging/build-hotkey-gui-exe.bat` | сборка `WhisperHotkey.exe` через PyInstaller |
 | `packaging/windows/WhisperServer.iss` | Inno Setup → `WhisperSetup-{версия}.exe` |

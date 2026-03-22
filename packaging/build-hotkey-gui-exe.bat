@@ -9,15 +9,21 @@ if not exist "%PY%" set "PY=python"
 
 set "ICONLINE="
 if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
+set "ICODATA="
+if exist "assets\app_icon.ico" set "ICODATA=--add-data assets\app_icon.ico;assets"
 
 "%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey ^
   %ICONLINE% ^
-  --hidden-import whisper_hotkey_core --hidden-import whisper_models ^
+  --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray ^
+  --hidden-import whisper_models --hidden-import whisper_file_log ^
   --hidden-import faster_whisper --hidden-import whisper_version ^
   --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip ^
   --hidden-import soundfile --hidden-import numpy ^
+  --hidden-import plyer.platforms.win.notification ^
+  --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image ^
   --add-data "packaging\VERSION;packaging" ^
-  whisper_hotkey_gui.py
+  %ICODATA% ^
+  whisper_hotkey_tray.py
 
 echo.
 echo Готово: dist\WhisperHotkey\WhisperHotkey.exe (рядом _internal)

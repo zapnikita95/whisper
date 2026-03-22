@@ -18,4 +18,4 @@ if not exist "%PY%" (
     exit /b 1
 )
 
-start "" "%PY%" "%~dp0whisper_hotkey_gui.py" %*
+start "" "%PY%" "%~dp0whisper_hotkey_tray.py" %*

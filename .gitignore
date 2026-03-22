@@ -10,4 +10,7 @@ build/
 /WhisperServer.spec
 /WhisperHotkey.spec
 whisper_hotkey_gui_prefs.json
+whisper_hotkey_prefs.json
+whisper_hotkey.log
+whisper_server.log
 assets/AppIcon.iconset/

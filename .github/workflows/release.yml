@@ -39,7 +39,8 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperServer \
             "${ICON_ARGS[@]}" \
             --collect-all uvicorn --collect-all fastapi --collect-all starlette \
-            --hidden-import whisper_server --hidden-import whisper_models --hidden-import faster_whisper \
+            --hidden-import whisper_server --hidden-import whisper_models --hidden-import whisper_file_log \
+            --hidden-import faster_whisper \
             --hidden-import whisper_version --hidden-import whisper_update_check \
             --add-data "packaging/VERSION;packaging" \
             whisper_server_gui.py
@@ -49,15 +50,23 @@ jobs:
         run: |
           set -e
           ICON_ARGS=()
-          if [ -f assets/app_icon.ico ]; then ICON_ARGS=(--icon assets/app_icon.ico); fi
+          ICO_DATA=()
+          if [ -f assets/app_icon.ico ]; then
+            ICON_ARGS=(--icon assets/app_icon.ico)
+            ICO_DATA=(--add-data "assets/app_icon.ico;assets")
+          fi
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey \
             "${ICON_ARGS[@]}" \
-            --hidden-import whisper_hotkey_core --hidden-import whisper_models \
+            --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray \
+            --hidden-import whisper_models --hidden-import whisper_file_log \
             --hidden-import faster_whisper --hidden-import whisper_version \
             --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip \
             --hidden-import soundfile --hidden-import numpy \
+            --hidden-import plyer.platforms.win.notification \
+            --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image \
             --add-data "packaging/VERSION;packaging" \
-            whisper_hotkey_gui.py
+            "${ICO_DATA[@]}" \
+            whisper_hotkey_tray.py
 
       - name: Inno Setup (Chocolatey)
         run: choco install innosetup -y --no-progress

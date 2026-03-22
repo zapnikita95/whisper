@@ -329,8 +329,8 @@ def main() -> int:
 
     ttk.Label(frm, text="Запись голоса на этом ПК (Windows)", font=("", 12, "bold")).pack(anchor=tk.W)
     hotkey_txt = (
-        "Запись на этом ПК (Ctrl+Win) — отдельная программа Whisper Hotkey:\n"
-        "WhisperHotkey.exe или whisper_hotkey_gui.py / start-whisper-hotkey.bat.\n"
+        "Запись на этом ПК (Ctrl+Win) — Whisper Hotkey (трей, уведомления):\n"
+        "WhisperHotkey.exe или start-whisper-hotkey-gui.bat. Лог: whisper_hotkey.log.\n"
         "Это не HTTP: клавиши локально; сервер выше — для Mac и других машин по сети."
     )
     ttk.Label(frm, text=hotkey_txt, wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 12))
