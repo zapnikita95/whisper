@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -175,6 +176,11 @@ def _maybe_check_updates_gui(root: object, current_ver: str) -> None:
 # Короткий таймаут: иначе на главном потоке Tk окно «Не отвечает» на секунды.
 _HTTP_TIMEOUT_SEC = 1.0
 
+# Опрос GET / после «Запустить сервер»: интервал и сколько ждать, пока импортируется faster_whisper/CUDA.
+# Раньше было 240×250 мс ≈ 60 с — на реальных ПК импорт легко 2–5+ мин, GUI ошибочно показывал «нет ответа».
+_API_START_POLL_MS = 250
+_API_START_POLL_MAX_FAILS = 1200  # ×250 мс ≈ 5 мин между попытками + первый опрос через 300 мс
+
 
 def _fetch_clients_json(port: int) -> dict | None:
     try:
@@ -194,36 +200,83 @@ def _fetch_root_json(port: int) -> dict | None:
         return None
 
 
+# Uvicorn по умолчанию пишет в stderr; в --windowed exe это иногда блокирует поток → HTTP не поднимается.
+# Структура как у uvicorn (нужны formatters), но handlers = NullHandler.
+_UVICORN_GUI_LOG_CONFIG: dict = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "()": "uvicorn.logging.DefaultFormatter",
+            "fmt": "%(levelprefix)s %(message)s",
+            "use_colors": False,
+        },
+        "access": {
+            "()": "uvicorn.logging.AccessFormatter",
+            "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            "use_colors": False,
+        },
+    },
+    "handlers": {
+        "default": {"formatter": "default", "class": "logging.NullHandler"},
+        "access": {"formatter": "access", "class": "logging.NullHandler"},
+    },
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"level": "INFO"},
+        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+    },
+}
+
+
 def _run_uvicorn(port: int, host: str) -> None:
+    import asyncio
+    import logging
+    import sys
+
     import uvicorn
+
+    if sys.platform == "win32":
+        # Proactor + uvicorn во вторичном потоке (Tk) часто не доходят до bind; Selector стабильнее.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    log = logging.getLogger("whisper.server")
+    log.info("GUI: импорт whisper_server.app (уже может быть в кэше модулей)…")
     from whisper_server import app
 
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    log.info("GUI: uvicorn.run host=%s port=%s (loop=asyncio, логи uvicorn → Null)", host, port)
+    try:
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=False,
+            loop="asyncio",
+            use_colors=False,
+            log_config=_UVICORN_GUI_LOG_CONFIG,
+        )
+    except OSError:
+        logging.getLogger("whisper.server").exception(
+            "GUI: uvicorn OSError — часто порт уже занят другим процессом"
+        )
+    except Exception:
+        logging.getLogger("whisper.server").exception("GUI: uvicorn.run завершился с ошибкой")
+        raise
 
 
-def main() -> int:
+def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, app_ver: str) -> None:
     import tkinter as tk
     from tkinter import ttk
 
     from whisper_models import MODEL_PRESETS
 
-    port = _find_free_port()
-    _firewall_allow(port)
-    _write_port_file(port)
-    ts_ip = _tailscale_ipv4()
-
-    prefs = _load_gui_prefs()
+    server_diag_log = Path(tempfile.gettempdir()) / "WhisperServer_last_run.log"
     saved_key = str(prefs.get("model_key", "large-v3")).strip() or "large-v3"
     preset_keys = [k for k, _, _ in MODEL_PRESETS]
     if saved_key not in preset_keys:
         saved_key = "large-v3"
     label_by_key = {k: lbl for k, _, lbl in MODEL_PRESETS}
-
-    app_ver = _get_app_version()
-    root = tk.Tk()
-    root.title(f"Whisper GPU Server  v{app_ver}")
-    root.geometry("560x460")
-    root.minsize(480, 400)
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -301,17 +354,20 @@ def main() -> int:
                         )
                         return
                     poll_gen["n"] = poll_gen.get("n", 0) + 1
-                    if poll_gen["n"] > 240:
-                        _apply_api_health(None, "таймаут ~60 с")
+                    if poll_gen["n"] > _API_START_POLL_MAX_FAILS:
+                        _apply_api_health(
+                            None,
+                            f"таймаут ~{(_API_START_POLL_MAX_FAILS * _API_START_POLL_MS) // 60_000} мин",
+                        )
                         status.config(
-                            text="Сервер не поднялся: whisper_server.log, антивирус, порт.",
+                            text=f"Сервер не поднялся — см. whisper_server.log и {server_diag_log}",
                             foreground="#a00",
                         )
                         return
                     sec = poll_gen["n"] // 4
                     api_health_var.set(f"● Запуск API… (~{sec} с) — окно не зависло, ждём в фоне")
                     api_health.configure(foreground="#c80")
-                    root.after(250, _schedule_api_poll)
+                    root.after(_API_START_POLL_MS, _schedule_api_poll)
 
                 root.after(0, apply)
 
@@ -325,7 +381,9 @@ def main() -> int:
         key = _model_key_from_ui()
         _save_gui_prefs({"model_key": key})
         os.environ["WHISPER_MODEL"] = key
-        api_health_var.set("● Запуск uvicorn… (импорт CTranslate2 может занять 1–3 мин)")
+        api_health_var.set(
+            "● Запуск uvicorn… (импорт CUDA/CT2 часто 1–5 мин — GUI ждёт до ~5 мин, см. лог)"
+        )
         api_health.configure(foreground="#c80")
         threading.Thread(
             target=lambda: _run_uvicorn(port, "0.0.0.0"),
@@ -335,7 +393,7 @@ def main() -> int:
         combo_models.configure(state="disabled")
         start_btn.state(["disabled"])
         status.config(
-            text="Сервер грузится в фоне — см. whisper_server.log. Окно можно двигать.",
+            text=f"Сервер грузится в фоне — лог: whisper_server.log и {server_diag_log}",
             foreground="#666",
         )
         root.after(300, _schedule_api_poll)
@@ -399,7 +457,7 @@ def main() -> int:
                     if srv_started["ok"]:
                         if root_data and root_data.get("status") == "ok":
                             _apply_api_health(root_data)
-                        elif poll_gen["n"] > 240:
+                        elif poll_gen["n"] > _API_START_POLL_MAX_FAILS:
                             _apply_api_health(None, "нет ответа")
                     for i in tree.get_children():
                         tree.delete(i)
@@ -430,9 +488,95 @@ def main() -> int:
         os._exit(0)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+
+
+def main() -> int:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    prefs = _load_gui_prefs()
+    app_ver = _get_app_version()
+    root = tk.Tk()
+    root.title(f"Whisper GPU Server  v{app_ver}")
+    root.geometry("520x160")
+    root.minsize(400, 120)
+
+    boot_frm = ttk.Frame(root, padding=24)
+    boot_frm.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        boot_frm,
+        text="Подготовка: свободный порт и брандмауэр (PowerShell/netsh могут занять до ~1 мин).\nОкно уже живое — его можно двигать.",
+        wraplength=480,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W)
+    boot_status = ttk.Label(boot_frm, text="Старт…", foreground="#444")
+    boot_status.pack(anchor=tk.W, pady=(12, 0))
+    boot_state: dict = {}
+
+    def apply_boot_result() -> None:
+        try:
+            if not root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            boot_frm.destroy()
+        except tk.TclError:
+            return
+        err = boot_state.get("error")
+        if err:
+            messagebox.showerror("Whisper Server", str(err))
+            root.destroy()
+            return
+        root.geometry("560x460")
+        root.minsize(480, 400)
+        _build_server_main_form(
+            root,
+            int(boot_state["port"]),
+            str(boot_state.get("ts_ip") or ""),
+            prefs,
+            app_ver,
+        )
+
+    def boot_worker() -> None:
+        def upd(msg: str) -> None:
+            def u() -> None:
+                try:
+                    if boot_frm.winfo_exists():
+                        boot_status.config(text=msg)
+                except tk.TclError:
+                    pass
+
+            try:
+                root.after(0, u)
+            except Exception:
+                pass
+
+        try:
+            upd("Свободный порт…")
+            p = _find_free_port()
+            upd(f"Порт {p}. Правило брандмауэра…")
+            _firewall_allow(p)
+            _write_port_file(p)
+            upd("Tailscale…")
+            ts = _tailscale_ipv4()
+            boot_state.clear()
+            boot_state.update(port=p, ts_ip=ts)
+        except Exception as e:
+            boot_state.clear()
+            boot_state["error"] = str(e)
+        try:
+            root.after(0, apply_boot_result)
+        except tk.TclError:
+            pass
+
+    threading.Thread(target=boot_worker, name="whisper-gui-boot", daemon=True).start()
     root.mainloop()
     return 0
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     raise SystemExit(main())

@@ -79,11 +79,11 @@ except ImportError as e:
 
 
 
-def _prepend_nvidia_cublas_to_path() -> None:
+def _prepend_nvidia_cublas_to_path() -> bool:
 
     if sys.platform != "win32":
 
-        return
+        return True
 
     candidates: list[Path] = []
 
@@ -111,7 +111,9 @@ def _prepend_nvidia_cublas_to_path() -> None:
 
             os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
 
-            return
+            return True
+
+    return False
 
 
 
@@ -125,13 +127,19 @@ def _play_record_start_sound() -> None:
 
             import winsound
 
-
-
-            winsound.Beep(1000, 80)
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
 
         except Exception:
 
-            pass
+            try:
+
+                import winsound
+
+                winsound.Beep(880, 35)
+
+            except Exception:
+
+                pass
 
 
 
@@ -252,6 +260,10 @@ class WhisperHotkey:
 
         toast_callback: Callable[[str, str, bool], None] | None = None,
 
+        speaker_verify: bool = False,
+
+        speaker_threshold: float | None = None,
+
     ):
 
         self.model_name = model
@@ -295,6 +307,12 @@ class WhisperHotkey:
         self._chunk_lock = threading.Lock()
 
         self._insert_lock = threading.Lock()
+
+        self._mic_fail_toast_ok = True
+
+        self._speaker_verify = speaker_verify
+
+        self._speaker_threshold = speaker_threshold
 
 
 
@@ -364,7 +382,25 @@ class WhisperHotkey:
 
             return
 
-        _prepend_nvidia_cublas_to_path()
+        cublas_ok = _prepend_nvidia_cublas_to_path()
+
+        if (
+
+            sys.platform == "win32"
+
+            and str(self.device).lower() == "cuda"
+
+            and not cublas_ok
+
+        ):
+
+            log.warning(
+
+                "cuBLAS: cublas64_12.dll не найдена в site-packages. "
+
+                "Поставь в venv: pip install nvidia-cublas-cu12 — иначе CTranslate2 часто не поднимет GPU."
+
+            )
 
         from faster_whisper import WhisperModel
 
@@ -460,15 +496,25 @@ class WhisperHotkey:
 
                 print(f"[Ошибка] Микрофон: {e}", file=sys.stderr, flush=True)
 
-                self._emit_toast(
+                with self._lock:
 
-                    "Микрофон",
+                    show = self._mic_fail_toast_ok
 
-                    "Нет доступа к микрофону, устройство занято или не найдено.",
+                    if show:
 
-                    True,
+                        self._mic_fail_toast_ok = False
 
-                )
+                if show:
+
+                    self._emit_toast(
+
+                        "Микрофон",
+
+                        "Нет доступа к микрофону, устройство занято или не найдено.",
+
+                        True,
+
+                    )
 
                 with self._lock:
 
@@ -484,6 +530,8 @@ class WhisperHotkey:
 
             n = 0
 
+            read_err_toasted = False
+
             while not self._stop_record.is_set() and n < max_chunks:
 
                 try:
@@ -494,7 +542,21 @@ class WhisperHotkey:
 
                     log.exception("Ошибка чтения микрофона")
 
-                    self._emit_toast("Микрофон", f"Сбой записи: {e}", True)
+                    if not read_err_toasted:
+
+                        read_err_toasted = True
+
+                        with self._lock:
+
+                            show = self._mic_fail_toast_ok
+
+                            if show:
+
+                                self._mic_fail_toast_ok = False
+
+                        if show:
+
+                            self._emit_toast("Микрофон", f"Сбой записи: {e}", True)
 
                     break
 
@@ -563,8 +625,6 @@ class WhisperHotkey:
         print("[Запись] Зажато Ctrl+Win — говори…", flush=True)
 
         self._emit_status("Запись… (отпусти Ctrl+Win)")
-
-        self._emit_toast("Запись", "Говори… Отпусти Ctrl+Win, когда закончишь.", False)
 
         self._record_thread = threading.Thread(target=self._record_worker, daemon=True)
 
@@ -639,6 +699,84 @@ class WhisperHotkey:
         def work() -> None:
 
             try:
+
+                want_spk = self._speaker_verify or os.environ.get(
+
+                    "WHISPER_SPEAKER_VERIFY", ""
+
+                ).strip().lower() in ("1", "true", "yes")
+
+                verify_tmp: str | None = None
+
+                try:
+
+                    if want_spk:
+
+                        try:
+
+                            from speaker_verify import (
+
+                                SpeakerRejected,
+
+                                SpeakerVerifyUnavailable,
+
+                                embedding_path,
+
+                                verify_wav_file_or_raise,
+
+                            )
+
+                            if embedding_path().is_file():
+
+                                import soundfile as sf
+
+                                with tempfile.NamedTemporaryFile(
+
+                                    suffix=".wav", delete=False
+
+                                ) as tmp:
+
+                                    verify_tmp = tmp.name
+
+                                sf.write(verify_tmp, audio, self.sample_rate)
+
+                                try:
+
+                                    verify_wav_file_or_raise(
+
+                                        verify_tmp,
+
+                                        thr_override=self._speaker_threshold,
+
+                                    )
+
+                                except SpeakerVerifyUnavailable:
+
+                                    pass
+
+                                except SpeakerRejected as e:
+
+                                    log.info("Голос не совпал с эталоном: %s", e)
+
+                                    self._emit_toast("Голос", str(e)[:220], True)
+
+                                    return
+
+                        except ImportError:
+
+                            log.warning("speaker_verify недоступен (requirements-speaker.txt)")
+
+                finally:
+
+                    if verify_tmp:
+
+                        try:
+
+                            os.unlink(verify_tmp)
+
+                        except OSError:
+
+                            pass
 
                 print("[Whisper] Обработка…", flush=True)
 
@@ -772,6 +910,12 @@ class WhisperHotkey:
         except Exception:
 
             return
+
+        if not active:
+
+            with self._lock:
+
+                self._mic_fail_toast_ok = True
 
         if active and not self._last_combo:
 
@@ -977,6 +1121,28 @@ def main() -> int:
 
     )
 
+    p.add_argument(
+
+        "--speaker-verify",
+
+        action="store_true",
+
+        help="Сверять с эталоном ~/.whisper/speaker_embedding.npy (см. requirements-speaker.txt)",
+
+    )
+
+    p.add_argument(
+
+        "--speaker-threshold",
+
+        type=float,
+
+        default=None,
+
+        help="Порог сходства голоса (иначе WHISPER_SPEAKER_THRESHOLD или значение по умолчанию)",
+
+    )
+
     args = p.parse_args()
 
 
@@ -1005,6 +1171,24 @@ def main() -> int:
 
 
 
+    sthr = args.speaker_threshold
+
+    if sthr is None and (os.environ.get("WHISPER_SPEAKER_THRESHOLD") or "").strip():
+
+        try:
+
+            sthr = float(os.environ["WHISPER_SPEAKER_THRESHOLD"].strip())
+
+        except ValueError:
+
+            sthr = None
+
+    spk = args.speaker_verify or (
+
+        os.environ.get("WHISPER_SPEAKER_VERIFY", "").strip().lower() in ("1", "true", "yes")
+
+    )
+
     service = WhisperHotkey(
 
         model=resolve_model(args.model),
@@ -1018,6 +1202,10 @@ def main() -> int:
         max_hold_seconds=args.max_hold,
 
         spoken_punctuation=not args.no_spoken_punctuation,
+
+        speaker_verify=spk,
+
+        speaker_threshold=sthr,
 
     )
 

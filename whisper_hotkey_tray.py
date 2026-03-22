@@ -2,6 +2,8 @@
 """
 Whisper Hotkey в фоне: иконка в трее, уведомления (запуск / запись / результат / ошибки).
 Лог: whisper_hotkey.log рядом с exe. Отключить уведомления: трей «Уведомления» или WHISPER_HOTKEY_NO_NOTIFICATIONS=1.
+Голос (как на Mac): эталон в ~/.whisper/speaker_embedding.npy, меню «Записать эталон…», «Проверка голоса» или WHISPER_SPEAKER_VERIFY=1 (нужен pip install -r requirements-speaker.txt при сборке exe).
+Без стартового тоста: WHISPER_HOTKEY_SILENT_START=1. Повторы одного и того же текста и частые тосты режутся (антиспам).
 
 Сборка: packaging/build-hotkey-gui-exe.bat → WhisperHotkey.exe
 """
@@ -44,12 +46,16 @@ def _load_prefs() -> dict:
     try:
         if OLD_PREFS.is_file():
             data = json.loads(OLD_PREFS.read_text(encoding="utf-8"))
-            merged = {"model_key": data.get("model_key", "large-v3"), "notifications": True}
+            merged = {
+                "model_key": data.get("model_key", "large-v3"),
+                "notifications": True,
+                "speaker_verify": False,
+            }
             _save_prefs(merged)
             return merged
     except (OSError, json.JSONDecodeError, TypeError):
         pass
-    return {"model_key": "large-v3", "notifications": True}
+    return {"model_key": "large-v3", "notifications": True, "speaker_verify": False}
 
 
 def _save_prefs(data: dict) -> None:
@@ -66,9 +72,28 @@ def _notifications_enabled() -> bool:
     return bool(_load_prefs().get("notifications", True))
 
 
-def _notify(title: str, body: str, error: bool = False) -> None:
+_NOTIFY_LOCK = threading.Lock()
+_NOTIFY_STATE: dict = {"t": 0.0, "sig": ""}
+
+
+def _notify(title: str, body: str, error: bool = False, *, force: bool = False) -> None:
     if not _notifications_enabled():
         return
+    sig = f"{title}\x00{body[:160]}"
+    now = time.monotonic()
+    if not force:
+        gap = 1.0 if error else 3.0
+        with _NOTIFY_LOCK:
+            if sig == _NOTIFY_STATE.get("sig") and now - float(_NOTIFY_STATE.get("t", 0)) < 15.0:
+                return
+            if now - float(_NOTIFY_STATE.get("t", 0)) < gap:
+                return
+            _NOTIFY_STATE["sig"] = sig
+            _NOTIFY_STATE["t"] = now
+    else:
+        with _NOTIFY_LOCK:
+            _NOTIFY_STATE["sig"] = sig
+            _NOTIFY_STATE["t"] = now
     try:
         from plyer import notification
 
@@ -76,7 +101,7 @@ def _notify(title: str, body: str, error: bool = False) -> None:
             title=title[:63],
             message=body[:255],
             app_name="Whisper Hotkey",
-            timeout=8,
+            timeout=5,
         )
     except Exception:
         import logging
@@ -91,6 +116,95 @@ def _is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def _speaker_threshold_from_env() -> float | None:
+    raw = os.environ.get("WHISPER_SPEAKER_THRESHOLD", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _run_enroll_speaker_worker(log, notify) -> None:
+    """Запись ~45 с с микрофона → ~/.whisper/speaker_embedding.npy (как enroll на Mac)."""
+    import tempfile
+
+    import numpy as np
+    import pyaudio
+    import soundfile as sf
+
+    sec = 45
+    rate = 16000
+    chunk = 1024
+    n_chunks = int(rate / chunk * sec) + 1
+    notify("Эталон голоса", f"Через 2 с запись {sec} с — говори в обычном темпе.", False, force=True)
+    time.sleep(2.0)
+    stream = None
+    pa = None
+    path: str | None = None
+    try:
+        pa = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paFloat32,
+            channels=1,
+            rate=rate,
+            input=True,
+            frames_per_buffer=chunk,
+        )
+        parts: list[bytes] = []
+        for _ in range(n_chunks):
+            parts.append(stream.read(chunk, exception_on_overflow=False))
+        raw_audio = b"".join(parts)
+        audio = np.frombuffer(raw_audio, dtype=np.float32)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sf.write(path, audio, rate)
+        from speaker_verify import enroll_from_wav
+
+        enroll_from_wav(path)
+        pr = _load_prefs()
+        pr["speaker_verify"] = True
+        _save_prefs(pr)
+        notify(
+            "Эталон голоса",
+            "Сохранён. Проверка голоса включена в настройках — перезапусти hotkey.",
+            False,
+            force=True,
+        )
+    except ImportError:
+        log.exception("enroll: нет speaker_verify / torch")
+        notify(
+            "Эталон голоса",
+            "Нужны зависимости: pip install -r requirements-speaker.txt и пересборка exe.",
+            True,
+            force=True,
+        )
+    except OSError as e:
+        log.exception("enroll: микрофон")
+        notify("Эталон голоса", f"Микрофон: {e}"[:220], True, force=True)
+    except Exception as e:
+        log.exception("enroll failed")
+        notify("Эталон голоса", str(e)[:220], True, force=True)
+    finally:
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except OSError:
+                pass
+        if pa is not None:
+            try:
+                pa.terminate()
+            except OSError:
+                pass
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _load_tray_image():
@@ -130,15 +244,23 @@ def main() -> int:
 
     os.environ["WHISPER_MODEL"] = model_key
 
-    if not _is_admin():
-        log.warning("Запуск без прав администратора — Ctrl+Win может не работать")
-        _notify(
-            "Whisper Hotkey",
-            "Нет прав администратора: перехват Ctrl+Win может не работать. Запусти exe от администратора.",
-            True,
-        )
-    else:
-        _notify("Whisper Hotkey", f"Работаю в фоне (v{_ver()}). Ctrl+Win — запись.", False)
+    silent_start = os.environ.get("WHISPER_HOTKEY_SILENT_START", "").strip().lower() in ("1", "true", "yes")
+    if not silent_start:
+        if not _is_admin():
+            log.warning("Запуск без прав администратора — Ctrl+Win может не работать")
+            _notify(
+                "Whisper Hotkey",
+                f"v{_ver()} · Ctrl+Win — запись. Нет прав администратора: перехват может не работать — запусти exe от администратора.",
+                True,
+                force=True,
+            )
+        else:
+            _notify(
+                "Whisper Hotkey",
+                f"Работаю в фоне (v{_ver()}). Ctrl+Win — запись.",
+                False,
+                force=True,
+            )
 
     def toast_cb(title: str, body: str, error: bool) -> None:
         _notify(title, body, error=error)
@@ -148,6 +270,7 @@ def main() -> int:
 
         time.sleep(0.4)
         try:
+            hp = _load_prefs()
             svc = WhisperHotkey(
                 model=resolve_model(os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3"),
                 device=os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda",
@@ -155,11 +278,13 @@ def main() -> int:
                 language=os.environ.get("WHISPER_LANGUAGE", "").strip() or None,
                 status_callback=lambda m: log.info("status: %s", m),
                 toast_callback=toast_cb,
+                speaker_verify=bool(hp.get("speaker_verify", False)),
+                speaker_threshold=_speaker_threshold_from_env(),
             )
             svc.run()
         except Exception:
             log.exception("Фатальная ошибка hotkey")
-            _notify("Whisper Hotkey", "Критическая ошибка — см. whisper_hotkey.log", True)
+            _notify("Whisper Hotkey", "Критическая ошибка — см. whisper_hotkey.log", True, force=True)
 
     def set_model(icon: pystray.Icon, key: str) -> None:
         p = _load_prefs()
@@ -167,7 +292,7 @@ def main() -> int:
         _save_prefs(p)
         os.environ["WHISPER_MODEL"] = key
         log.info("В prefs выбрана модель %s (нужен перезапуск)", key)
-        _notify("Модель", "Перезапусти Whisper Hotkey, чтобы применить модель.", False)
+        _notify("Модель", "Перезапусти Whisper Hotkey, чтобы применить модель.", False, force=True)
         icon.update_menu()
 
     def toggle_notifications(icon: pystray.Icon, item: object) -> None:
@@ -176,8 +301,26 @@ def main() -> int:
         _save_prefs(p)
         log.info("Уведомления: %s", p["notifications"])
         if p["notifications"]:
-            _notify("Уведомления", "Включены.", False)
+            _notify("Уведомления", "Включены.", False, force=True)
         icon.update_menu()
+
+    def toggle_speaker_verify(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p["speaker_verify"] = not bool(p.get("speaker_verify", False))
+        _save_prefs(p)
+        log.info("Проверка голоса (prefs): %s", p["speaker_verify"])
+        _notify("Голос", "Перезапусти Whisper Hotkey, чтобы применить проверку голоса.", False, force=True)
+        icon.update_menu()
+
+    def start_enroll_speaker(icon: pystray.Icon, item: object) -> None:
+        def w() -> None:
+            _run_enroll_speaker_worker(log, _notify)
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
+
+        threading.Thread(target=w, name="whisper-enroll", daemon=True).start()
 
     def open_log_folder(icon: pystray.Icon, item: object) -> None:
         d = log_dir()
@@ -223,9 +366,15 @@ def main() -> int:
         on = bool(_load_prefs().get("notifications", True))
         return f"Уведомления: {'вкл' if on else 'выкл'}"
 
+    def spk_label(item: object) -> str:
+        on = bool(_load_prefs().get("speaker_verify", False))
+        return f"Проверка голоса: {'вкл' if on else 'выкл'} (перезапуск)"
+
     menu = pystray.Menu(
         Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
         Item(notif_label, toggle_notifications),
+        Item(spk_label, toggle_speaker_verify),
+        Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item("Модель → (перезапуск)", model_submenu()),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),

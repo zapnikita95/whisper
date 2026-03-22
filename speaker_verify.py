@@ -82,7 +82,9 @@ def score_wav_file(wav_path: str | Path) -> float:
     """Косинусное сходство с эталоном [0..1] для целого utterance."""
     ref = load_reference()
     if ref is None:
-        raise SpeakerVerifyUnavailable("Нет эталона — выполни enroll (Mac: --enroll-speaker).")
+        raise SpeakerVerifyUnavailable(
+            "Нет эталона — Mac: --enroll-speaker или меню трея; Windows hotkey: «Записать эталон голоса»."
+        )
     encoder, preprocess_wav = _load_encoder()
     wav = preprocess_wav(Path(wav_path))
     if wav.size < 4000:

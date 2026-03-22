@@ -286,12 +286,15 @@ powershell -ExecutionPolicy Bypass -File "$W\packaging\setup-venv-and-build.ps1"
 
 | Файл | Когда |
 |------|--------|
-| **`whisper_server.log`** | HTTP-сервер (`whisper_server.py` / `WhisperServer.exe`), ротация ~2 МБ. |
+| **`whisper_server.log`** | HTTP-сервер (`whisper_server.py` / `WhisperServer.exe`), ротация ~2 МБ, строки сразу пишутся на диск. |
+| **`%TEMP%\WhisperServer_last_run.log`** | То же самое для сервера — дубль, чтобы не искать каталог с exe (удобно из GUI без консоли). |
 | **`whisper_hotkey.log`** | Hotkey (консоль и трей / `WhisperHotkey.exe`). |
+
+Пока в логе висит строка про **импорт faster_whisper** — HTTP ещё не поднят: это загрузка CUDA/CTranslate2 (часто десятки секунд и дольше), не «сломался» API. После **«Uvicorn принимает HTTP»** `GET /` начинает отвечать; **`ready: true`** в JSON — только после первой загрузки весов модели (обычно при первом `POST /transcribe`). Окно **Whisper GPU Server** ждёт ответ API до **~5 минут** (раньше обрывалось через ~60 с и показывало ложный «нет ответа»). Если в **`whisper_server.log`** есть «Импорт faster_whisper завершён», но **нет** строки «**Uvicorn принимает HTTP**» — пересобери **WhisperServer.exe** (исправлен запуск uvicorn из фонового потока: `WindowsSelectorEventLoopPolicy` и отключение записи uvicorn в stderr в windowed-сборке).
 
 Каталог логов: рядом с exe или скриптом; переопределение: **`WHISPER_LOG_DIR=C:\путь`**.
 
-Hotkey: отключить всплывающие уведомления — **меню трея «Уведомления»** или **`WHISPER_HOTKEY_NO_NOTIFICATIONS=1`**.
+Hotkey: отключить всплывающие уведомления — **меню трея «Уведомления»** или **`WHISPER_HOTKEY_NO_NOTIFICATIONS=1`**. Без стартового тоста: **`WHISPER_HOTKEY_SILENT_START=1`**. Одинаковые и слишком частые тосты режутся (антиспам); **уже показанные** баннеры в Центре уведомлений Windows приложение не «отзывает» — их можно **очистить вручную** (Параметры → Система → Уведомления) или отключить уведомления для приложения.
 
 ---
 
@@ -316,6 +319,8 @@ Set-Location $Repo
 
 **Ошибка `Failed to load Python DLL` … `build\…\_internal\python312.dll`:** ты запускаешь **не тот** exe. PyInstaller кладёт **рабочую** сборку только в **`dist\`**. Папка **`build\`** — временная, оттуда запуск **нельзя**. Открой именно `dist\WhisperServer\` или `dist\WhisperHotkey\`.
 
+**Сборка сервера: `PermissionError` / WinError 5 при `Removing dir dist\WhisperServer`:** папка занята — **закрой `WhisperServer.exe`**, закрой **Проводник** в `dist\WhisperServer`, при необходимости пауза антивируса. Батник `packaging\build-server-gui-exe.bat` собирает сначала в **`dist\.whisper_stage`**, затем переносит в `dist\WhisperServer`. Если перенос не вышел, запускай **`dist\.whisper_stage\WhisperServer\WhisperServer.exe`** или выполни **`packaging\promote-whisper-server-dist.bat`** после освобождения папки.
+
 Если **из `dist\`** та же ошибка — поставь [VC++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) и перенеси всю папку с exe с OneDrive на локальный диск (синк иногда портит DLL).
 
 Повторные сборки: шаги 4–6 (или только 6, если зависимости не менялись).
@@ -330,7 +335,9 @@ Set-Location $Repo
 
 Результат: **`dist\WhisperHotkey\WhisperHotkey.exe`** (+ `_internal`): **иконка в трее**, уведомления (старт, запись, результат, ошибки). Запуск **от имени администратора**. Без сборки: **`start-whisper-hotkey-gui.bat`**.
 
-Консольный вариант: `whisper-hotkey.py` / `start-whisper-hotkey.bat` → тот же **`whisper_hotkey.log`**.
+**Проверка голоса (как на Mac):** тот же эталон **`%USERPROFILE%\.whisper\speaker_embedding.npy`**. В трее: **«Записать эталон голоса (~45 с)…»** и пункт **«Проверка голоса»** (после переключения — перезапуск hotkey). Либо **`WHISPER_SPEAKER_VERIFY=1`** и опционально **`WHISPER_SPEAKER_THRESHOLD`**. Чтобы эта логика попала в exe, в venv перед сборкой: **`pip install -r requirements-speaker.txt`** (torch + resemblyzer). Если GPU не грузится и в **`whisper_hotkey.log`** нет `cublas64_12.dll`, поставь **`pip install nvidia-cublas-cu12`**.
+
+Консольный вариант: `whisper-hotkey.py` / `start-whisper-hotkey.bat` → тот же **`whisper_hotkey.log`**, флаги **`--speaker-verify`** / **`--speaker-threshold`**.
 
 #### Коротко по шагам (сервер)
 

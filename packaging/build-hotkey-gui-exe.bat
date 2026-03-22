@@ -12,10 +12,12 @@ if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
 set "ICODATA="
 if exist "assets\app_icon.ico" set "ICODATA=--add-data assets\app_icon.ico;assets"
 
+REM Проверка голоса в exe: в venv сначала pip install -r requirements-speaker.txt (torch + resemblyzer).
 "%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey ^
   %ICONLINE% ^
   --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray ^
   --hidden-import whisper_models --hidden-import whisper_file_log ^
+  --hidden-import speaker_verify ^
   --hidden-import faster_whisper --hidden-import whisper_version ^
   --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip ^
   --hidden-import soundfile --hidden-import numpy ^

@@ -1,6 +1,9 @@
 """
 HTTP API сервер для транскрипции через Whisper на GPU (Windows).
 Импортируется GUI и uvicorn; точка входа CLI — whisper-server.py (shim) или python -m.
+
+Важно: лог поднимается ДО импорта faster_whisper — иначе долгая загрузка CUDA/CT2 выглядит как «тишина».
+Файлы: whisper_server.log (рядом с exe / WHISPER_LOG_DIR) и %TEMP%\\WhisperServer_last_run.log
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 try:
     from fastapi import FastAPI, File, Request, UploadFile, HTTPException
@@ -22,6 +26,27 @@ except ImportError as e:
     print(f"Ошибка импорта: {e}", file=sys.stderr)
     print("Установи: pip install fastapi uvicorn python-multipart", file=sys.stderr)
     sys.exit(1)
+
+from whisper_file_log import configure
+from whisper_models import resolve_model
+
+_SERVER_TEMP_LOG = "WhisperServer_last_run.log"
+log = configure(
+    "whisper.server",
+    "whisper_server.log",
+    flush_each_record=True,
+    mirror_temp_basename=_SERVER_TEMP_LOG,
+)
+log.info(
+    "=== старт процесса сервера pid=%s cwd=%s TEMP=%s ===",
+    os.getpid(),
+    os.getcwd(),
+    tempfile.gettempdir(),
+)
+log.info(
+    "Основной лог: рядом с приложением (см. whisper_file_log.log_dir); копия в %%TEMP%%/%s",
+    _SERVER_TEMP_LOG,
+)
 
 
 def _prepend_nvidia_cublas_to_path() -> None:
@@ -44,8 +69,17 @@ def _prepend_nvidia_cublas_to_path() -> None:
 
 
 _prepend_nvidia_cublas_to_path()
+log.info("PATH (cublas): проверка завершена")
 
-from faster_whisper import WhisperModel
+log.info(
+    "Импорт faster_whisper (CTranslate2, CUDA DLL и т.д.) — часто 10–90 с, это норма; HTTP ещё не слушает."
+)
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    log.exception("Не удалось импортировать faster_whisper")
+    raise
+log.info("Импорт faster_whisper завершён — дальше создаётся FastAPI/uvicorn.")
 
 try:
     from whisper_version import __version__ as APP_VERSION
@@ -57,11 +91,6 @@ WINDOWS_LOCAL_HOTKEY_DESC = (
     "Whisper Hotkey (трей / Ctrl+Win) на этом ПК: запись в микрофон → текст в активное окно. Лог: whisper_hotkey.log."
 )
 
-from whisper_file_log import configure
-from whisper_models import resolve_model
-
-log = configure("whisper.server", "whisper_server.log")
-
 app = FastAPI(title="Whisper API Server")
 
 app.add_middleware(
@@ -72,7 +101,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_model: WhisperModel | None = None
+_model: Any = None
 _model_name = resolve_model(os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3")
 _device = (os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda")
 _compute_type = (os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8")
@@ -107,7 +136,7 @@ def get_clients_snapshot() -> dict:
     }
 
 
-def get_model() -> WhisperModel:
+def get_model() -> Any:
     global _model
     if _model is None:
         print(f"[Server] Загрузка модели {_model_name} ({_device}, {_compute_type})...", flush=True)
@@ -123,6 +152,13 @@ def get_model() -> WhisperModel:
         print("[Server] Модель загружена.", flush=True)
         log.info("Модель загружена")
     return _model
+
+
+@app.on_event("startup")
+def _log_http_ready() -> None:
+    log.info(
+        "Uvicorn принимает HTTP. GET / отвечает сразу; поле ready=true после первой загрузки весов (POST /transcribe)."
+    )
 
 
 @app.get("/")
@@ -252,6 +288,7 @@ def main() -> int:
     print(f"[Server] Версия: {APP_VERSION}", flush=True)
     print(f"[Server] Модель: {_model_name} ({_device}, {_compute_type})", flush=True)
     print("[Server] Для остановки: Ctrl+C", flush=True)
+    log.info("CLI: uvicorn.run host=%s port=%s", args.host, args.port)
 
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
