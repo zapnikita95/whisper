@@ -66,7 +66,7 @@ def _notifications_enabled() -> bool:
     return bool(_load_prefs().get("notifications", True))
 
 
-def _notify(title: str, body: str, *, error: bool = False) -> None:
+def _notify(title: str, body: str, error: bool = False) -> None:
     if not _notifications_enabled():
         return
     try:
