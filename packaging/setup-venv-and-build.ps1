@@ -4,8 +4,8 @@
 # Только venv и pip:
 #   powershell -ExecutionPolicy Bypass -File "...\packaging\setup-venv-and-build.ps1" -Build None
 #
-# Сборка сервера (WhisperServer.exe):
-#   powershell -ExecutionPolicy Bypass -File "...\packaging\setup-venv-and-build.ps1" -Build Server
+# Сборка сервера (WhisperServer.exe); путь к .ps1 полный или из корня репо:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\whisper\packaging\setup-venv-and-build.ps1" -Build Server
 #
 # Сборка hotkey (WhisperHotkey.exe, трей):
 #   powershell -ExecutionPolicy Bypass -File "...\packaging\setup-venv-and-build.ps1" -Build Hotkey
@@ -59,8 +59,8 @@ if ($DownloadModels) {
 
 function Invoke-ServerBuild {
     Write-Host ""
-    Write-Host ">>> packaging\build-server-gui-exe.bat"
-    cmd.exe /c "packaging\build-server-gui-exe.bat"
+    Write-Host ">>> packaging\build-server-gui-exe.bat nopause"
+    cmd.exe /c "packaging\build-server-gui-exe.bat nopause"
 }
 
 function Invoke-HotkeyBuild {

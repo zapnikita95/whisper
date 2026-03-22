@@ -23,7 +23,8 @@ echo.
 echo --- Закрой WhisperServer.exe и не держи открытой папку dist\WhisperServer в Проводнике ---
 echo.
 taskkill /IM WhisperServer.exe /F >nul 2>&1
-timeout /t 2 /nobreak >nul
+REM ~2 с без timeout: из PowerShell cmd /c без TTY даёт "Input redirection is not supported"
+ping 127.0.0.1 -n 3 >nul
 
 "%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperServer ^
   --distpath "%STAGE%" ^
@@ -51,7 +52,8 @@ if not exist "%STAGE%\WhisperServer\WhisperServer.exe" (
 echo.
 echo Перенос сборки в dist\WhisperServer ...
 taskkill /IM WhisperServer.exe /F >nul 2>&1
-timeout /t 2 /nobreak >nul
+REM ~2 с без timeout: из PowerShell cmd /c без TTY даёт "Input redirection is not supported"
+ping 127.0.0.1 -n 3 >nul
 
 if exist "%FINAL%" rmdir /s /q "%FINAL%"
 if exist "%FINAL%" (
@@ -84,5 +86,6 @@ echo   Если COLLECT падал с WinError 5: закрой WhisperServer.exe
 echo   закрой Проводник в dist\WhisperServer, повтори сборку.
 echo ============================================================
 echo.
-pause
+REM nopause — когда скрипт дергают из setup-venv-and-build.ps1 / CI
+if /i not "%~1"=="nopause" pause
 endlocal
