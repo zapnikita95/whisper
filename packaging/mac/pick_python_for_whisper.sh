@@ -13,15 +13,29 @@ pick_python_for_whisper() {
 			return 0
 		fi
 	fi
-	local cands=(
-		"/opt/homebrew/bin/python3"
-		"/usr/local/bin/python3"
-		"/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
-		"/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
-		"/Library/Frameworks/Python.framework/Versions/Current/bin/python3"
-		"$HOME/Library/Python/3.13/bin/python3"
-		"$HOME/Library/Python/3.12/bin/python3"
-	)
+	# Из .app: сначала python.org (туда обычно ставят pip install rumps), иначе часто берётся Homebrew без rumps → нет иконки.
+	local cands
+	if [ "${WHISPER_MAC_APP_PICK_PYTHON:-}" = "1" ]; then
+		cands=(
+			"/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
+			"/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+			"/Library/Frameworks/Python.framework/Versions/Current/bin/python3"
+			"/opt/homebrew/bin/python3"
+			"/usr/local/bin/python3"
+			"$HOME/Library/Python/3.13/bin/python3"
+			"$HOME/Library/Python/3.12/bin/python3"
+		)
+	else
+		cands=(
+			"/opt/homebrew/bin/python3"
+			"/usr/local/bin/python3"
+			"/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
+			"/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+			"/Library/Frameworks/Python.framework/Versions/Current/bin/python3"
+			"$HOME/Library/Python/3.13/bin/python3"
+			"$HOME/Library/Python/3.12/bin/python3"
+		)
+	fi
 	local x
 	x="$(command -v python3 2>/dev/null || true)"
 	[ -n "$x" ] && cands+=("$x")

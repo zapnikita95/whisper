@@ -171,6 +171,8 @@ Whisper иногда пишет фразу с ошибкой («восклица
    ```
    Затем открой `packaging/mac/WhisperClient.app`. **CFBundleExecutable** — не bash, а маленький **Mach-O stub** (`whisper_stub.c`), иначе Finder даёт ошибку вроде «нет разрешения открыть (null)». Скрипт `run.sh` подставляет PATH с Homebrew и проверяет pip-модули. Нужны **Xcode Command Line Tools** (`clang`) для сборки. Иконка: `assets/AppIcon.icns`. Перегенерация из PNG: `./packaging/regenerate_icons.sh`. Свой Python: `WHISPER_PYTHON3` (см. `packaging/mac/run.sh`). После правок `whisper-client-mac.py`: `./packaging/build_mac_app.sh`.
 
+   **Почему не было иконки 🎤:** из Finder клиент выбирал **первый** подходящий Python (часто Homebrew), а `pip3 install rumps` ты ставил в **python.org** (`/Library/Frameworks/...`) — в том интерпретаторе `import rumps` был `None`, меню не поднималось. Сейчас для `.app` порядок поиска: **сначала Python.org 3.13/3.12**, потом Homebrew; плюс при отсутствии rumps показывается **диалог** с точной командой `…/python3 -m pip install rumps`. Если поток хоткея падает, клиент **перезапускает** его и шлёт уведомление (процесс не должен «тихо исчезать» из‑за мёртвого listener).
+
 4. **Простой способ (скрипт):** двойной клик на `start-client-mac.command` в Finder  
    **Или из терминала:**
    ```bash

@@ -168,7 +168,14 @@ def _mac_notify_progress(body: str) -> None:
 
 
 def tray_icon_path() -> str | None:
-    """Иконка для строки меню: рядом со скриптом (.app Resources) или assets репозитория."""
+    """Иконка для строки меню: WHISPER_MAC_RESOURCES (.app), рядом со скриптом, assets репозитория."""
+    res = (os.environ.get("WHISPER_MAC_RESOURCES") or "").strip()
+    if res:
+        base = Path(res)
+        for name in ("AppIcon.icns", "AppIcon.png"):
+            p = base / name
+            if p.is_file():
+                return str(p)
     here = Path(__file__).resolve().parent
     for name in ("AppIcon.icns", "AppIcon.png"):
         p = here / name
@@ -204,7 +211,7 @@ def _check_pynput_py313() -> None:
         sys.exit(1)
 
 
-_check_pynput_py313()
+# Вызов перенесён в main() после configure_whisper_mac_logging — иначе при .app ошибка не попадает в файл лога.
 
 
 # --- Модификаторы pynput → каноническое имя
@@ -455,6 +462,7 @@ class WhisperClientMac:
         self._listener_ref: keyboard.Listener | None = None
         self._listener_ref_lock = threading.Lock()
         self._listener_thread: threading.Thread | None = None
+        self._listener_start_lock = threading.Lock()
         self._run_stop = False
         self._work_lock = threading.Lock()
         # PID процесса с полем ввода (frontmost при старте записи) — перед Cmd+V возвращаем фокус туда.
@@ -464,6 +472,34 @@ class WhisperClientMac:
         """Остановка клиента (меню «Выход», SIGINT)."""
         self._run_stop = True
         self._kick_listener_restart(force=True)
+
+    def _ensure_listener_thread(self) -> None:
+        """Поток pynput не должен «тихо умереть» и гасить весь клиент — поднимаем снова."""
+        with self._listener_start_lock:
+            if self._run_stop:
+                return
+            t = self._listener_thread
+            if t is not None and t.is_alive():
+                return
+            had_dead = t is not None
+            if had_dead:
+                _mac_log(
+                    "warning",
+                    "listener_thread_restarting (previous thread dead; hotkeys were inactive)",
+                )
+                try:
+                    mac_banner_notification(
+                        "Whisper",
+                        "Перехват клавиш перезапущен — снова можно диктовать.",
+                    )
+                except Exception:
+                    pass
+            self._listener_thread = threading.Thread(
+                target=self._listener_loop,
+                name="whisper-pynput-listener",
+                daemon=False,
+            )
+            self._listener_thread.start()
 
     def _reset_hotkey_tracker(self) -> None:
         """Сброс модели «какие клавиши зажаты» — после вставки и после цикла распознавания."""
@@ -1024,11 +1060,6 @@ class WhisperClientMac:
         )
 
         self._run_stop = False
-        self._listener_thread = threading.Thread(
-            target=self._listener_loop,
-            name="whisper-pynput-listener",
-            daemon=False,
-        )
 
         def _sigint(_signum: int, _frame: object | None) -> None:
             print("\n[Client] Остановка…", flush=True)
@@ -1036,14 +1067,31 @@ class WhisperClientMac:
 
         signal.signal(signal.SIGINT, _sigint)
 
-        self._listener_thread.start()
+        self._ensure_listener_thread()
+
+        def _headless_main_loop() -> None:
+            while not self._run_stop:
+                self._ensure_listener_thread()
+                t = self._listener_thread
+                if t is not None:
+                    t.join(timeout=0.6)
 
         try:
             if menu_bar and WhisperMenuBarApp is not None:
-                WhisperMenuBarApp(self).run()
+                try:
+                    WhisperMenuBarApp(self).run()
+                except BaseException:
+                    _MAC_LOGGER.exception("rumps_menu_bar_crashed_fallback_headless")
+                    try:
+                        mac_banner_notification(
+                            "Whisper",
+                            "Строка меню недоступна — клиент работает без иконки. См. ~/Library/Logs/WhisperMacClient.log",
+                        )
+                    except Exception:
+                        pass
+                    _headless_main_loop()
             else:
-                while self._listener_thread.is_alive() and not self._run_stop:
-                    self._listener_thread.join(timeout=0.5)
+                _headless_main_loop()
         finally:
             self.request_shutdown()
             if self._listener_thread is not None:
@@ -1102,6 +1150,12 @@ if rumps is not None:
                 busy = self.client._busy
             self.title = "🔴" if (rec or busy) else "🎤"
 
+        @rumps.timer(2.0)
+        def _watchdog_listener(self, _sender) -> None:
+            if self.client._run_stop:
+                return
+            self.client._ensure_listener_thread()
+
 else:
     WhisperMenuBarApp = None  # type: ignore[misc, assignment]
 
@@ -1109,6 +1163,12 @@ else:
 def main() -> int:
     log_path = configure_whisper_mac_logging()
     _mac_log("info", "=== старт whisper-client-mac ===")
+    try:
+        _check_pynput_py313()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _mac_log("error", "pynput_version_check_exit code=%s", e.code)
+        raise
 
     if hasattr(threading, "excepthook"):
         _orig_thread_excepthook = threading.excepthook
@@ -1267,6 +1327,31 @@ def main() -> int:
             "[Client] Иконка в строке меню: pip install rumps (тем же python3, что запускает клиент).",
             flush=True,
         )
+        exe = sys.executable.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display dialog "Нет пакета rumps — не будет иконки 🎤 в строке меню.\\n\\nВыполни в Терминале:\\n{exe} -m pip install rumps" '
+                'buttons {"OK"} default button 1 with title "Whisper Client"',
+            ],
+            check=False,
+            capture_output=True,
+        )
+        _mac_log("warning", "rumps_missing executable=%s", sys.executable)
+
+    _mac_log(
+        "info",
+        "runtime python=%s rumps_ok=%s menu_bar_requested=%s",
+        sys.executable,
+        rumps is not None,
+        (
+            sys.platform == "darwin"
+            and rumps is not None
+            and not args.no_menu_bar
+            and os.environ.get("WHISPER_MAC_NO_MENU") != "1"
+        ),
+    )
 
     client = WhisperClientMac(
         server_url=args.server,

@@ -7,6 +7,10 @@ MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$MACOS_DIR/pick_python_for_whisper.sh"
 export PYTHONUNBUFFERED=1
+export WHISPER_MAC_RESOURCES="$R"
+# До pick: иначе pick_python не знает, что это .app (порядок интерпретаторов = сначала Python.org + rumps).
+export WHISPER_FROM_APP_BUNDLE=1
+export WHISPER_MAC_APP_PICK_PYTHON=1
 
 PY="$(pick_python_for_whisper)" || {
 	osascript <<'OSA'
@@ -32,6 +36,5 @@ for a in "$@"; do
 		*) CMD+=("$a") ;;
 	esac
 done
-export WHISPER_FROM_APP_BUNDLE=1
 export WHISPER_NOTIFY_TOOL="$MACOS_DIR/whisper_notify"
 exec "${CMD[@]}"
