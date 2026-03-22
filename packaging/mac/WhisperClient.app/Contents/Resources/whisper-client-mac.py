@@ -10,6 +10,7 @@
 
 Журнал (вставка/сервер): ~/Library/Logs/WhisperMacClient.log — в Console фильтр «WHISPER_MAC».
 Полный текст распознавания в лог: WHISPER_MAC_DEBUG=1.
+Перехват клавиш — отдельный поток с автоперезапуском; иконка в меню — пакет rumps (опционально). Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import argparse
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import rumps
+except ImportError:
+    rumps = None  # type: ignore[misc, assignment]
+
 try:
     import requests
     import sounddevice as sd
@@ -69,6 +77,19 @@ def _mac_log(level: str, msg: str, *args: object) -> None:
         log_fn(msg, *args)
     else:
         _MAC_LOGGER.info(msg, *args)
+
+
+def tray_icon_path() -> str | None:
+    """Иконка для строки меню: рядом со скриптом (.app Resources) или assets репозитория."""
+    here = Path(__file__).resolve().parent
+    for name in ("AppIcon.icns", "AppIcon.png"):
+        p = here / name
+        if p.is_file():
+            return str(p)
+    assets = here.parent / "assets" / "AppIcon.icns"
+    if assets.is_file():
+        return str(assets)
+    return None
 
 
 def _check_pynput_py313() -> None:
@@ -344,10 +365,17 @@ class WhisperClientMac:
         self._kbd = KeyboardController()
         # Перезапуск глобального Listener после распознавания (macOS часто убивает tap после Cmd+V / synthetic keys)
         self._listener_ref: keyboard.Listener | None = None
+        self._listener_ref_lock = threading.Lock()
+        self._listener_thread: threading.Thread | None = None
         self._run_stop = False
         self._work_lock = threading.Lock()
         # PID процесса с полем ввода (frontmost при старте записи) — перед Cmd+V возвращаем фокус туда.
         self._paste_target_unix_id: int | None = None
+
+    def request_shutdown(self) -> None:
+        """Остановка клиента (меню «Выход», SIGINT)."""
+        self._run_stop = True
+        self._kick_listener_restart(force=True)
 
     def _reset_hotkey_tracker(self) -> None:
         """Сброс модели «какие клавиши зажаты» — после вставки и после цикла распознавания."""
@@ -357,15 +385,87 @@ class WhisperClientMac:
             self._hk_combo_active = False
 
     def _kick_listener_restart(self, *, force: bool = False) -> None:
-        """Останавливает текущий Listener; run() сразу поднимет новый (новый event tap)."""
+        """Останавливает текущий Listener; поток _listener_loop поднимет новый tap."""
         if not force and self._run_stop:
             return
-        lr = self._listener_ref
+        with self._listener_ref_lock:
+            lr = self._listener_ref
         if lr is not None:
             try:
                 lr.stop()
             except Exception:
                 pass
+
+    def _on_press_hotkey(self, key) -> None:
+        target = self.hotkey.tokens
+        try:
+            t = key_event_token(key)
+            should_start = False
+            with self._hk_lock:
+                if self._hk_suppress:
+                    return
+                if t:
+                    self._hk_pressed.add(t)
+                if frozenset(self._hk_pressed) == target and not self._hk_combo_active:
+                    self._hk_combo_active = True
+                    should_start = True
+            if should_start:
+                self._start_recording()
+        except Exception:
+            _MAC_LOGGER.debug("on_press_hotkey", exc_info=True)
+
+    def _on_release_hotkey(self, key) -> None:
+        target = self.hotkey.tokens
+        try:
+            t = key_event_token(key)
+            should_stop = False
+            with self._hk_lock:
+                if self._hk_suppress:
+                    return
+                if t:
+                    self._hk_pressed.discard(t)
+                if frozenset(self._hk_pressed) != target:
+                    if self._hk_combo_active:
+                        self._hk_combo_active = False
+                        should_stop = True
+            if should_stop:
+                self._stop_recording_and_process()
+        except Exception:
+            _MAC_LOGGER.debug("on_release_hotkey", exc_info=True)
+
+    def _listener_loop(self) -> None:
+        """Отдельный поток: бесконечно поднимает pynput Listener; при падении tap — пауза и снова."""
+        err_backoff = 0.25
+        while not self._run_stop:
+            try:
+                with keyboard.Listener(
+                    on_press=self._on_press_hotkey,
+                    on_release=self._on_release_hotkey,
+                    suppress=False,
+                ) as listener:
+                    with self._listener_ref_lock:
+                        self._listener_ref = listener
+                    try:
+                        listener.join()
+                    finally:
+                        with self._listener_ref_lock:
+                            if self._listener_ref is listener:
+                                self._listener_ref = None
+            except Exception:
+                _MAC_LOGGER.exception("pynput Listener crashed; will retry")
+                _mac_log(
+                    "warning",
+                    "hotkey_listener_restart_after_error backoff=%.2fs",
+                    err_backoff,
+                )
+                time.sleep(err_backoff)
+                err_backoff = min(err_backoff * 1.6, 4.0)
+                continue
+            err_backoff = 0.25
+            if self._run_stop:
+                break
+            _mac_log("debug", "listener_join_ended (kick or macOS); immediate restart")
+            time.sleep(0.12)
 
     def _release_sticky_modifiers(self) -> None:
         """Сбрасываем модификаторы после горячих клавиш — иначе они «дотягиваются» до синтетической вставки."""
@@ -767,71 +867,97 @@ class WhisperClientMac:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def run(self) -> None:
+    def run(self, *, menu_bar: bool = False) -> None:
         print(f"[Client] Удерживай {self._hotkey_label} — запись, отпусти все клавиши сочетания — распознавание.", flush=True)
         print(f"[Client] Сервер: {self.server_url}", flush=True)
-        print("[Client] Выход: Ctrl+C", flush=True)
+        if menu_bar and rumps is not None:
+            print("[Client] Иконка 🎤 в строке меню — «Выход» там же. Горячие клавиши без ⌘ (не трогаем Portal).", flush=True)
+        else:
+            print("[Client] Выход: Ctrl+C", flush=True)
         print(
-            "[Client] После каждой вставки перехват клавиш перезапускается (обход глюка macOS).",
+            "[Client] Перехват клавиш в фоновом потоке с автоперезапуском (macOS / Portal / Cmd+V).",
             flush=True,
         )
 
-        target = self.hotkey.tokens
         self._run_stop = False
+        self._listener_thread = threading.Thread(
+            target=self._listener_loop,
+            name="whisper-pynput-listener",
+            daemon=False,
+        )
 
-        def on_press(key):
-            try:
-                t = key_event_token(key)
-                should_start = False
-                with self._hk_lock:
-                    if self._hk_suppress:
-                        return
-                    if t:
-                        self._hk_pressed.add(t)
-                    if frozenset(self._hk_pressed) == target and not self._hk_combo_active:
-                        self._hk_combo_active = True
-                        should_start = True
-                if should_start:
-                    self._start_recording()
-            except Exception:
-                pass
+        def _sigint(_signum: int, _frame: object | None) -> None:
+            print("\n[Client] Остановка…", flush=True)
+            self.request_shutdown()
 
-        def on_release(key):
-            try:
-                t = key_event_token(key)
-                should_stop = False
-                with self._hk_lock:
-                    if self._hk_suppress:
-                        return
-                    if t:
-                        self._hk_pressed.discard(t)
-                    if frozenset(self._hk_pressed) != target:
-                        if self._hk_combo_active:
-                            self._hk_combo_active = False
-                            should_stop = True
-                if should_stop:
-                    self._stop_recording_and_process()
-            except Exception:
-                pass
+        signal.signal(signal.SIGINT, _sigint)
+
+        self._listener_thread.start()
 
         try:
-            while not self._run_stop:
-                with keyboard.Listener(
-                    on_press=on_press,
-                    on_release=on_release,
-                    suppress=False,
-                ) as listener:
-                    self._listener_ref = listener
-                    try:
-                        listener.join()
-                    finally:
-                        self._listener_ref = None
-        except KeyboardInterrupt:
-            self._run_stop = True
-            print("\n[Client] Остановка…", flush=True)
+            if menu_bar and WhisperMenuBarApp is not None:
+                WhisperMenuBarApp(self).run()
+            else:
+                while self._listener_thread.is_alive() and not self._run_stop:
+                    self._listener_thread.join(timeout=0.5)
         finally:
-            self._run_stop = True
-            self._kick_listener_restart(force=True)
+            self.request_shutdown()
+            if self._listener_thread is not None:
+                self._listener_thread.join(timeout=5.0)
+
+
+if rumps is not None:
+
+    class WhisperMenuBarApp(rumps.App):
+        """Индикатор в menu bar. Хоткей Whisper без ⌘ — не пересекается с Portal (⌘⌃P/C/V)."""
+
+        def __init__(self, client: WhisperClientMac) -> None:
+            ip = tray_icon_path()
+            if ip:
+                super().__init__("Whisper", icon=ip, quit_button=None)
+                self._emoji_mode = False
+            else:
+                super().__init__("Whisper", title="🎤", quit_button=None)
+                self._emoji_mode = True
+            self.client = client
+            self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
+            self.menu = [
+                self._mi_server,
+                rumps.separator,
+                rumps.MenuItem("Показать лог…", callback=self._open_log),
+                rumps.MenuItem("Выход", callback=self._quit),
+            ]
+
+        def _server_title(self) -> str:
+            u = self.client.server_url
+            return u if len(u) <= 56 else u[:53] + "…"
+
+        def _open_log(self, _sender) -> None:
+            logf = Path.home() / "Library" / "Logs" / "WhisperMacClient.log"
+            subprocess.run(["open", "-R", str(logf)], check=False)
+
+        def _quit(self, _sender) -> None:
+            self.client.request_shutdown()
+            if self.client._listener_thread and self.client._listener_thread.is_alive():
+                self.client._listener_thread.join(timeout=5.0)
+            rumps.quit_application()
+
+        @rumps.timer(0.5)
+        def _tick(self, _sender) -> None:
+            if self.client._run_stop:
+                rumps.quit_application()
+                return
+            self._mi_server.title = self._server_title()
+            if not self._emoji_mode:
+                return
+            rec = busy = False
+            with self.client._lock:
+                rec = self.client._recording
+                busy = self.client._busy
+            self.title = "🔴" if (rec or busy) else "🎤"
+
+else:
+    WhisperMenuBarApp = None  # type: ignore[misc, assignment]
 
 
 def main() -> int:
@@ -888,6 +1014,11 @@ def main() -> int:
         default=90.0,
         metavar="SEC",
         help="Секунд ожидания при --bind-hotkey (по умолчанию 90)",
+    )
+    p.add_argument(
+        "--no-menu-bar",
+        action="store_true",
+        help="Не показывать иконку в строке меню (нужен пакет rumps; см. README)",
     )
     args = p.parse_args()
     _mac_log("info", "server=%s log_file=%s", args.server, log_path)
@@ -963,6 +1094,23 @@ def main() -> int:
                 capture_output=True,
             )
 
+    use_menu_bar = (
+        sys.platform == "darwin"
+        and WhisperMenuBarApp is not None
+        and not args.no_menu_bar
+        and os.environ.get("WHISPER_MAC_NO_MENU") != "1"
+    )
+    if (
+        os.environ.get("WHISPER_FROM_APP_BUNDLE")
+        and sys.platform == "darwin"
+        and WhisperMenuBarApp is None
+        and not args.no_menu_bar
+    ):
+        print(
+            "[Client] Иконка в строке меню: pip install rumps (тем же python3, что запускает клиент).",
+            flush=True,
+        )
+
     client = WhisperClientMac(
         server_url=args.server,
         language=args.language,
@@ -970,7 +1118,7 @@ def main() -> int:
         hotkey=hotkey,
     )
     try:
-        client.run()
+        client.run(menu_bar=use_menu_bar)
     except KeyboardInterrupt:
         return 0
     except Exception as e:

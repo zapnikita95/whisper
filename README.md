@@ -160,6 +160,7 @@ Whisper иногда пишет фразу с ошибкой («восклица
 1. Установи зависимости:
    ```bash
    pip3 install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip
+   pip3 install rumps   # опционально: иконка 🎤 в строке меню (клиент не «пропал»); отключить: `--no-menu-bar` или `WHISPER_MAC_NO_MENU=1`
    ```
 
 2. Скопируй `whisper-client-mac.py` на Mac.
