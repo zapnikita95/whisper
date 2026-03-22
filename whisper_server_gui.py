@@ -225,6 +225,10 @@ def main() -> int:
         width=64,
     )
     combo_models.pack(anchor=tk.W, pady=(4, 2))
+    try:
+        combo_models.current(preset_keys.index(saved_key))
+    except (ValueError, tk.TclError):
+        pass
     ttk.Label(
         frm,
         text="Сначала выбери модель, затем «Запустить сервер». Сменить модель можно только после перезапуска этого окна.",
