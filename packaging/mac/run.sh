@@ -3,65 +3,28 @@
 # Вызывается из Mach-O stub Contents/MacOS/WhisperClient; $0 = .../run.sh
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../Resources" && pwd)"
+MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$MACOS_DIR/pick_python_for_whisper.sh"
 export PYTHONUNBUFFERED=1
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
-pick_python() {
-	local c
-	if [ -n "${WHISPER_PYTHON3:-}" ] && [ -x "${WHISPER_PYTHON3}" ]; then
-		echo "${WHISPER_PYTHON3}"
-		return 0
-	fi
-	c="$(command -v python3 2>/dev/null || true)"
-	if [ -n "$c" ] && [ -x "$c" ]; then
-		echo "$c"
-		return 0
-	fi
-	for c in \
-		/opt/homebrew/bin/python3 \
-		/usr/local/bin/python3 \
-		"$HOME/Library/Python/3.13/bin/python3" \
-		"$HOME/Library/Python/3.12/bin/python3" \
-		/usr/bin/python3
-	do
-		[ -x "$c" ] || continue
-		echo "$c"
-		return 0
-	done
-	return 1
-}
-
-PY="$(pick_python)" || {
+PY="$(pick_python_for_whisper)" || {
 	osascript <<'OSA'
-display dialog "Не найден python3. Поставь Python 3 (brew или python.org) и зависимости из README." buttons {"OK"} default button 1 with title "Whisper Client"
+display dialog "Не найден python3 с модулями (requests, pynput, sounddevice…). В Терминале для своего Python: python3 -m pip install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip. Либо задай WHISPER_PYTHON3 в run.sh." buttons {"OK"} default button 1 with title "Whisper Client"
 OSA
 	exit 1
 }
-
-if ! "$PY" -c "import requests, sounddevice, numpy, soundfile, pynput, pyperclip" 2>/dev/null; then
-	logger -t WhisperClient "missing pip deps for: $PY"
-	osascript <<'OSA'
-display dialog "Не хватает модулей (requests, pynput, sounddevice…). В Терминале выполни для ТОГО ЖЕ Python, что используешь для .command:
-
-/opt/homebrew/bin/python3 -m pip install requests sounddevice numpy soundfile pynput pyperclip
-
-Если python3 другой — замени путь (команда: which python3)." buttons {"OK"} default button 1 with title "Whisper Client"
-OSA
-	exit 1
-fi
 
 if URL="$("$PY" "$R/pick_server_url.py" 2>/dev/null)" && [ -n "$URL" ]; then
 	:
 else
-	URL="http://100.115.68.2:8000"
+	URL="http://${WHISPER_MAC_SERVER_HOST:-100.115.68.2}:8000"
 fi
 
-# Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения (например после open из Терминала со старым export).
-# Свой вариант: поменяй строку ниже (формат как в README: shift+ctrl+grave, alt+ctrl, …).
+# Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.
 export WHISPER_MAC_HOTKEY="shift+ctrl+grave"
 
-# Finder / Launch Services передаёт в .app аргумент -psn_0_… — argparse в Python падает и процесс мгновенно выходит (иконка в Dock «прыгает»).
-# Собираем argv в массив: при set -u пустой EXTRA[@] в exec ломает bash («unbound variable»).
+# Finder передаёт -psn_0_… — не пробрасываем в Python (argparse).
 CMD=( "$PY" "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt )
 for a in "$@"; do
 	case "$a" in

@@ -176,7 +176,11 @@ Whisper иногда пишет фразу с ошибкой («восклица
    chmod +x start-client-mac.command  # один раз
    ./start-client-mac.command
    ```
-   
+
+   **`[forkpty: Device not configured]` / «pseudo-tty»:** это не скрипт, а среда без настоящего терминала (часто **Run** в **Cursor**). Запускай из **Terminal.app** (`./start-client-mac.command`) или двойным кликом в **Finder**. Если `.command` открывается в Cursor: **Сведения** → «Открывать в программе» → **Terminal** → «Изменить всё…». Скрипт при отсутствии TTY сам вызывает `open -a Terminal`.
+
+   **Иконка в Dock «думает» полминуты:** раньше поиск сервера шёл по портам по очереди (~33 с). Сейчас **параллельный** опрос в `pick_server_url.py` + выбор первого **Python, где уже стоят pip-зависимости** (`pick_python_for_whisper.sh`). IP Windows в Tailscale: **`export WHISPER_MAC_SERVER_HOST=…`** перед запуском или URL аргументом. Если сервер не найден, `start-client-mac.command` всё равно стартует с `http://$HOST:8000` (можно сменить вручную).
+
    **Или напрямую:**
    ```bash
    python3 whisper-client-mac.py --server 'http://TAILSCALE_IP:ПОРТ'

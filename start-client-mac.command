@@ -1,72 +1,65 @@
 #!/bin/bash
-cd "$(dirname "$0")"
+# Запуск из Cursor/другой IDE без pseudo-TTY даёт: [forkpty: Device not configured].
+# Тогда открываем настоящий Terminal.app (там есть /dev/tty). Обход: WHISPER_MAC_COMMAND_SKIP_TTY_REDIRECT=1
+HERE="$(cd "$(dirname "$0")" && pwd)" || exit 1
+SELF="$HERE/$(basename "$0")"
+cd "$HERE" || exit 1
 
-# Всегда этот хост; порт — из server_port.txt или первый ответящий из 8000–8010.
-# Другой URL только если передать аргументом: ./start-client-mac.command 'http://другой:порт'
-
-HOST="100.115.68.2"
-CONNECT_TIMEOUT=3
-
-# Только ответ whisper-server.py: GET / → JSON с status ok и полем model (не любой HTTP на порту).
-is_whisper_port() {
-    local p="$1"
-    local body
-    body=$(curl -sf --connect-timeout "$CONNECT_TIMEOUT" "http://${HOST}:${p}/") || return 1
-    echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get('status')=='ok' and 'model' in d else 1)" 2>/dev/null
-}
-
-if [[ "${1:-}" =~ ^https?:// ]]; then
-    SERVER_URL="$1"
-    shift
-else
-    PORT=""
-    if [ -f server_port.txt ]; then
-        PORT=$(tr -d '[:space:]' < server_port.txt | tr -d '\r')
-    fi
-
-    if [ -n "$PORT" ] && is_whisper_port "$PORT"; then
-        echo "✓ Сервер: http://${HOST}:${PORT} (из server_port.txt)"
-    else
-        if [ -n "$PORT" ] && [ -f server_port.txt ]; then
-            echo "⚠ Порт из server_port.txt ($PORT) не похож на Whisper — ищу другой…"
-        fi
-        echo "Поиск Whisper API на ${HOST}, порты 8000–8010…"
-        PORT=""
-        for p in 8000 8001 8002 8003 8004 8005 8006 8007 8008 8009 8010; do
-            if is_whisper_port "$p"; then
-                PORT=$p
-                echo "✓ Найден Whisper на порту $PORT"
-                break
-            fi
-        done
-        if [ -z "$PORT" ]; then
-            echo "✗ ОШИБКА: сервер не найден на 100.115.68.2:8000–8010"
-            echo "Проверь Tailscale и что start-server.bat запущен на Windows."
-            read -p "Нажми Enter для выхода..."
-            exit 1
-        fi
-    fi
-    SERVER_URL="http://${HOST}:${PORT}"
+if [ ! -t 0 ] && [ -z "${WHISPER_MAC_COMMAND_SKIP_TTY_REDIRECT:-}" ]; then
+	echo "Нет интерактивного TTY (часто при «Run» из Cursor). Открываю Terminal.app…" >&2
+	exec open -a Terminal "$SELF"
+	exit 0
 fi
 
-if ! command -v python3 &> /dev/null; then
-    echo "Ошибка: Python 3 не найден."
-    read -p "Нажми Enter для выхода..."
-    exit 1
+# shellcheck source=/dev/null
+source "$HERE/packaging/mac/pick_python_for_whisper.sh"
+
+if ! PY="$(pick_python_for_whisper)"; then
+	echo "Ошибка: нет python3 с модулями requests, sounddevice, pynput, pyperclip…"
+	echo "  Установи: /opt/homebrew/bin/python3 -m pip install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip"
+	echo "  Или задай WHISPER_PYTHON3=/путь/к/python3 с уже установленными пакетами."
+	[ -t 0 ] && read -p "Нажми Enter для выхода..."
+	exit 1
 fi
 
 if [ ! -f "whisper-client-mac.py" ]; then
-    echo "Ошибка: whisper-client-mac.py не найден."
-    read -p "Нажми Enter для выхода..."
-    exit 1
+	echo "Ошибка: whisper-client-mac.py не найден (запускай из корня репозитория whisper)."
+	[ -t 0 ] && read -p "Нажми Enter для выхода..."
+	exit 1
 fi
 
-if ! python3 -c "import requests, sounddevice, numpy, soundfile, pynput, pyperclip" 2>/dev/null; then
-    echo "Установи зависимости:"
-    echo "  pip3 install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip"
-    echo ""
-    read -p "Продолжить? (y/n) " -n 1 -r; echo
-    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+# IP Windows в Tailscale: WHISPER_MAC_SERVER_HOST (по умолчанию старый пример из репо).
+export WHISPER_MAC_SERVER_HOST="${WHISPER_MAC_SERVER_HOST:-100.115.68.2}"
+H="$WHISPER_MAC_SERVER_HOST"
+
+# Явный URL: ./start-client-mac.command 'http://IP:ПОРТ'
+if [[ "${1:-}" =~ ^https?:// ]]; then
+	SERVER_URL="$1"
+	shift
+else
+	SERVER_URL=""
+	# Быстрая проверка server_port.txt (один curl)
+	if [ -f server_port.txt ]; then
+		HPORT=$(tr -d '[:space:]' < server_port.txt | tr -d '\r')
+		if [ -n "$HPORT" ]; then
+			if body=$(curl -sf --connect-timeout 2 "http://${H}:${HPORT}/") && echo "$body" | "$PY" -c "import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get('status')=='ok' and 'model' in d else 1)" 2>/dev/null; then
+				SERVER_URL="http://${H}:${HPORT}"
+				echo "✓ Сервер: $SERVER_URL (из server_port.txt + проверка /)"
+			fi
+		fi
+	fi
+	if [ -z "$SERVER_URL" ]; then
+		echo "Поиск Whisper API на $H:8000–8010 (параллельно, ~2 c)…"
+		if DETECTED="$("$PY" "$HERE/packaging/mac/pick_server_url.py" 2>/dev/null)" && [ -n "$DETECTED" ]; then
+			SERVER_URL="$DETECTED"
+			echo "✓ Сервер: $SERVER_URL"
+		else
+			SERVER_URL="http://${H}:8000"
+			echo "⚠ API не ответил — подставляю $SERVER_URL (клиент всё равно запустится)."
+			echo "  Укажи IP: export WHISPER_MAC_SERVER_HOST=твой_tailscale_ip"
+			echo "  Или URL: ./start-client-mac.command 'http://IP:ПОРТ'"
+		fi
+	fi
 fi
 
 echo "Сервер: $SERVER_URL"
@@ -76,6 +69,5 @@ echo "  Или сразу:  --hotkey 'alt+ctrl'  |  --hotkey 'ctrl+grave'  |  --
 echo "Для выхода: Ctrl+C"
 echo ""
 
-python3 whisper-client-mac.py --server "$SERVER_URL" "$@"
-
-read -p "Нажми Enter для выхода..."
+"$PY" whisper-client-mac.py --server "$SERVER_URL" "$@"
+[ -t 0 ] && read -p "Нажми Enter для выхода..."
