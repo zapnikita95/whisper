@@ -78,3 +78,10 @@ switch ($Build) {
         Invoke-HotkeyBuild
     }
 }
+
+Write-Host ""
+Write-Host "========== КУДА ЖАТЬ ==========" -ForegroundColor Yellow
+Write-Host "Сервер:  $Repo\dist\WhisperServer\WhisperServer.exe"
+Write-Host "Hotkey:   $Repo\dist\WhisperHotkey\WhisperHotkey.exe"
+Write-Host "НЕ открывай exe из папки build\ — там служебные файлы PyInstaller, запуск ломается."
+Write-Host "================================"

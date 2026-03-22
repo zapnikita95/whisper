@@ -26,5 +26,11 @@ if exist "assets\app_icon.ico" set "ICODATA=--add-data assets\app_icon.ico;asset
   whisper_hotkey_tray.py
 
 echo.
-echo Готово: dist\WhisperHotkey\WhisperHotkey.exe (рядом _internal)
+echo ============================================================
+echo   ВАЖНО: запускай ТОЛЬКО отсюда ^(вся папка dist\WhisperHotkey^):
+echo   %CD%\dist\WhisperHotkey\WhisperHotkey.exe
+echo.
+echo   НЕ запускай exe из папки build\ — ошибка Python DLL.
+echo ============================================================
+echo.
 pause

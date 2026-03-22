@@ -311,8 +311,12 @@ Set-Location $Repo
 
 После успешной сборки:
 
-- Запускай **`dist\WhisperServer\WhisperServer.exe`**.
-- Рядом обязательно лежит папка **`_internal`** — копируй/переноси **всю** папку `dist\WhisperServer`, а не один файл.
+- Запускай **`dist\WhisperServer\WhisperServer.exe`** (и hotkey: **`dist\WhisperHotkey\WhisperHotkey.exe`**).
+- Рядом обязательно лежит папка **`_internal`** — копируй/переноси **всю** папку `dist\WhisperServer` / `dist\WhisperHotkey`, а не один файл.
+
+**Ошибка `Failed to load Python DLL` … `build\…\_internal\python312.dll`:** ты запускаешь **не тот** exe. PyInstaller кладёт **рабочую** сборку только в **`dist\`**. Папка **`build\`** — временная, оттуда запуск **нельзя**. Открой именно `dist\WhisperServer\` или `dist\WhisperHotkey\`.
+
+Если **из `dist\`** та же ошибка — поставь [VC++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) и перенеси всю папку с exe с OneDrive на локальный диск (синк иногда портит DLL).
 
 Повторные сборки: шаги 4–6 (или только 6, если зависимости не менялись).
 

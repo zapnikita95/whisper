@@ -22,5 +22,12 @@ if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
   whisper_server_gui.py
 
 echo.
-echo Готово: dist\WhisperServer\WhisperServer.exe (или onefile — см. README)
+echo ============================================================
+echo   ВАЖНО: запускай ТОЛЬКО отсюда ^(вместе с папкой _internal^):
+echo   %CD%\dist\WhisperServer\WhisperServer.exe
+echo.
+echo   НЕ запускай exe из папки build\ — там неполная сборка,
+echo   будет ошибка "Failed to load Python DLL".
+echo ============================================================
+echo.
 pause
