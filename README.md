@@ -239,32 +239,30 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 ### Упаковка: exe без консоли (Windows)
 
-#### С нуля: окружение и сборка (копируй в PowerShell)
+#### С нуля: окружение и сборка
 
-Нужны **Python 3.10+** (в PATH) и **NVIDIA + драйвер** для GPU. Виртуальное окружение лучше держать **вне OneDrive** (иначе pip часто ломается на блокировках файлов).
+Нужны **Python 3.10+** (команда `python` в PATH) и **NVIDIA + драйвер** для GPU. Venv создаётся в **`%USERPROFILE%\.venvs\faster-whisper`** (вне OneDrive).
+
+**Самый простой вариант — один раз запустить скрипт** (путь поправь, если репозиторий не на рабочем столе):
 
 ```powershell
-# 1) Путь к клону репозитория (подставь свой, если другой)
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\OneDrive\Desktop\whisper\packaging\setup-venv-and-build.ps1"
+```
+
+Скрипт сам находит корень репозитория относительно своей папки `packaging\`, создаёт venv при необходимости, ставит `requirements.txt`, `pyinstaller` и вызывает `build-server-gui-exe.bat`.
+
+---
+
+**Если копируешь команды вручную — только целиком этот блок, подряд** (не по одной строке: иначе переменные пустые и всё ломается). Если папка проекта не `OneDrive\Desktop\whisper` — поменяй **первую** строку `$Repo`.
+
+```powershell
 $Repo = "$env:USERPROFILE\OneDrive\Desktop\whisper"
-
-# 2) Каталог для venv (не в OneDrive)
-$VenvDir = "$env:USERPROFILE\.venvs\faster-whisper"
-$Py    = "$VenvDir\Scripts\python.exe"
-$Pip   = "$VenvDir\Scripts\pip.exe"
-
-# 3) Создать venv и обновить pip
-New-Item -ItemType Directory -Force -Path (Split-Path $VenvDir) | Out-Null
-python -m venv $VenvDir
-& $Pip install -U pip
-
-# 4) Зависимости проекта (из корня репо)
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.venvs" | Out-Null
+python -m venv "$env:USERPROFILE\.venvs\faster-whisper"
+& "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" -m pip install -U pip
 Set-Location $Repo
-& $Pip install -r .\requirements.txt
-
-# 5) PyInstaller (только для сборки exe)
-& $Pip install pyinstaller
-
-# 6) Сборка GUI-сервера (батник сам вызовет PyInstaller из этого venv)
+& "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" -m pip install -r .\requirements.txt
+& "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" -m pip install pyinstaller
 .\packaging\build-server-gui-exe.bat
 ```
 
@@ -342,6 +340,7 @@ Set-Location $Repo
 | `packaging/mac/whisper_stub.c` | Mach-O загрузчик для .app (Finder) |
 | `assets/app_icon.png` | исходник иконки; `AppIcon.icns`, `app_icon.ico` — для .app / exe |
 | `packaging/regenerate_icons.sh` | PNG → icns + ico |
+| `packaging/setup-venv-and-build.ps1` | venv + pip + PyInstaller + вызов `build-server-gui-exe.bat` одной командой |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
 | `packaging/windows/WhisperServer.iss` | Inno Setup → `WhisperSetup-{версия}.exe` |
 | `packaging/mac/make_dmg.sh` | DMG для `WhisperClient.app` (create-dmg) |
