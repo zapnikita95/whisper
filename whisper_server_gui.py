@@ -172,21 +172,25 @@ def _maybe_check_updates_gui(root: object, current_ver: str) -> None:
     threading.Thread(target=worker, name="whisper-update-check", daemon=True).start()
 
 
+# Короткий таймаут: иначе на главном потоке Tk окно «Не отвечает» на секунды.
+_HTTP_TIMEOUT_SEC = 1.0
+
+
 def _fetch_clients_json(port: int) -> dict | None:
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{port}/clients")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SEC) as resp:
             return json.loads(resp.read().decode())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, TimeoutError):
         return None
 
 
 def _fetch_root_json(port: int) -> dict | None:
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{port}/")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SEC) as resp:
             return json.loads(resp.read().decode())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, TimeoutError):
         return None
 
 
@@ -254,6 +258,8 @@ def main() -> int:
 
     srv_started = {"ok": False}
     poll_gen = {"n": 0}
+    poll_worker_busy = {"v": False}
+    tree_worker_busy = {"v": False}
 
     api_health_var = tk.StringVar(value="● API: жми «Запустить сервер»")
     api_health = ttk.Label(frm, textvariable=api_health_var, font=("Segoe UI", 10, "bold"))
@@ -271,28 +277,45 @@ def main() -> int:
             api_health_var.set("● API: нет ответа")
             api_health.configure(foreground="#a30")
 
-    def _poll_api_after_start() -> None:
-        if not srv_started["ok"]:
+    def _schedule_api_poll() -> None:
+        """Опрос GET / только в фоне — иначе Tk зависает (Not Responding)."""
+        if not srv_started["ok"] or poll_worker_busy["v"]:
             return
-        data = _fetch_root_json(port)
-        if data and data.get("status") == "ok":
-            _apply_api_health(data)
-            status.config(
-                text="Сервер отвечает. Закрой окно — остановка (процесс завершится).",
-                foreground="#0a0",
-            )
-            return
-        poll_gen["n"] = poll_gen.get("n", 0) + 1
-        if poll_gen["n"] > 120:
-            _apply_api_health(None, "таймаут 60 с")
-            status.config(
-                text="Сервер не поднялся: смотри логи / антивирус / порт занят.",
-                foreground="#a00",
-            )
-            return
-        api_health_var.set(f"● Запуск API… ({poll_gen['n'] // 4} с)")
-        api_health.configure(foreground="#c80")
-        root.after(250, _poll_api_after_start)
+        poll_worker_busy["v"] = True
+
+        def work() -> None:
+            data: dict | None = None
+            try:
+                data = _fetch_root_json(port)
+            finally:
+
+                def apply() -> None:
+                    poll_worker_busy["v"] = False
+                    if not srv_started["ok"]:
+                        return
+                    if data and data.get("status") == "ok":
+                        _apply_api_health(data)
+                        status.config(
+                            text="Сервер отвечает. Закрой окно — остановка (процесс завершится).",
+                            foreground="#0a0",
+                        )
+                        return
+                    poll_gen["n"] = poll_gen.get("n", 0) + 1
+                    if poll_gen["n"] > 240:
+                        _apply_api_health(None, "таймаут ~60 с")
+                        status.config(
+                            text="Сервер не поднялся: whisper_server.log, антивирус, порт.",
+                            foreground="#a00",
+                        )
+                        return
+                    sec = poll_gen["n"] // 4
+                    api_health_var.set(f"● Запуск API… (~{sec} с) — окно не зависло, ждём в фоне")
+                    api_health.configure(foreground="#c80")
+                    root.after(250, _schedule_api_poll)
+
+                root.after(0, apply)
+
+        threading.Thread(target=work, name="whisper-gui-poll", daemon=True).start()
 
     def on_start_server() -> None:
         if srv_started["ok"]:
@@ -302,7 +325,7 @@ def main() -> int:
         key = _model_key_from_ui()
         _save_gui_prefs({"model_key": key})
         os.environ["WHISPER_MODEL"] = key
-        api_health_var.set("● Запуск uvicorn…")
+        api_health_var.set("● Запуск uvicorn… (импорт CTranslate2 может занять 1–3 мин)")
         api_health.configure(foreground="#c80")
         threading.Thread(
             target=lambda: _run_uvicorn(port, "0.0.0.0"),
@@ -311,8 +334,11 @@ def main() -> int:
         ).start()
         combo_models.configure(state="disabled")
         start_btn.state(["disabled"])
-        status.config(text="Поднимаю HTTP API…", foreground="#666")
-        root.after(300, _poll_api_after_start)
+        status.config(
+            text="Сервер грузится в фоне — см. whisper_server.log. Окно можно двигать.",
+            foreground="#666",
+        )
+        root.after(300, _schedule_api_poll)
 
     start_btn = ttk.Button(frm, text="Запустить сервер", command=on_start_server)
     start_btn.pack(anchor=tk.W, pady=(4, 8))
@@ -354,23 +380,45 @@ def main() -> int:
     status.pack(anchor=tk.W)
 
     def refresh_tree() -> None:
-        for i in tree.get_children():
-            tree.delete(i)
-        root_data = _fetch_root_json(port) if srv_started["ok"] else None
-        if srv_started["ok"]:
-            if root_data and root_data.get("status") == "ok":
-                _apply_api_health(root_data)
-            elif poll_gen["n"] > 120:
-                _apply_api_health(None, "нет ответа")
-        data = _fetch_clients_json(port)
-        if data:
-            for row in data.get("clients", []):
-                tree.insert(
-                    "",
-                    tk.END,
-                    values=(row.get("ip", ""), row.get("client", ""), row.get("last_seen_ago_sec", "")),
-                )
-        root.after(1500, refresh_tree)
+        if tree_worker_busy["v"]:
+            root.after(1500, refresh_tree)
+            return
+        tree_worker_busy["v"] = True
+
+        def work() -> None:
+            root_data = None
+            clients_data = None
+            try:
+                if srv_started["ok"]:
+                    root_data = _fetch_root_json(port)
+                clients_data = _fetch_clients_json(port)
+            finally:
+
+                def apply() -> None:
+                    tree_worker_busy["v"] = False
+                    if srv_started["ok"]:
+                        if root_data and root_data.get("status") == "ok":
+                            _apply_api_health(root_data)
+                        elif poll_gen["n"] > 240:
+                            _apply_api_health(None, "нет ответа")
+                    for i in tree.get_children():
+                        tree.delete(i)
+                    if clients_data:
+                        for row in clients_data.get("clients", []):
+                            tree.insert(
+                                "",
+                                tk.END,
+                                values=(
+                                    row.get("ip", ""),
+                                    row.get("client", ""),
+                                    row.get("last_seen_ago_sec", ""),
+                                ),
+                            )
+                    root.after(1500, refresh_tree)
+
+                root.after(0, apply)
+
+        threading.Thread(target=work, name="whisper-gui-clients", daemon=True).start()
 
     refresh_tree()
 
