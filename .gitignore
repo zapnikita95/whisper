@@ -8,4 +8,6 @@ dist/
 build/
 *.spec.bak
 /WhisperServer.spec
+/WhisperHotkey.spec
+whisper_hotkey_gui_prefs.json
 assets/AppIcon.iconset/

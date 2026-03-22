@@ -84,7 +84,8 @@ python -m venv $venv
 
 ### Самый простой запуск (батник)
 
-Дважды щёлкни **`start-whisper-hotkey.bat`**. Если прав администратора нет, Windows сама спросит подтверждение (нужно для глобального перехвата клавиш).
+- **С окном** (выбор модели, статус): **`start-whisper-hotkey-gui.bat`** или **`WhisperHotkey.exe`** после установки **`WhisperHotkeySetup-*.exe`**.
+- **Консоль** (логи в чёрном окне): **`start-whisper-hotkey.bat`**. Если прав администратора нет, Windows сама спросит подтверждение (нужно для глобального перехвата клавиш).
 
 ### Запуск из PowerShell
 
@@ -237,6 +238,17 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 **Примечание:** если обработка идёт, новая запись не начнётся автоматически (чтобы избежать зависаний).
 
+### Два установщика Windows (релиз по тегу `v*`)
+
+В [GitHub Actions](.github/workflows/release.yml) на тег **`v1.2.3`** собираются:
+
+| Файл в релизе | Назначение |
+|---------------|------------|
+| **`WhisperSetup-{версия}.exe`** | **Сервер** — GPU HTTP API для Mac и других клиентов (`WhisperServer.exe`). |
+| **`WhisperHotkeySetup-{версия}.exe`** | **Локальный клиент** — окно + Ctrl+Win, запись с микрофона и вставка текста на **этом** ПК (`WhisperHotkey.exe`). |
+
+Локально после PyInstaller: `ISCC.exe packaging\windows\WhisperServer.iss` и `ISCC.exe packaging\windows\WhisperHotkey.iss` (см. ниже).
+
 ### Упаковка: exe без консоли (Windows)
 
 #### С нуля: окружение и сборка
@@ -273,12 +285,24 @@ Set-Location $Repo
 
 Повторные сборки: шаги 4–6 (или только 6, если зависимости не менялись).
 
-#### Коротко по шагам
+#### Сборка Whisper Hotkey (локальный Ctrl+Win)
+
+Тот же venv, что и для сервера:
+
+```powershell
+.\packaging\build-hotkey-gui-exe.bat
+```
+
+Результат: **`dist\WhisperHotkey\WhisperHotkey.exe`** (+ `_internal`). Запуск **от имени администратора** (иначе перехват Ctrl+Win может не работать). Без сборки: **`start-whisper-hotkey-gui.bat`** из venv.
+
+Консольный вариант без окна по-прежнему: `whisper-hotkey.py` / `start-whisper-hotkey.bat` (логика в модуле `whisper_hotkey_core.py`).
+
+#### Коротко по шагам (сервер)
 
 1. В том же venv, где стоят `fastapi`, `faster-whisper`, `uvicorn`: `pip install pyinstaller`.
 2. В репозитории желательно есть `assets\app_icon.ico` (собирается на Mac: `packaging/regenerate_icons.sh` или кладётся вручную); без иконки сборка всё равно пройдёт, если в батнике нет файла.
 3. Запусти `packaging\build-server-gui-exe.bat` — получишь **onedir** `dist\WhisperServer\WhisperServer.exe` (рядом папка `_internal`). Первый запуск exe может быть долгим из‑за CTranslate2 и загрузки модели.
-4. Запуск **двойным кликом по WhisperServer.exe** — окно с выбором модели, портом и списком HTTP‑клиентов; `server_port.txt` создаётся в той же папке, что и exe. Для автозагрузки — ярлык на этот exe.
+4. Запуск **двойным кликом по WhisperServer.exe** — окно с выбором модели, портом, **статусом API (онлайн / модель / веса)** и списком HTTP‑клиентов; `server_port.txt` создаётся в той же папке, что и exe. Для автозагрузки — ярлык на этот exe.
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 
@@ -304,6 +328,8 @@ Set-Location $Repo
 
 `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\WhisperServer.iss /DMyAppVersion=1.2.0`
 
+`"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\WhisperHotkey.iss /DMyAppVersion=1.2.0`
+
 Локально DMG: `brew install create-dmg` → `./packaging/mac/make_dmg.sh`.
 
 ### Автообновление
@@ -311,7 +337,7 @@ Set-Location $Repo
 - **Windows (GUI):** через ~10 с после старта запрашивается GitHub `releases/latest`; если тег новее `packaging/VERSION`, предлагается скачать **`WhisperSetup-*.exe`** и запустить. Отключить: **`WHISPER_SKIP_UPDATE_CHECK=1`**. Другой репозиторий: **`WHISPER_RELEASES_REPO=owner/name`**.
 - **Mac (меню 🎤):** пункт **«Проверить обновления…»** — скачивает **`WhisperClient-*.dmg`** в `~/Downloads` (или открывает страницу релиза). Фоновое напоминание раз в сессию (~2 мин), если есть более новый тег.
 
-Имена вложений в релизе должны содержать **`WhisperSetup`** (`.exe`) и **`WhisperClient`** (`.dmg`) — так их находит клиент.
+Имена вложений в релизе: **`WhisperSetup`** (`.exe`) и **`WhisperClient`** (`.dmg`) — так автообновление сервера и Mac их находит. Второй установщик **`WhisperHotkeySetup`** — локальный hotkey, ставится отдельно.
 
 ### Верификация говорящего (опционально)
 
@@ -326,7 +352,10 @@ Set-Location $Repo
 | Файл | Назначение |
 |------|------------|
 | `transcribe.py` | CLI: файл → текст в консоль |
-| `whisper-hotkey.py` | Ctrl+Win удерживаешь — запись, отпускаешь — текст (Windows) |
+| `whisper_hotkey_core.py` | логика Ctrl+Win (запись → Whisper → вставка) |
+| `whisper-hotkey.py` | консольный вход (shim → core), без окна |
+| `whisper_hotkey_gui.py` | окно Whisper Hotkey + сборка `WhisperHotkey.exe` |
+| `start-whisper-hotkey-gui.bat` | GUI hotkey с запросом прав администратора |
 | `whisper_models.py` | пресеты моделей (ключ → HF id для faster-whisper) |
 | `whisper_server.py` | код HTTP API (импорт GUI / uvicorn) |
 | `whisper-server.py` | shim: запуск CLI как раньше |
@@ -342,7 +371,9 @@ Set-Location $Repo
 | `packaging/regenerate_icons.sh` | PNG → icns + ico |
 | `packaging/setup-venv-and-build.ps1` | venv + pip + PyInstaller + вызов `build-server-gui-exe.bat` одной командой |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
+| `packaging/build-hotkey-gui-exe.bat` | сборка `WhisperHotkey.exe` через PyInstaller |
 | `packaging/windows/WhisperServer.iss` | Inno Setup → `WhisperSetup-{версия}.exe` |
+| `packaging/windows/WhisperHotkey.iss` | Inno Setup → `WhisperHotkeySetup-{версия}.exe` |
 | `packaging/mac/make_dmg.sh` | DMG для `WhisperClient.app` (create-dmg) |
 | `packaging/VERSION` | номер версии для API, GUI, Mac, CI |
 | `whisper_version.py` | чтение версии (и `WHISPER_VERSION`) |

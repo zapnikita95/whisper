@@ -181,6 +181,15 @@ def _fetch_clients_json(port: int) -> dict | None:
         return None
 
 
+def _fetch_root_json(port: int) -> dict | None:
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
 def _run_uvicorn(port: int, host: str) -> None:
     import uvicorn
     from whisper_server import app
@@ -244,14 +253,57 @@ def main() -> int:
         return "large-v3"
 
     srv_started = {"ok": False}
+    poll_gen = {"n": 0}
+
+    api_health_var = tk.StringVar(value="● API: жми «Запустить сервер»")
+    api_health = ttk.Label(frm, textvariable=api_health_var, font=("Segoe UI", 10, "bold"))
+
+    def _apply_api_health(data: dict | None, offline_reason: str | None = None) -> None:
+        if data and data.get("status") == "ok":
+            m = data.get("model") or "?"
+            rd = "да" if data.get("ready") else "нет"
+            api_health_var.set(f"● API онлайн · модель: {m} · веса загружены: {rd}")
+            api_health.configure(foreground="#0a6")
+        elif offline_reason:
+            api_health_var.set(f"● API недоступен ({offline_reason})")
+            api_health.configure(foreground="#a30")
+        else:
+            api_health_var.set("● API: нет ответа")
+            api_health.configure(foreground="#a30")
+
+    def _poll_api_after_start() -> None:
+        if not srv_started["ok"]:
+            return
+        data = _fetch_root_json(port)
+        if data and data.get("status") == "ok":
+            _apply_api_health(data)
+            status.config(
+                text="Сервер отвечает. Закрой окно — остановка (процесс завершится).",
+                foreground="#0a0",
+            )
+            return
+        poll_gen["n"] = poll_gen.get("n", 0) + 1
+        if poll_gen["n"] > 120:
+            _apply_api_health(None, "таймаут 60 с")
+            status.config(
+                text="Сервер не поднялся: смотри логи / антивирус / порт занят.",
+                foreground="#a00",
+            )
+            return
+        api_health_var.set(f"● Запуск API… ({poll_gen['n'] // 4} с)")
+        api_health.configure(foreground="#c80")
+        root.after(250, _poll_api_after_start)
 
     def on_start_server() -> None:
         if srv_started["ok"]:
             return
         srv_started["ok"] = True
+        poll_gen["n"] = 0
         key = _model_key_from_ui()
         _save_gui_prefs({"model_key": key})
         os.environ["WHISPER_MODEL"] = key
+        api_health_var.set("● Запуск uvicorn…")
+        api_health.configure(foreground="#c80")
         threading.Thread(
             target=lambda: _run_uvicorn(port, "0.0.0.0"),
             name="uvicorn",
@@ -259,12 +311,15 @@ def main() -> int:
         ).start()
         combo_models.configure(state="disabled")
         start_btn.state(["disabled"])
-        status.config(text="Сервер запущен. Закрой окно — остановка.", foreground="#0a0")
+        status.config(text="Поднимаю HTTP API…", foreground="#666")
+        root.after(300, _poll_api_after_start)
 
     start_btn = ttk.Button(frm, text="Запустить сервер", command=on_start_server)
     start_btn.pack(anchor=tk.W, pady=(4, 8))
 
     ttk.Label(frm, text="HTTP API (удалённые клиенты)", font=("", 12, "bold")).pack(anchor=tk.W)
+    api_health.pack(anchor=tk.W, pady=(2, 0))
+
     ttk.Label(frm, text=f"Порт: {port}   •   Локально: http://127.0.0.1:{port}/").pack(anchor=tk.W, pady=(4, 0))
 
     lan_line = f"В сети (0.0.0.0:{port}) — подключай Mac / другие ПК по IP этого компьютера."
@@ -274,9 +329,9 @@ def main() -> int:
 
     ttk.Label(frm, text="Запись голоса на этом ПК (Windows)", font=("", 12, "bold")).pack(anchor=tk.W)
     hotkey_txt = (
-        "Отдельная программа whisper-hotkey.py (или start-whisper-hotkey.bat):\n"
-        "зажми Ctrl+Win — запись с микрофона, отпусти — распознавание и вставка текста.\n"
-        "Это не HTTP: клавиши обрабатываются локально, сервер выше — для Mac и прочих клиентов."
+        "Запись на этом ПК (Ctrl+Win) — отдельная программа Whisper Hotkey:\n"
+        "WhisperHotkey.exe или whisper_hotkey_gui.py / start-whisper-hotkey.bat.\n"
+        "Это не HTTP: клавиши локально; сервер выше — для Mac и других машин по сети."
     )
     ttk.Label(frm, text=hotkey_txt, wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 12))
 
@@ -301,6 +356,12 @@ def main() -> int:
     def refresh_tree() -> None:
         for i in tree.get_children():
             tree.delete(i)
+        root_data = _fetch_root_json(port) if srv_started["ok"] else None
+        if srv_started["ok"]:
+            if root_data and root_data.get("status") == "ok":
+                _apply_api_health(root_data)
+            elif poll_gen["n"] > 120:
+                _apply_api_health(None, "нет ответа")
         data = _fetch_clients_json(port)
         if data:
             for row in data.get("clients", []):

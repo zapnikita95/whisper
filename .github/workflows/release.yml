@@ -30,7 +30,7 @@ jobs:
       - name: Install deps
         run: python -m pip install -U pip wheel && pip install -r requirements.txt pyinstaller
 
-      - name: PyInstaller
+      - name: PyInstaller (WhisperServer)
         shell: bash
         run: |
           set -e
@@ -39,15 +39,30 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperServer \
             "${ICON_ARGS[@]}" \
             --collect-all uvicorn --collect-all fastapi --collect-all starlette \
-            --hidden-import whisper_server --hidden-import faster_whisper \
+            --hidden-import whisper_server --hidden-import whisper_models --hidden-import faster_whisper \
             --hidden-import whisper_version --hidden-import whisper_update_check \
             --add-data "packaging/VERSION;packaging" \
             whisper_server_gui.py
 
+      - name: PyInstaller (WhisperHotkey)
+        shell: bash
+        run: |
+          set -e
+          ICON_ARGS=()
+          if [ -f assets/app_icon.ico ]; then ICON_ARGS=(--icon assets/app_icon.ico); fi
+          python -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey \
+            "${ICON_ARGS[@]}" \
+            --hidden-import whisper_hotkey_core --hidden-import whisper_models \
+            --hidden-import faster_whisper --hidden-import whisper_version \
+            --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip \
+            --hidden-import soundfile --hidden-import numpy \
+            --add-data "packaging/VERSION;packaging" \
+            whisper_hotkey_gui.py
+
       - name: Inno Setup (Chocolatey)
         run: choco install innosetup -y --no-progress
 
-      - name: Compile .iss
+      - name: Compile .iss (Server + Hotkey)
         shell: pwsh
         run: |
           $candidates = @(
@@ -58,11 +73,17 @@ jobs:
           if (-not $iscc) { throw "ISCC.exe not found after choco install innosetup" }
           New-Item -ItemType Directory -Force -Path dist/release | Out-Null
           & $iscc "packaging\windows\WhisperServer.iss" /DMyAppVersion=$env:VERSION
+          & $iscc "packaging\windows\WhisperHotkey.iss" /DMyAppVersion=$env:VERSION
 
       - uses: actions/upload-artifact@v4
         with:
           name: whisper-setup
           path: dist/release/WhisperSetup-*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-hotkey-setup
+          path: dist/release/WhisperHotkeySetup-*.exe
 
   build-macos:
     runs-on: macos-latest
@@ -103,6 +124,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/whisper-setup/*.exe
+            artifacts/whisper-hotkey-setup/*.exe
             artifacts/whisper-dmg/*.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
