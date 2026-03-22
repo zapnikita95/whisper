@@ -4,7 +4,7 @@
 
 ## Что сделано в этом репо
 
-- У **Mac-клиента** (`whisper-client-mac.py`) умолчание сменено с **⌥+⌃** на **⌃+⇧+`** (`shift+ctrl+grave`) — редко бьётся об **⌘+W** и типичные ⌃⇧+буква в IDE.
+- У **Mac-клиента** (`whisper-client-mac.py`) умолчание: **⌃+⇧+⌥** (`shift+ctrl+alt`) — три модификатора, без клавиши *grave* (иначе в Cursor часто открывается терминал и в текст сыпятся символы backtick). Раньше было ⌃+⇧+grave.
 - **Portal** по умолчанию: **⌘+⌃+P**, **⌘+⌃+C**, **⌘+⌃+V** — **Cmd** в Whisper по умолчанию не задействован, пересечений нет.
 
 ## Быстрые правила
@@ -23,7 +23,7 @@
 python3 whisper-client-mac.py --server 'http://...' --hotkey 'shift+ctrl+]'
 
 # постоянно через env
-export WHISPER_MAC_HOTKEY='shift+ctrl+grave'
+export WHISPER_MAC_HOTKEY='shift+ctrl+alt'
 python3 whisper-client-mac.py --server 'http://...' --no-hotkey-prompt
 ```
 

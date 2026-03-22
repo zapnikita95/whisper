@@ -14,7 +14,7 @@
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		VWH9TXVpdGs8iHuCoio8yhY6zJ4=
+		dpjYhIqJHsiywULKN8sFNfvTAAk=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -32,10 +32,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			gflLDwA7VmokBso15fujWYiBMaM=
+			HW4y1XEO6dyy6YIcAfZmXVxoMZ8=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"81f94b0f003b566a2406ca35e5fba359888131a3"</string>
+			<string>cdhash H"1d6e32d5710ee9dcb2e9821c01f6665d5c68319f"</string>
 		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
@@ -55,7 +55,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			Y/Z4Z830Mjd0EyRyMqeZ3REa29HUHemuHhrl+dQ1jUQ=
+			kuf2q8fcafdB8AYetBAc4bjwwPdziodSTQz83/1tS84=
 			</data>
 		</dict>
 	</dict>

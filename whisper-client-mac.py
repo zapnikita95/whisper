@@ -2,9 +2,9 @@
 """
 Клиент для Mac: запись с микрофона, отправка на Windows-сервер, вставка текста.
 Запуск: python3 whisper-client-mac.py --server http://192.168.1.100:8000
-Горячая клавиша: при запуске в терминале спросит строку (Enter = ⌃+⇧+`), либо --hotkey, либо --bind-hotkey
+Горячая клавиша: при запуске в терминале спросит строку (Enter = ⌃+⇧+⌥), либо --hotkey, либо --bind-hotkey
 
-Рядом с Portal (⌘+⌃+P/C/V): по умолчанию ⌃+⇧+` — редко пересекается с ⌘+W / ⌃⇧W в приложениях.
+Рядом с Portal (⌘+⌃+P/C/V): по умолчанию ⌃+⇧+⌥ — три модификатора, без печатного символа (не пишет ` в поле и не бьётся с «терминал» в Cursor).
 Переопределение: WHISPER_MAC_HOTKEY или флаг --hotkey; в WhisperClient.app хоткей задаётся в packaging/mac/run.sh.
 См. PORTAL_AND_WHISPER_MAC.md
 
@@ -227,8 +227,8 @@ class HotkeySpec:
 
     @staticmethod
     def default_mac_with_portal() -> HotkeySpec:
-        """⌃+⇧+` — мало конфликтов с Portal (⌘+⌃+P / C / V) и с ⌘+W."""
-        return HotkeySpec(frozenset({"m:shift", "m:ctrl", "c:`"}))
+        """⌃+⇧+⌥ — только модификаторы: не вводят символ в текст и не совпадают с ⌃⇧` в Cursor (терминал)."""
+        return HotkeySpec(frozenset({"m:shift", "m:ctrl", "m:alt"}))
 
     @staticmethod
     def default_option_ctrl() -> HotkeySpec:
@@ -332,7 +332,7 @@ def bind_hotkey_interactive(timeout: float = 90.0) -> HotkeySpec:
         if done.wait(timeout):
             assert out[0] is not None
             return out[0]
-    print("[Client] Таймаут привязки — остаётся ⌃+⇧+` (shift+ctrl+grave).", flush=True)
+    print("[Client] Таймаут привязки — остаётся ⌃+⇧+⌥ (shift+ctrl+alt).", flush=True)
     return HotkeySpec.default_mac_with_portal()
 
 
@@ -973,11 +973,11 @@ def main() -> int:
         description="Whisper клиент для Mac",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-В терминале при старте (если не указан --hotkey) спросит сочетание; Enter = ⌃+⇧+`.
+В терминале при старте (если не указан --hotkey) спросит сочетание; Enter = ⌃+⇧+⌥.
 Примеры:
   %(prog)s --server URL
-  %(prog)s --server URL --hotkey ctrl+grave
-  %(prog)s --server URL --no-hotkey-prompt   # без вопроса, ⌃+⇧+` (или WHISPER_MAC_HOTKEY)
+  %(prog)s --server URL --hotkey shift+ctrl+grave
+  %(prog)s --server URL --no-hotkey-prompt   # без вопроса, ⌃+⇧+⌥ (или WHISPER_MAC_HOTKEY)
   %(prog)s --server URL --bind-hotkey
         """.strip(),
     )
@@ -1001,7 +1001,7 @@ def main() -> int:
     p.add_argument(
         "--no-hotkey-prompt",
         action="store_true",
-        help="Не спрашивать сочетание в терминале; без --hotkey — ⌃+⇧+` или WHISPER_MAC_HOTKEY",
+        help="Не спрашивать сочетание в терминале; без --hotkey — ⌃+⇧+⌥ или WHISPER_MAC_HOTKEY",
     )
     p.add_argument(
         "--bind-hotkey",
@@ -1027,16 +1027,16 @@ def main() -> int:
 
     def _default_hotkey_str() -> str:
         raw = (os.environ.get("WHISPER_MAC_HOTKEY") or "").strip()
-        return raw if raw else "shift+ctrl+grave"
+        return raw if raw else "shift+ctrl+alt"
 
     def read_hotkey_from_terminal() -> HotkeySpec:
         dflt = _default_hotkey_str()
         print(
-            "[Client] Сочетание задаётся ТЕКСТОМ (латиницей), не нажимай здесь физические ⌃⇧` — в терминале это не то же самое.",
+            "[Client] Сочетание задаётся ТЕКСТОМ (латиницей), не путай с физическим нажатием клавиш в другом окне.",
             flush=True,
         )
         print(
-            "[Client] Примеры:  shift+ctrl+grave   alt+ctrl   ctrl+grave   cmd+alt+period   shift+ctrl+rbracket",
+            "[Client] Примеры:  shift+ctrl+alt   shift+ctrl+grave   alt+ctrl   ctrl+grave   shift+ctrl+rbracket",
             flush=True,
         )
         print(

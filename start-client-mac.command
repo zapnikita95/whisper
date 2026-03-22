@@ -63,8 +63,8 @@ else
 fi
 
 echo "Сервер: $SERVER_URL"
-echo "При старте клиент спросит сочетание в терминале (Enter = ⌃+⇧+\`, не конфликтует с Portal ⌘+⌃+…)."
-echo "  Без вопроса:  --no-hotkey-prompt   (или export WHISPER_MAC_HOTKEY='shift+ctrl+grave')"
+echo "При старте клиент спросит сочетание в терминале (Enter = ⌃+⇧+⌥ — без \` в тексте и без спама терминалом Cursor)."
+echo "  Без вопроса:  --no-hotkey-prompt   (или export WHISPER_MAC_HOTKEY='shift+ctrl+alt')"
 echo "  Или сразу:  --hotkey 'alt+ctrl'  |  --hotkey 'ctrl+grave'  |  --bind-hotkey"
 echo "Для выхода: Ctrl+C"
 echo ""

@@ -22,7 +22,7 @@ else
 fi
 
 # Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.
-export WHISPER_MAC_HOTKEY="shift+ctrl+grave"
+export WHISPER_MAC_HOTKEY="shift+ctrl+alt"
 
 # Finder передаёт -psn_0_… — не пробрасываем в Python (argparse).
 CMD=( "$PY" "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt )
