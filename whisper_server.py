@@ -7,6 +7,7 @@ HTTP API сервер для транскрипции через Whisper на GP
 """
 from __future__ import annotations
 
+import math
 import os
 import site
 import sys
@@ -136,6 +137,19 @@ def get_clients_snapshot() -> dict:
     }
 
 
+def _safe_language_probability(info: Any) -> float | None:
+    lp = getattr(info, "language_probability", None)
+    if lp is None:
+        return None
+    try:
+        f = float(lp)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
 def get_model() -> Any:
     global _model
     if _model is None:
@@ -246,7 +260,7 @@ async def transcribe(
             return {
                 "text": text,
                 "language": info.language if info.language else None,
-                "language_probability": float(info.language_probability) if hasattr(info, "language_probability") else None,
+                "language_probability": _safe_language_probability(info),
             }
         finally:
             try:

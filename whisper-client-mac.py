@@ -125,6 +125,29 @@ def _mac_log(level: str, msg: str, *args: object) -> None:
         _MAC_LOGGER.info(msg, *args)
 
 
+def _fastapi_error_detail(resp: requests.Response) -> str:
+    """Текст из JSON FastAPI/Starlette (`detail`) — чтобы в уведомлении было не только «500 Server Error»."""
+    try:
+        j = resp.json()
+    except ValueError:
+        body = (resp.text or "").strip()
+        return (body[:400] if body else f"HTTP {resp.status_code}")
+    if not isinstance(j, dict):
+        return f"HTTP {resp.status_code}"
+    d = j.get("detail")
+    if isinstance(d, str):
+        return d
+    if isinstance(d, list):
+        parts: list[str] = []
+        for item in d[:5]:
+            if isinstance(item, dict):
+                parts.append(str(item.get("msg", item)))
+            else:
+                parts.append(str(item))
+        return "; ".join(parts) if parts else f"HTTP {resp.status_code}"
+    return f"HTTP {resp.status_code}"
+
+
 def mac_banner_notification(title: str, body: str = "") -> None:
     """macOS: баннер в Центре уведомлений. Из .app — бинарь whisper_notify (не «Python»); иначе osascript."""
     if sys.platform != "darwin":
@@ -990,6 +1013,12 @@ class WhisperClientMac:
                     _mac_log("info", "transcribe_upload_start url=%s paste_target_pid=%s", self.server_url, paste_pid)
                     max_retries = 3
                     response = None
+                    try:
+                        _tx_to = float(
+                            (os.environ.get("WHISPER_MAC_TRANSCRIBE_TIMEOUT") or "300").strip() or "300"
+                        )
+                    except ValueError:
+                        _tx_to = 300.0
 
                     for attempt in range(max_retries):
                         try:
@@ -1005,9 +1034,24 @@ class WhisperClientMac:
                                     files=files,
                                     params=params,
                                     headers={"X-Whisper-Client": "mac"},
-                                    timeout=180.0,  # увеличил таймаут до 3 минут
+                                    timeout=_tx_to,
                                 )
-                                response.raise_for_status()
+                                if response.status_code >= 400:
+                                    detail = _fastapi_error_detail(response)
+                                    _mac_log(
+                                        "error",
+                                        "transcribe_http status=%s detail=%r",
+                                        response.status_code,
+                                        detail,
+                                    )
+                                    if response.status_code == 403:
+                                        mac_banner_notification("Whisper — отклонено", detail[:220])
+                                    else:
+                                        mac_banner_notification(
+                                            "Whisper — ошибка сервера",
+                                            f"{response.status_code}: {detail}"[:220],
+                                        )
+                                    return
                                 break  # успешно, выходим из цикла
                         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                             if attempt < max_retries - 1:

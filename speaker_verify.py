@@ -141,6 +141,10 @@ def should_verify_server() -> bool:
 
 def verify_if_enabled_server(wav_path: str | Path) -> None:
     """Вызывать из transcribe: при включённом verify и наличии эталона — проверить."""
+    import logging
+
+    _log = logging.getLogger(__name__)
+
     if not should_verify_server():
         return
     ref = load_reference()
@@ -148,5 +152,13 @@ def verify_if_enabled_server(wav_path: str | Path) -> None:
         return
     try:
         verify_wav_file_or_raise(wav_path, thr_override=None)
+    except SpeakerRejected:
+        raise
     except SpeakerVerifyUnavailable:
+        return
+    except Exception:
+        # Реземблер/torch/CUDA не должны ронять транскрипцию целиком — только лог.
+        _log.exception(
+            "speaker_verify: внутренняя ошибка, проверка пропущена для этого запроса"
+        )
         return
