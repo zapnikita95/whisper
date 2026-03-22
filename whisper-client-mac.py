@@ -10,7 +10,8 @@
 
 Журнал (вставка/сервер): ~/Library/Logs/WhisperMacClient.log (если нет прав — /tmp/WhisperMacClient.log); в Console фильтр «WHISPER_MAC»; после каждой строки flush на диск.
 Полный текст распознавания в лог: WHISPER_MAC_DEBUG=1.
-Перехват клавиш — отдельный поток с автоперезапуском; иконка в меню — пакет rumps (опционально). Хоткей по умолчанию без ⌘ (рядом с Portal).
+Перехват клавиш — отдельный поток с автоперезапуском; иконка 🎤/🔴 в строке меню — rumps (рекомендуется: pip install rumps; pick_python выберет интерпретатор с rumps).
+Уведомления из .app — Contents/MacOS/whisper_notify (не процесс Python). Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
 
