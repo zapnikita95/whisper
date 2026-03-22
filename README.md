@@ -209,6 +209,8 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --no-spoken-punct
 python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --no-hotkey-prompt
 python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --hotkey 'ctrl+grave'
 python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
+python3 whisper-client-mac.py --enroll-speaker ~/Desktop/calibration.wav   # только эталон, без --server
+python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 ```
 
 ### Как это работает
@@ -230,6 +232,42 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 
+### Версия
+
+- Источник правды: **`packaging/VERSION`** (строка `1.2.0`). В CI при теге `v*` файл перезаписывается из имени тега.
+- `GET /` возвращает **`app_version`**; окно **WhisperServer** и меню Mac показывают ту же версию.
+- Переопределение: переменная окружения **`WHISPER_VERSION`**.
+
+### Релизы GitHub Actions
+
+При push тега вида **`v1.2.3`** workflow [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+1. Собирает **Windows**: PyInstaller → **Inno Setup** → `dist/release/WhisperSetup-{версия}.exe`.
+2. Собирает **macOS**: `build_mac_app.sh` → **create-dmg** → `dist/release/WhisperClient-{версия}.dmg`.
+3. Прикрепляет оба файла к **GitHub Release** для этого тега.
+
+Локально Inno: установи [Inno Setup](https://jrsoftware.org/isinfo.php), затем после PyInstaller:
+
+`"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\WhisperServer.iss /DMyAppVersion=1.2.0`
+
+Локально DMG: `brew install create-dmg` → `./packaging/mac/make_dmg.sh`.
+
+### Автообновление
+
+- **Windows (GUI):** через ~10 с после старта запрашивается GitHub `releases/latest`; если тег новее `packaging/VERSION`, предлагается скачать **`WhisperSetup-*.exe`** и запустить. Отключить: **`WHISPER_SKIP_UPDATE_CHECK=1`**. Другой репозиторий: **`WHISPER_RELEASES_REPO=owner/name`**.
+- **Mac (меню 🎤):** пункт **«Проверить обновления…»** — скачивает **`WhisperClient-*.dmg`** в `~/Downloads` (или открывает страницу релиза). Фоновое напоминание раз в сессию (~2 мин), если есть более новый тег.
+
+Имена вложений в релизе должны содержать **`WhisperSetup`** (`.exe`) и **`WhisperClient`** (`.dmg`) — так их находит клиент.
+
+### Верификация говорящего (опционально)
+
+1. Установи зависимости: `pip install -r requirements-speaker.txt` (torch + resemblyzer).
+2. Запиши эталон (WAV 30–60 с):  
+   `python3 whisper-client-mac.py --enroll-speaker ./мой_голос.wav`  
+   Эталон: `~/.whisper/speaker_embedding.npy` (или **`WHISPER_SPEAKER_EMBEDDING_PATH`**).
+3. Включи проверку: **`--speaker-verify`** или **`WHISPER_SPEAKER_VERIFY=1`**. Порог: **`--speaker-threshold 0.7`** или **`WHISPER_SPEAKER_THRESHOLD`** (по умолчанию `0.72`).
+4. **Сервер:** эталон тот же формат на диске Windows; включение: **`WHISPER_SPEAKER_VERIFY=1`** (и при необходимости **`WHISPER_SPEAKER_EMBEDDING_PATH`**). При несовпадении — **HTTP 403**.
+
 ## Файлы
 
 | Файл | Назначение |
@@ -249,6 +287,13 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 | `assets/app_icon.png` | исходник иконки; `AppIcon.icns`, `app_icon.ico` — для .app / exe |
 | `packaging/regenerate_icons.sh` | PNG → icns + ico |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
+| `packaging/windows/WhisperServer.iss` | Inno Setup → `WhisperSetup-{версия}.exe` |
+| `packaging/mac/make_dmg.sh` | DMG для `WhisperClient.app` (create-dmg) |
+| `packaging/VERSION` | номер версии для API, GUI, Mac, CI |
+| `whisper_version.py` | чтение версии (и `WHISPER_VERSION`) |
+| `whisper_update_check.py` | запрос `releases/latest` |
+| `speaker_verify.py` | embedding + эталон голоса |
+| `requirements-speaker.txt` | torch + resemblyzer для speaker verify |
 | `run-transcribe.ps1` | transcribe через venv |
 | `run-hotkey.ps1` | hotkey через venv |
 | `requirements.txt` | зависимости |

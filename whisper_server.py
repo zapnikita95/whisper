@@ -47,6 +47,11 @@ _prepend_nvidia_cublas_to_path()
 
 from faster_whisper import WhisperModel
 
+try:
+    from whisper_version import __version__ as APP_VERSION
+except ImportError:
+    APP_VERSION = "0.0.0-dev"
+
 # Локальная запись на Windows (whisper-hotkey.py) — не HTTP, для подсказок в GUI/API
 WINDOWS_LOCAL_HOTKEY_DESC = (
     "whisper-hotkey.py на этом ПК: зажми Ctrl+Win — запись с микрофона, отпусти — распознавание и вставка в активное окно."
@@ -112,6 +117,7 @@ def root():
         n = len(_clients)
     return {
         "status": "ok",
+        "app_version": APP_VERSION,
         "model": _model_name,
         "device": _device,
         "ready": _model is not None,
@@ -145,6 +151,15 @@ async def transcribe(
             tmp.write(contents)
 
         try:
+            try:
+                from speaker_verify import SpeakerRejected, verify_if_enabled_server
+
+                verify_if_enabled_server(tmp_path)
+            except ImportError:
+                pass
+            except SpeakerRejected as e:
+                raise HTTPException(status_code=403, detail=str(e)) from e
+
             data, sr = sf.read(tmp_path)
             if len(data.shape) > 1:
                 data = data[:, 0]
@@ -210,6 +225,7 @@ def main() -> int:
     _compute_type = args.compute_type
 
     print(f"[Server] Запуск на http://{args.host}:{args.port}", flush=True)
+    print(f"[Server] Версия: {APP_VERSION}", flush=True)
     print(f"[Server] Модель: {_model_name} ({_device}, {_compute_type})", flush=True)
     print("[Server] Для остановки: Ctrl+C", flush=True)
 

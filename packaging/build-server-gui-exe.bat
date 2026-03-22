@@ -16,6 +16,8 @@ if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
   %ICONLINE% ^
   --collect-all uvicorn --collect-all fastapi --collect-all starlette ^
   --hidden-import whisper_server --hidden-import faster_whisper ^
+  --hidden-import whisper_version --hidden-import whisper_update_check ^
+  --add-data "packaging\VERSION;packaging" ^
   whisper_server_gui.py
 
 echo.

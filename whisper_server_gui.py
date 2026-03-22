@@ -31,6 +31,12 @@ os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+try:
+    from whisper_version import get_version as _get_app_version
+except ImportError:
+    def _get_app_version() -> str:
+        return "0.0.0-dev"
+
 
 def _find_free_port() -> int:
     ps = (
@@ -94,6 +100,58 @@ def _write_port_file(port: int) -> None:
         pass
 
 
+def _maybe_check_updates_gui(root: object, current_ver: str) -> None:
+    import threading
+    import tempfile
+    import urllib.request
+    import webbrowser
+    from tkinter import messagebox
+
+    try:
+        from whisper_update_check import fetch_latest_release, is_remote_newer, pick_asset_url
+    except ImportError:
+        return
+
+    def worker() -> None:
+        if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
+            return
+        rel = fetch_latest_release()
+        if not rel:
+            return
+        tag = (rel.get("tag_name") or "").strip()
+        if not is_remote_newer(tag, current_ver):
+            return
+        html = (rel.get("html_url") or "").strip() or "https://github.com/zapnikita95/whisper/releases"
+
+        def ask() -> None:
+            if not messagebox.askyesno(
+                "Обновление Whisper Server",
+                f"Доступна версия {tag} (у тебя {current_ver}).\n\nСкачать установщик?",
+            ):
+                return
+            picked = pick_asset_url(rel, suffix=".exe", contains="whispersetup")
+            if not picked:
+                webbrowser.open(html)
+                return
+            name, url = picked
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".exe")
+                os.close(fd)
+                req = urllib.request.Request(url, headers={"User-Agent": "WhisperServerGUI/1.0"})
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    Path(tmp).write_bytes(resp.read())
+                os.startfile(tmp)  # type: ignore[attr-defined]
+            except OSError:
+                webbrowser.open(html)
+
+        try:
+            root.after(0, ask)
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, name="whisper-update-check", daemon=True).start()
+
+
 def _fetch_clients_json(port: int) -> dict | None:
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{port}/clients")
@@ -129,8 +187,9 @@ def main() -> int:
     srv_thread.start()
     ready.wait(timeout=30)
 
+    app_ver = _get_app_version()
     root = tk.Tk()
-    root.title("Whisper GPU Server")
+    root.title(f"Whisper GPU Server  v{app_ver}")
     root.geometry("560x420")
     root.minsize(480, 360)
 
@@ -181,6 +240,8 @@ def main() -> int:
         root.after(1500, refresh_tree)
 
     refresh_tree()
+
+    root.after(10_000, lambda: _maybe_check_updates_gui(root, app_ver))
 
     def on_close() -> None:
         status.config(text="Остановка…", foreground="#a00")

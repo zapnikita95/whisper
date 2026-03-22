@@ -28,6 +28,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+_rp = Path(__file__).resolve().parent
+if str(_rp) not in sys.path:
+    sys.path.insert(0, str(_rp))
+
 try:
     import rumps
 except ImportError:
@@ -165,6 +169,59 @@ def _mac_notify_progress(body: str) -> None:
     if os.environ.get("WHISPER_MAC_NOTIFY_PROGRESS", "1" if os.environ.get("WHISPER_FROM_APP_BUNDLE") else "0") != "1":
         return
     mac_banner_notification("Whisper", body)
+
+
+def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool = False) -> None:
+    """Проверка GitHub Releases; при наличии .dmg — скачать в ~/Downloads."""
+    import urllib.request
+    import webbrowser
+
+    try:
+        from whisper_update_check import fetch_latest_release, is_remote_newer, pick_asset_url
+        from whisper_version import get_version
+    except ImportError:
+        mac_banner_notification("Whisper", "Обнови WhisperClient.app (нет модулей версии/обновлений).")
+        return
+
+    cur = get_version()
+    rel = fetch_latest_release()
+    if rel is None:
+        if notify_always:
+            mac_banner_notification("Whisper", "Не удалось связаться с GitHub (сеть или лимит API).")
+        _mac_log("warning", "update_check_no_release_response")
+        return
+    tag = (rel.get("tag_name") or "").strip()
+    if not is_remote_newer(tag, cur):
+        if notify_always:
+            mac_banner_notification("Whisper", f"Установлена актуальная версия ({cur}).")
+        return
+    if notify_newer_only and not notify_always:
+        mac_banner_notification(
+            "Whisper",
+            f"Доступна версия {tag}. Меню → Проверить обновления…",
+        )
+        return
+    picked = pick_asset_url(rel, suffix=".dmg", contains="whisperclient")
+    html = (rel.get("html_url") or "").strip() or "https://github.com/zapnikita95/whisper/releases"
+    if not picked:
+        webbrowser.open(html)
+        mac_banner_notification("Whisper", "Открыта страница релиза — скачай DMG вручную.")
+        return
+    name, url = picked
+    dest = Path.home() / "Downloads" / name
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "WhisperMacClient/1.0"})
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            dest.write_bytes(resp.read())
+        mac_banner_notification(
+            "Whisper",
+            f"Скачано {dest.name} — открой DMG и перетащи Whisper Client в Программы.",
+        )
+        _mac_log("info", "update_downloaded path=%s", dest)
+    except Exception as e:
+        _MAC_LOGGER.exception("update_download_failed")
+        webbrowser.open(html)
+        mac_banner_notification("Whisper", f"Скачивание не удалось ({e!s:.80}) — открыта страница релиза.")
 
 
 def tray_icon_path() -> str | None:
@@ -438,6 +495,9 @@ class WhisperClientMac:
         language: str | None = None,
         spoken_punctuation: bool = True,
         hotkey: HotkeySpec | None = None,
+        *,
+        speaker_verify: bool = False,
+        speaker_threshold: float | None = None,
     ):
         self.server_url = server_url.rstrip("/")
         self.language = language
@@ -467,6 +527,8 @@ class WhisperClientMac:
         self._work_lock = threading.Lock()
         # PID процесса с полем ввода (frontmost при старте записи) — перед Cmd+V возвращаем фокус туда.
         self._paste_target_unix_id: int | None = None
+        self._speaker_verify = speaker_verify
+        self._speaker_threshold = speaker_threshold
 
     def request_shutdown(self) -> None:
         """Остановка клиента (меню «Выход», SIGINT)."""
@@ -876,6 +938,34 @@ class WhisperClientMac:
                     sf.write(tmp_path, audio_data, self.sample_rate)
 
                 try:
+                    if self._speaker_verify:
+                        try:
+                            from speaker_verify import (
+                                SpeakerRejected,
+                                load_reference,
+                                verify_wav_file_or_raise,
+                            )
+                        except ImportError:
+                            _mac_log("warning", "speaker_verify_no_module install requirements-speaker.txt")
+                        else:
+                            ref = load_reference()
+                            if ref is None:
+                                _mac_log(
+                                    "warning",
+                                    "speaker_verify_enabled_but_no_enrollment use --enroll-speaker",
+                                )
+                            else:
+                                try:
+                                    verify_wav_file_or_raise(
+                                        tmp_path,
+                                        thr_override=self._speaker_threshold,
+                                    )
+                                except SpeakerRejected as e:
+                                    print(f"[Client] {e}", flush=True)
+                                    _mac_log("info", "speaker_rejected %s", e)
+                                    mac_banner_notification("Whisper", str(e)[:220])
+                                    return
+
                     # Проверяем доступность сервера перед отправкой
                     try:
                         health_check = requests.get(f"{self.server_url}/", timeout=5.0)
@@ -1105,6 +1195,12 @@ if rumps is not None:
 
         def __init__(self, client: WhisperClientMac) -> None:
             ip = tray_icon_path()
+            try:
+                from whisper_version import get_version as _gv
+
+                self._app_version = _gv()
+            except ImportError:
+                self._app_version = "?"
             if ip:
                 super().__init__("Whisper", icon=ip, quit_button=None)
                 self._emoji_mode = False
@@ -1112,9 +1208,13 @@ if rumps is not None:
                 super().__init__("Whisper", title="🎤", quit_button=None)
                 self._emoji_mode = True
             self.client = client
+            self._auto_update_hint_done = False
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
             self.menu = [
+                rumps.MenuItem(f"Версия {self._app_version}", callback=None),
                 self._mi_server,
+                rumps.separator,
+                rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
                 rumps.separator,
                 rumps.MenuItem("Показать лог…", callback=self._open_log),
                 rumps.MenuItem("Выход", callback=self._quit),
@@ -1129,6 +1229,13 @@ if rumps is not None:
             if not logf.is_file():
                 logf = Path(tempfile.gettempdir()) / "WhisperMacClient.log"
             subprocess.run(["open", "-R", str(logf)], check=False)
+
+        def _check_updates_menu(self, _sender) -> None:
+            threading.Thread(
+                target=lambda: run_mac_update_flow(notify_always=True),
+                name="whisper-mac-update",
+                daemon=True,
+            ).start()
 
         def _quit(self, _sender) -> None:
             self.client.request_shutdown()
@@ -1155,6 +1262,18 @@ if rumps is not None:
             if self.client._run_stop:
                 return
             self.client._ensure_listener_thread()
+
+        @rumps.timer(120.0)
+        def _auto_update_hint(self, _sender) -> None:
+            if self._auto_update_hint_done or self.client._run_stop:
+                return
+            self._auto_update_hint_done = True
+            if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
+                return
+            try:
+                run_mac_update_flow(notify_newer_only=True)
+            except Exception:
+                _MAC_LOGGER.debug("auto_update_hint", exc_info=True)
 
 else:
     WhisperMenuBarApp = None  # type: ignore[misc, assignment]
@@ -1206,8 +1325,8 @@ def main() -> int:
     )
     p.add_argument(
         "--server",
-        required=True,
-        help="URL сервера (например: http://192.168.1.100:8000)",
+        default=None,
+        help="URL сервера (например: http://192.168.1.100:8000); не нужен только с --enroll-speaker",
     )
     p.add_argument("--language", default=None, help="ru, en или авто")
     p.add_argument(
@@ -1243,7 +1362,53 @@ def main() -> int:
         action="store_true",
         help="Не показывать иконку в строке меню (нужен пакет rumps; см. README)",
     )
+    p.add_argument(
+        "--enroll-speaker",
+        metavar="WAV",
+        default=None,
+        help="Сохранить эталон голоса из WAV (~30–60 с); нужен pip install -r requirements-speaker.txt",
+    )
+    p.add_argument(
+        "--speaker-verify",
+        action="store_true",
+        help="Перед отправкой на сервер сверять голос с эталоном (~/.whisper/speaker_embedding.npy)",
+    )
+    p.add_argument(
+        "--speaker-threshold",
+        type=float,
+        default=None,
+        metavar="0.0-1.0",
+        help="Порог косинусного сходства (по умолчанию из WHISPER_SPEAKER_THRESHOLD или 0.72)",
+    )
     args = p.parse_args()
+
+    if not args.enroll_speaker and not args.server:
+        p.error("нужен --server (или только --enroll-speaker WAV для эталона голоса)")
+
+    if args.enroll_speaker:
+        try:
+            from speaker_verify import embedding_path, enroll_from_wav
+        except ImportError:
+            print(
+                "[Client] Нет speaker_verify — установи: pip install -r requirements-speaker.txt",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            enroll_from_wav(args.enroll_speaker)
+            print(f"[Client] Эталон сохранён: {embedding_path()}", flush=True)
+            return 0
+        except Exception as e:
+            print(f"[Client] enroll-speaker: {e}", file=sys.stderr)
+            return 1
+
+    try:
+        from whisper_version import get_version as _app_ver
+
+        _mac_log("info", "app_version=%s", _app_ver())
+    except ImportError:
+        pass
+
     _mac_log("info", "server=%s log_file=%s", args.server, log_path)
     if not sys.stdout.isatty():
         print(f"[Client] Подробный лог: {log_path}", flush=True)
@@ -1353,11 +1518,16 @@ def main() -> int:
         ),
     )
 
+    spk = args.speaker_verify or (
+        os.environ.get("WHISPER_SPEAKER_VERIFY", "").strip().lower() in ("1", "true", "yes")
+    )
     client = WhisperClientMac(
         server_url=args.server,
         language=args.language,
         spoken_punctuation=not args.no_spoken_punctuation,
         hotkey=hotkey,
+        speaker_verify=spk,
+        speaker_threshold=args.speaker_threshold,
     )
     try:
         client.run(menu_bar=use_menu_bar)

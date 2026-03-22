@@ -8,13 +8,29 @@
 		<data>
 		UX+kEAaSA4kz3vtmrW6qAnfPPRg=
 		</data>
+		<key>Resources/VERSION</key>
+		<data>
+		z3RL0AeFCwRgHchlgV7A9eYMaXA=
+		</data>
 		<key>Resources/pick_server_url.py</key>
 		<data>
 		PChu88ZsJ5eBIw3+GjuQkFnTnyk=
 		</data>
+		<key>Resources/speaker_verify.py</key>
+		<data>
+		kOxh0EejXEI5fiQue5naBF5IwUU=
+		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		nEMxJPFD8CF/NeE41vZS5lKlsuM=
+		AWeyT44VhnngWQd7UfHrmTwRjbs=
+		</data>
+		<key>Resources/whisper_update_check.py</key>
+		<data>
+		IaqOfEtq96UvTyI6zDHTG34tqsI=
+		</data>
+		<key>Resources/whisper_version.py</key>
+		<data>
+		8oXKRG66wtOTkT9TN2u0oW/MJL4=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -53,6 +69,13 @@
 			nxv1N1tklBlKofw0qDEQoj+7QP3H/JSkMBrvbvlKAMk=
 			</data>
 		</dict>
+		<key>Resources/VERSION</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			HltRzeUVOWqfp2KQnPjKZYTMxWSzJdLuvup2F1/pXE0=
+			</data>
+		</dict>
 		<key>Resources/pick_server_url.py</key>
 		<dict>
 			<key>hash2</key>
@@ -60,11 +83,32 @@
 			a1TdgBrZmIBz804UxS4JbDG2ScjzNYg0JF7ufbLah5Y=
 			</data>
 		</dict>
+		<key>Resources/speaker_verify.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			D0de0oOV/O6BDkw32xKnePdZ7wMcRtPkGZSTzN1SO0E=
+			</data>
+		</dict>
 		<key>Resources/whisper-client-mac.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			Ee2/Zb7zN5XyEpkIlfcEVVT7AAVFogv+m/w3W1F8T+4=
+			ja+lDABy1MZItHRnsRV/Mt0Gx1fU2xi9QOfUY21wPXM=
+			</data>
+		</dict>
+		<key>Resources/whisper_update_check.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			c9C+mYV9bOHRTAAHnAx5OandpqZ5SbQU1DrGINd730E=
+			</data>
+		</dict>
+		<key>Resources/whisper_version.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			Kx4hMcFUbFW3r9rOyEGJJm07vtYU2Ghm/l9gP8PQcUA=
 			</data>
 		</dict>
 	</dict>

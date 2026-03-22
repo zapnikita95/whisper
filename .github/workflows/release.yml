@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: VERSION from tag
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          echo "${GITHUB_REF#refs/tags/v}" > packaging/VERSION
+
+      - name: Install deps
+        run: python -m pip install -U pip wheel && pip install -r requirements.txt pyinstaller
+
+      - name: PyInstaller
+        shell: bash
+        run: |
+          set -e
+          ICON_ARGS=()
+          if [ -f assets/app_icon.ico ]; then ICON_ARGS=(--icon assets/app_icon.ico); fi
+          python -m PyInstaller --noconfirm --clean --windowed --name WhisperServer \
+            "${ICON_ARGS[@]}" \
+            --collect-all uvicorn --collect-all fastapi --collect-all starlette \
+            --hidden-import whisper_server --hidden-import faster_whisper \
+            --hidden-import whisper_version --hidden-import whisper_update_check \
+            --add-data "packaging/VERSION;packaging" \
+            whisper_server_gui.py
+
+      - name: Inno Setup (Chocolatey)
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile .iss
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles(x86)}\Inno Setup 5\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after choco install innosetup" }
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          & $iscc "packaging\windows\WhisperServer.iss" /DMyAppVersion=$env:VERSION
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-setup
+          path: dist/release/WhisperSetup-*.exe
+
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: VERSION from tag
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          echo "${GITHUB_REF#refs/tags/v}" > packaging/VERSION
+
+      - name: Build WhisperClient.app
+        run: ./packaging/build_mac_app.sh
+
+      - name: DMG
+        run: |
+          brew install create-dmg
+          ./packaging/mac/make_dmg.sh "$VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-dmg
+          path: dist/release/WhisperClient-*.dmg
+
+  publish:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: whisper-*
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/whisper-setup/*.exe
+            artifacts/whisper-dmg/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
