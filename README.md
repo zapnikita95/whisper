@@ -168,7 +168,7 @@ Whisper иногда пишет фразу с ошибкой («восклица
    ```bash
    ./packaging/build_mac_app.sh
    ```
-   Затем открой `packaging/mac/WhisperClient.app` (нужен системный **Python 3** с теми же pip-пакетами). Из Finder клиент стартует с `--no-hotkey-prompt` (⌥+⌃ по умолчанию); свой `--hotkey` задавай из Терминала.
+   Затем открой `packaging/mac/WhisperClient.app`. Лаунчер подставляет **PATH с Homebrew** (из Finder он пустой — иначе берётся «голый» `/usr/bin/python3` без твоих pip-пакетов и приложение «падает»). При отсутствии модулей покажется диалог. Свой Python: `WHISPER_PYTHON3` (см. `packaging/mac/launcher.sh`). Из Finder: `--no-hotkey-prompt`; свой `--hotkey` — из Терминала. После правок `whisper-client-mac.py`: `./packaging/build_mac_app.sh`.
 
 4. **Простой способ (скрипт):** двойной клик на `start-client-mac.command` в Finder  
    **Или из терминала:**
@@ -182,10 +182,12 @@ Whisper иногда пишет фразу с ошибкой («восклица
    python3 whisper-client-mac.py --server 'http://TAILSCALE_IP:ПОРТ'
    ```
 
-5. При запуске **в терминале** клиент спросит сочетание одной строкой (как шорткат, через `+`); **Enter** без ввода = **⌥+⌃** (Option+Control). Удерживай выбранное сочетание — запись, отпусти все клавиши — распознавание. Альтернативы:
-   - без вопроса с ⌥+⌃: `--no-hotkey-prompt`;
-   - сразу строкой: `--hotkey 'ctrl+grave'` или `--hotkey 'ctrl+]'`;
+5. При запуске **в терминале** клиент спросит сочетание одной строкой (через `+`); **Enter** без ввода = **⌃+⇧+`** (`shift+ctrl+grave`) — **не пересекается с Portal** (⌘+⌃+P/C/V). Удерживай сочетание — запись, отпусти все клавиши — распознавание. Альтернативы:
+   - без вопроса: `--no-hotkey-prompt` (или переменная **`WHISPER_MAC_HOTKEY`**);
+   - сразу строкой: `--hotkey 'shift+ctrl+grave'`, `--hotkey 'alt+ctrl'` (старое ⌥+⌃), `--hotkey 'ctrl+]'`;
    - «нажми и запомни»: `--bind-hotkey`.
+
+   **Вместе с [Portal](https://github.com/zapnikita95/portal) на том же Mac:** см. **[PORTAL_AND_WHISPER_MAC.md](PORTAL_AND_WHISPER_MAC.md)** (права «Мониторинг ввода», порядок запуска, pynput 1.8+).
 
 ### Опции клиента
 
@@ -225,6 +227,7 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 | `whisper-server.py` | shim: запуск CLI как раньше |
 | `whisper_server_gui.py` | окно сервера: порт, Ctrl+Win, список HTTP-клиентов |
 | `whisper-client-mac.py` | Клиент для Mac: запись → сервер → текст |
+| `PORTAL_AND_WHISPER_MAC.md` | Portal + Whisper на одном Mac (хоткеи, права) |
 | `start-whisper-hotkey.bat` | простой запуск hotkey + запрос прав администратора |
 | `start-server.bat` | запуск HTTP API сервера (консоль) |
 | `start-server-gui.bat` | запуск сервера с GUI (как start-server.bat по правам) |
