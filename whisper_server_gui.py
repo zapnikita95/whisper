@@ -38,6 +38,12 @@ except ImportError:
     def _get_app_version() -> str:
         return "0.0.0-dev"
 
+try:
+    from whisper_file_log import log_dir as _whisper_server_log_dir
+except ImportError:
+    def _whisper_server_log_dir() -> Path:
+        return ROOT
+
 
 def _find_free_port() -> int:
     ps = (
@@ -267,7 +273,7 @@ def _run_uvicorn(port: int, host: str) -> None:
 
 def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, app_ver: str) -> None:
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, scrolledtext
 
     from whisper_models import MODEL_PRESETS
 
@@ -278,8 +284,180 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
         saved_key = "large-v3"
     label_by_key = {k: lbl for k, _, lbl in MODEL_PRESETS}
 
-    frm = ttk.Frame(root, padding=12)
+    nb = ttk.Notebook(root)
+    nb.pack(fill=tk.BOTH, expand=True)
+
+    tab_server = ttk.Frame(nb, padding=12)
+    tab_logs = ttk.Frame(nb, padding=8)
+    nb.add(tab_server, text="Сервер")
+    nb.add(tab_logs, text="Логи")
+
+    frm = ttk.Frame(tab_server)
     frm.pack(fill=tk.BOTH, expand=True)
+
+    # ——— вкладка «Логи»: хвост файла в реальном времени ———
+    _log_tail_bytes = 120_000
+    _log_max_lines = 8000
+    _log_state: dict = {"which": "main", "offset": 0, "path": ""}
+
+    def _log_path_main() -> Path:
+        return _whisper_server_log_dir() / "whisper_server.log"
+
+    def _log_path_temp() -> Path:
+        return Path(tempfile.gettempdir()) / "WhisperServer_last_run.log"
+
+    def _active_log_path() -> Path:
+        return _log_path_main() if _log_state["which"] == "main" else _log_path_temp()
+
+    log_src_var = tk.StringVar(value="Основной (whisper_server.log)")
+
+    log_top = ttk.Frame(tab_logs)
+    log_top.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(log_top, text="Файл:").pack(side=tk.LEFT, padx=(0, 6))
+    cb_log = ttk.Combobox(
+        log_top,
+        textvariable=log_src_var,
+        values=(
+            "Основной (whisper_server.log)",
+            f"Копия в TEMP ({server_diag_log.name})",
+        ),
+        state="readonly",
+        width=42,
+    )
+    cb_log.pack(side=tk.LEFT, padx=(0, 8))
+
+    autoscroll_var = tk.BooleanVar(value=True)
+
+    def _open_log_in_explorer() -> None:
+        p = _active_log_path()
+        try:
+            if p.is_file():
+                subprocess.run(["explorer", "/select,", str(p.resolve())], check=False)
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(["explorer", str(p.parent.resolve())], check=False)
+        except OSError:
+            pass
+
+    ttk.Button(log_top, text="Папка с файлом", command=_open_log_in_explorer).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Checkbutton(log_top, text="Автопрокрутка", variable=autoscroll_var).pack(side=tk.LEFT, padx=(0, 8))
+
+    path_lbl_var = tk.StringVar(value="")
+    ttk.Label(tab_logs, textvariable=path_lbl_var, font=("", 8), foreground="#555", wraplength=640).pack(
+        anchor=tk.W, pady=(0, 4)
+    )
+
+    log_text = scrolledtext.ScrolledText(
+        tab_logs,
+        wrap=tk.NONE,
+        font=("Consolas", 9),
+        height=22,
+        state=tk.DISABLED,
+        bg="#1e1e1e",
+        fg="#d4d4d4",
+        insertbackground="#d4d4d4",
+        selectbackground="#264f78",
+    )
+    log_text.pack(fill=tk.BOTH, expand=True)
+
+    def _clear_log_view() -> None:
+        log_text.configure(state=tk.NORMAL)
+        log_text.delete("1.0", tk.END)
+        log_text.configure(state=tk.DISABLED)
+
+    ttk.Button(log_top, text="Очистить окно", command=_clear_log_view).pack(side=tk.LEFT)
+
+    def _on_log_source_change(_evt: object | None = None) -> None:
+        v = log_src_var.get()
+        _log_state["which"] = "main" if "Основной" in v else "temp"
+        _log_state["offset"] = 0
+        _log_state["path"] = ""
+        _clear_log_view()
+        _pull_log_lines(initial=True)
+
+    cb_log.bind("<<ComboboxSelected>>", _on_log_source_change)
+
+    def _trim_log_widget() -> None:
+        try:
+            end_line = int(log_text.index("end-1c").split(".")[0])
+        except (ValueError, tk.TclError):
+            return
+        if end_line > _log_max_lines:
+            cut = end_line - _log_max_lines + 500
+            log_text.delete("1.0", f"{cut}.0")
+
+    def _append_log_chunk(chunk: str) -> None:
+        if not chunk:
+            return
+        log_text.configure(state=tk.NORMAL)
+        log_text.insert(tk.END, chunk)
+        _trim_log_widget()
+        if autoscroll_var.get():
+            log_text.see(tk.END)
+        log_text.configure(state=tk.DISABLED)
+
+    def _pull_log_lines(*, initial: bool = False) -> None:
+        path = _active_log_path()
+        path_lbl_var.set(str(path.resolve()))
+        try:
+            if not path.is_file():
+                if initial:
+                    _append_log_chunk(
+                        f"(Файл ещё не создан — появится после «Запустить сервер». Ожидаемый путь:\n{path}\n)\n"
+                    )
+                return
+            size = path.stat().st_size
+        except OSError:
+            return
+
+        key = str(path.resolve())
+        if _log_state["path"] != key:
+            _log_state["path"] = key
+            _log_state["offset"] = 0
+
+        prev_off = _log_state["offset"]
+        if initial or size < prev_off:
+            if (not initial) and size < prev_off:
+                log_text.configure(state=tk.NORMAL)
+                log_text.delete("1.0", tk.END)
+                log_text.configure(state=tk.DISABLED)
+            start = 0 if size <= _log_tail_bytes else size - _log_tail_bytes
+            _log_state["offset"] = start
+            if start > 0 and initial:
+                prefix = f"… (показан хвост файла, ~{_log_tail_bytes // 1024} КБ) …\n"
+            else:
+                prefix = ""
+        else:
+            prefix = ""
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(_log_state["offset"])
+                chunk = f.read()
+                _log_state["offset"] = f.tell()
+        except OSError:
+            return
+
+        if prefix:
+            log_text.configure(state=tk.NORMAL)
+            log_text.delete("1.0", tk.END)
+            log_text.configure(state=tk.DISABLED)
+            _append_log_chunk(prefix)
+        if chunk:
+            _append_log_chunk(chunk)
+
+    def _schedule_log_poll() -> None:
+        try:
+            on_logs = nb.tab(nb.select(), "text") == "Логи"
+        except tk.TclError:
+            root.after(700, _schedule_log_poll)
+            return
+        if on_logs:
+            _pull_log_lines(initial=False)
+        root.after(700, _schedule_log_poll)
+
+    root.after(400, lambda: _pull_log_lines(initial=True))
+    root.after(500, _schedule_log_poll)
 
     ttk.Label(frm, text="Модель (faster-whisper)", font=("", 12, "bold")).pack(anchor=tk.W)
     model_var = tk.StringVar(value=label_by_key[saved_key])
@@ -528,8 +706,8 @@ def main() -> int:
             messagebox.showerror("Whisper Server", str(err))
             root.destroy()
             return
-        root.geometry("560x460")
-        root.minsize(480, 400)
+        root.geometry("600x520")
+        root.minsize(520, 440)
         _build_server_main_form(
             root,
             int(boot_state["port"]),
