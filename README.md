@@ -335,7 +335,7 @@ Set-Location $Repo
 
 Результат: **`dist\WhisperHotkey\WhisperHotkey.exe`** (+ `_internal`): **иконка в трее**, уведомления (старт, запись, результат, ошибки). Запуск **от имени администратора**. Без сборки: **`start-whisper-hotkey-gui.bat`**.
 
-**Проверка голоса (как на Mac):** тот же эталон **`%USERPROFILE%\.whisper\speaker_embedding.npy`**. В трее: **«Записать эталон голоса (~45 с)…»** и пункт **«Проверка голоса»** (после переключения — перезапуск hotkey). Либо **`WHISPER_SPEAKER_VERIFY=1`** и опционально **`WHISPER_SPEAKER_THRESHOLD`**. Чтобы эта логика попала в exe, в venv перед сборкой: **`pip install -r requirements-speaker.txt`** (torch + resemblyzer). Если GPU не грузится и в **`whisper_hotkey.log`** нет `cublas64_12.dll`, поставь **`pip install nvidia-cublas-cu12`**.
+**Проверка голоса (как на Mac):** тот же эталон **`%USERPROFILE%\.whisper\speaker_embedding.npy`**. В трее: **«Записать эталон голоса (~45 с)…»** и пункт **«Проверка голоса»** (после переключения — перезапуск hotkey). Либо **`WHISPER_SPEAKER_VERIFY=1`** и опционально **`WHISPER_SPEAKER_THRESHOLD`**. Сборка **`packaging\build-hotkey-gui-exe.bat`** сама ставит **`packaging\requirements-speaker-windows-pyi.txt`** и **resemblyzer** (без MSVC: заглушка **webrtcvad** в **`speaker_verify.py`**). На Mac/Linux по-прежнему **`requirements-speaker.txt`**. Сообщение в логе про **cuBLAS** (`cublas64_12.dll`) пишет **`whisper_hotkey_core`** — попадает в exe после пересборки; при отсутствии DLL: **`pip install nvidia-cublas-cu12`** в venv.
 
 Консольный вариант: `whisper-hotkey.py` / `start-whisper-hotkey.bat` → тот же **`whisper_hotkey.log`**, флаги **`--speaker-verify`** / **`--speaker-threshold`**.
 

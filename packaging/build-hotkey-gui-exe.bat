@@ -1,38 +1,64 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 >nul
 cd /d "%~dp0.."
 
-REM Сборка WhisperHotkey.exe (окно без консоли). Нужен venv с faster-whisper и pip install pyinstaller
+REM Сборка WhisperHotkey.exe. cuBLAS-предупреждение в логе — из whisper_hotkey_core (входит в exe).
+REM Проверка голоса: packaging\requirements-speaker-windows-pyi.txt + resemblyzer --no-deps (webrtcvad — заглушка в speaker_verify.py).
+REM Используется WhisperHotkey.spec (collect-all torch/resemblyzer). Выход: dist\WhisperHotkey после переноса из .whisper_hotkey_stage.
+
+set "STAGE=%CD%\dist\.whisper_hotkey_stage"
+set "FINAL=%CD%\dist\WhisperHotkey"
 
 set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
-set "ICONLINE="
-if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
-set "ICODATA="
-if exist "assets\app_icon.ico" set "ICODATA=--add-data assets\app_icon.ico;assets"
+echo [1/4] pip: torch + scipy + librosa + resemblyzer (Windows, без webrtcvad)...
+"%PY%" -m pip install -q -r "%CD%\packaging\requirements-speaker-windows-pyi.txt"
+if errorlevel 1 exit /b 1
+"%PY%" -m pip install -q --no-deps "resemblyzer>=0.1.1"
+if errorlevel 1 exit /b 1
+"%PY%" -c "import speaker_verify; print('speaker_verify: import ok')"
+if errorlevel 1 exit /b 1
 
-REM Проверка голоса в exe: в venv сначала pip install -r requirements-speaker.txt (torch + resemblyzer).
-"%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey ^
-  %ICONLINE% ^
-  --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray ^
-  --hidden-import whisper_models --hidden-import whisper_file_log ^
-  --hidden-import speaker_verify ^
-  --hidden-import faster_whisper --hidden-import whisper_version ^
-  --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip ^
-  --hidden-import soundfile --hidden-import numpy ^
-  --hidden-import plyer.platforms.win.notification ^
-  --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image ^
-  --add-data "packaging\VERSION;packaging" ^
-  %ICODATA% ^
-  whisper_hotkey_tray.py
+echo [2/4] Закрой WhisperHotkey.exe (если запущен)...
+taskkill /IM WhisperHotkey.exe /F >nul 2>&1
+timeout /t 2 /nobreak >nul
 
+echo [3/4] PyInstaller WhisperHotkey.spec ^(distpath=%STAGE%^)...
+"%PY%" -m PyInstaller --noconfirm --clean ^
+  --distpath "%STAGE%" ^
+  --workpath "%CD%\build\WhisperHotkey" ^
+  WhisperHotkey.spec
+if errorlevel 1 exit /b 1
+
+if not exist "%STAGE%\WhisperHotkey\WhisperHotkey.exe" (
+  echo Не найден %STAGE%\WhisperHotkey\WhisperHotkey.exe
+  exit /b 1
+)
+
+echo [4/4] Перенос в dist\WhisperHotkey ...
+taskkill /IM WhisperHotkey.exe /F >nul 2>&1
+timeout /t 2 /nobreak >nul
+if exist "%FINAL%" rmdir /s /q "%FINAL%"
+if exist "%FINAL%" (
+  echo [ВНИМАНИЕ] Не удалось удалить "%FINAL%". Запуск: %STAGE%\WhisperHotkey\WhisperHotkey.exe
+  goto :done
+)
+move "%STAGE%\WhisperHotkey" "%FINAL%" >nul
+if errorlevel 1 (
+  echo move не удался. Сборка: %STAGE%\WhisperHotkey\WhisperHotkey.exe
+  goto :done
+)
+rmdir "%STAGE%" 2>nul
+echo Готово: %FINAL%\WhisperHotkey.exe
+
+:done
 echo.
 echo ============================================================
-echo   ВАЖНО: запускай ТОЛЬКО отсюда ^(вся папка dist\WhisperHotkey^):
-echo   %CD%\dist\WhisperHotkey\WhisperHotkey.exe
-echo.
-echo   НЕ запускай exe из папки build\ — ошибка Python DLL.
+echo   Запускай: %FINAL%\WhisperHotkey.exe ^(+ папка _internal^)
+echo   НЕ из build\ — только dist\
 echo ============================================================
 echo.
-pause
+if not defined SKIP_BUILD_PAUSE pause
+endlocal

@@ -1,0 +1,8 @@
+# Для PyInstaller hotkey на Windows без MSVC (webrtcvad не собирается).
+# resemblyzer ставится с --no-deps; VAD — заглушка в speaker_verify._install_webrtcvad_stub_if_needed
+numpy>=1.24.0
+torch>=2.0.0
+scipy>=1.10.0
+typing-extensions>=4.0.0
+librosa>=0.10.0
+soundfile>=0.12.0

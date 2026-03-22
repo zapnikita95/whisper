@@ -34,7 +34,39 @@ def threshold() -> float:
         return DEFAULT_THRESHOLD
 
 
+def _install_webrtcvad_stub_if_needed() -> None:
+    """
+    webrtcvad на Windows часто требует MSVC для сборки. Резерв: заглушка — весь сигнал «с речью»,
+    trim_long_silences по сути не режет (качество VAD хуже, но embedding и проверка работают).
+    """
+    import sys
+    import types
+
+    if "webrtcvad" in sys.modules:
+        return
+    try:
+        import webrtcvad  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return
+    m = types.ModuleType("webrtcvad")
+
+    class Vad:
+        __slots__ = ()
+
+        def __init__(self, mode: int = 3) -> None:
+            pass
+
+        def is_speech(self, pcm: bytes, sample_rate: int = 16000) -> bool:
+            return True
+
+    m.Vad = Vad
+    sys.modules["webrtcvad"] = m
+
+
 def _load_encoder():
+    _install_webrtcvad_stub_if_needed()
     try:
         import torch
         from resemblyzer import VoiceEncoder, preprocess_wav
