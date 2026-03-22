@@ -441,7 +441,7 @@ class WhisperClientMac:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=3.0,
+                timeout=10.0,
             )
             if r.returncode != 0:
                 _mac_log(
@@ -749,8 +749,6 @@ class WhisperClientMac:
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
                 finally:
                     try:
-                        import os
-
                         os.unlink(tmp_path)
                     except Exception:
                         pass
