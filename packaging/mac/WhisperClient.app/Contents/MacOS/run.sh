@@ -28,6 +28,11 @@ fi
 # Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.
 export WHISPER_MAC_HOTKEY="shift+ctrl+alt"
 
+# Эталон голоса уже есть — включаем проверку без флагов (отключить: WHISPER_MAC_NO_SPEAKER_VERIFY=1 в run.sh).
+if [ -f "${HOME}/.whisper/speaker_embedding.npy" ] && [ "${WHISPER_MAC_NO_SPEAKER_VERIFY:-}" != "1" ]; then
+	export WHISPER_SPEAKER_VERIFY=1
+fi
+
 # Finder передаёт -psn_0_… — не пробрасываем в Python (argparse).
 CMD=( "$PY" "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt )
 for a in "$@"; do

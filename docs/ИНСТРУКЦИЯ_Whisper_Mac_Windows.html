@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Whisper — простая настройка (Windows + Mac)</title>
+  <style>
+    body { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; line-height: 1.45; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    h1 { font-size: 1.5rem; border-bottom: 2px solid #333; padding-bottom: 0.35rem; }
+    h2 { font-size: 1.2rem; margin-top: 1.75rem; color: #111; }
+    ol { padding-left: 1.25rem; }
+    li { margin: 0.5rem 0; }
+    .note { background: #f5f5f5; border-left: 4px solid #666; padding: 0.75rem 1rem; margin: 1rem 0; }
+    .few { color: #0a5; font-weight: 600; }
+    code { background: #eee; padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.95em; }
+    footer { margin-top: 2.5rem; font-size: 0.9rem; color: #555; }
+  </style>
+</head>
+<body>
+
+<h1>Whisper: диктовка с Mac на Windows-сервер</h1>
+<p>Цель: на <strong>Windows</strong> крутится сервер с GPU, на <strong>Mac</strong> — клиент в строке меню. Нажимаешь сочетание клавиш, говоришь, текст вставляется в активное окно.</p>
+<p class="few">Всего несколько шагов на каждой системе — без ежедневного Терминала.</p>
+
+<h2>Часть A — Windows (сервер)</h2>
+<ol>
+  <li><strong>Скачай установщик.</strong> Открой в браузере страницу релизов репозитория на GitHub (раздел <em>Releases</em>). Скачай файл вида <code>WhisperSetup-… .exe</code> (самый свежий релиз).</li>
+  <li><strong>Установи.</strong> Дважды щёлкни по файлу → «Далее» / «Next» → при необходимости согласись с правами администратора → дождись окончания → «Готово».</li>
+  <li><strong>Запусти Whisper Server.</strong> Через меню «Пуск» найди ярлык <strong>Whisper Server</strong> и открой его. Должно появиться окно с <strong>номером порта</strong> и подсказкой про сеть.</li>
+  <li><strong>Брандмауэр.</strong> Если Windows спросит разрешение для сети — нажми «Разрешить» для частной сети (и при использовании Tailscale тоже разреши, если спросит).</li>
+  <li><strong>Запиши адрес для Mac.</strong> В окне будет строка вида <code>http://127.0.0.1:ПОРТ</code>. Для Mac с другого компьютера нужен IP этого ПК в той же сети или в <strong>Tailscale</strong> (в окне часто есть подсказка с Tailscale IPv4). Запиши что-то вроде <code>http://100.x.x.x:ПОРТ</code> — это вставишь/проверишь на Mac один раз (или Mac сам найдёт сервер, если настроен сканер портов).</li>
+</ol>
+<div class="note">
+  <strong>Проверка обновлений (Windows):</strong> после запуска GUI через несколько секунд приложение само сравнивает версию с GitHub. Если есть новее — появится вопрос «Скачать обновление?». Согласись — откроется загрузка установщика. Ничего вручную искать не обязательно.
+</div>
+<div class="note">
+  <strong>Эталон голоса на сервере (редко нужно):</strong> если на сервере включена проверка голоса, эталонный файл <code>speaker_embedding.npy</code> должен лежать в профиле пользователя Windows (см. README про <code>WHISPER_SPEAKER_VERIFY</code>). В обычном сценарии достаточно эталона только на Mac.
+</div>
+
+<h2>Часть B — Mac (клиент)</h2>
+<ol>
+  <li><strong>Скачай и поставь приложение.</strong> На GitHub в <em>Releases</em> скачай <code>WhisperClient-… .dmg</code>. Открой DMG → перетащи <strong>Whisper Client</strong> в папку <strong>Программы</strong> (Applications).</li>
+  <li><strong>Первый запуск и права.</strong> Открой <strong>Программы</strong> → запусти Whisper Client. Если macOS ругается на разработчика: <em>Системные настройки → Конфиденциальность и безопасность</em> → «Всё равно открыть».</li>
+  <li><strong>Мониторинг ввода.</strong> <em>Системные настройки → Конфиденциальность и безопасность → Мониторинг ввода</em> — включи переключатель для <strong>Whisper Client</strong> (или Python, если так отображается). Без этого горячие клавиши не сработают.</li>
+  <li><strong>Микрофон.</strong> В том же разделе «Конфиденциальность» открой <strong>Микрофон</strong> и разреши для Whisper Client.</li>
+  <li><strong>Иконка в строке меню.</strong> Справа сверху должна появиться иконка 🎤 (или значок приложения). Нажми на неё: там версия, адрес сервера, <strong>Проверить обновления</strong>, запись эталона голоса и выход.</li>
+  <li><strong>Как пользоваться.</strong> Зажми сочетание <strong>⌃ ⌥ ⇧</strong> (Control + Option + Shift), говори, отпусти все три — пойдёт распознавание и вставка в то приложение, которое было активно в начале записи.</li>
+</ol>
+<div class="note">
+  <strong>Проверка обновлений (Mac):</strong> примерно через 10–15 секунд после старта клиент сам проверяет GitHub. Если вышла новая версия — придёт уведомление. Полное скачивание DMG — через пункт меню 🎤 → <strong>Проверить обновления…</strong>.
+</div>
+<div class="note">
+  <strong>Эталон голоса (Mac) — без Терминала:</strong> меню 🎤 → <strong>Записать эталон голоса (45 с)…</strong> → «Начать» → говори 45 секунд одним голосом. После сохранения чужие голоса не отправляются на сервер.<br /><br />
+  <strong>Один раз установить модули (если меню эталона пишет про ошибку):</strong> открой «Терминал» (Программы → Утилиты), вставь одну строку и нажми Enter:<br />
+  <code>python3 -m pip install torch resemblyzer</code><br />
+  (это 1–2 ГБ загрузки, нужен интернет). Потом снова открой пункт эталона в меню.
+</div>
+<div class="note">
+  После первого сохранения эталона при следующих запусках <strong>Whisper Client из .app</strong> проверка голоса включается <strong>сама</strong> (файл лежит в <code>~/.whisper/speaker_embedding.npy</code>). Отключить только через правку <code>run.sh</code> внутри .app или переменную <code>WHISPER_MAC_NO_SPEAKER_VERIFY=1</code> — для обычного пользователя не нужно.
+</div>
+
+<h2>Открыть этот файл в Word</h2>
+<p>В Microsoft Word: <strong>Файл → Открыть</strong> → выбери этот HTML-файл. При необходимости <strong>Сохранить как → Документ Word (.docx)</strong>.</p>
+
+<footer>
+  Актуальные детали и «если не работает» — в <code>README.md</code> репозитория. Лог на Mac: <code>~/Library/Logs/WhisperMacClient.log</code> (фильтр в Консоли: WHISPER_MAC).
+</footer>
+
+</body>
+</html>

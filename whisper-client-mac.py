@@ -1208,17 +1208,18 @@ if rumps is not None:
                 super().__init__("Whisper", title="🎤", quit_button=None)
                 self._emoji_mode = True
             self.client = client
-            self._auto_update_hint_done = False
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
             self.menu = [
                 rumps.MenuItem(f"Версия {self._app_version}", callback=None),
                 self._mi_server,
                 rumps.separator,
                 rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
+                rumps.MenuItem("Записать эталон голоса (45 с)…", callback=self._enroll_speaker_menu),
                 rumps.separator,
                 rumps.MenuItem("Показать лог…", callback=self._open_log),
                 rumps.MenuItem("Выход", callback=self._quit),
             ]
+            threading.Timer(12.0, self._startup_update_check_once).start()
 
         def _server_title(self) -> str:
             u = self.client.server_url
@@ -1236,6 +1237,65 @@ if rumps is not None:
                 name="whisper-mac-update",
                 daemon=True,
             ).start()
+
+        def _startup_update_check_once(self) -> None:
+            if self.client._run_stop:
+                return
+            if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
+                return
+            try:
+                run_mac_update_flow(notify_newer_only=True)
+            except Exception:
+                _MAC_LOGGER.debug("startup_update_check", exc_info=True)
+
+        def _enroll_speaker_menu(self, _sender) -> None:
+            ok = rumps.alert(
+                title="Эталон голоса",
+                message="После «Начать» пойдёт запись 45 секунд.\n\nГовори в обычном темпе одним голосом. Рядом не должно болтать других людей.\n\nНужны пакеты torch + resemblyzer (см. инструкцию HTML, один раз в Терминале).",
+                ok="Начать",
+                cancel="Отмена",
+            )
+            if ok != 1:
+                return
+            threading.Thread(target=self._enroll_record_worker, name="whisper-enroll", daemon=True).start()
+
+        def _enroll_record_worker(self) -> None:
+            sr = 16000
+            dur_sec = 45
+            frames = int(sr * dur_sec)
+            tmp_path: str | None = None
+            try:
+                try:
+                    from speaker_verify import embedding_path, enroll_from_wav
+                except ImportError:
+                    mac_banner_notification(
+                        "Whisper",
+                        "Нет модулей для эталона. Один раз в Терминале: python3 -m pip install torch resemblyzer",
+                    )
+                    return
+                mac_banner_notification("Whisper", "Идёт запись 45 с — говори в микрофон…")
+                rec = sd.rec(frames, samplerate=sr, channels=1, dtype="float32")
+                sd.wait()
+                flat = np.asarray(rec).reshape(-1)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                    tmp_path = tf.name
+                sf.write(tmp_path, flat, sr)
+                enroll_from_wav(tmp_path)
+                self.client._speaker_verify = True
+                _mac_log("info", "enroll_menu_ok path=%s", embedding_path())
+                mac_banner_notification(
+                    "Whisper",
+                    "Эталон сохранён. Проверка голоса включена для этой сессии; при следующем запуске .app — автоматически.",
+                )
+            except Exception as e:
+                _MAC_LOGGER.exception("enroll_menu_failed")
+                mac_banner_notification("Whisper", f"Ошибка записи эталона: {e!s:.120}")
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
         def _quit(self, _sender) -> None:
             self.client.request_shutdown()
@@ -1262,18 +1322,6 @@ if rumps is not None:
             if self.client._run_stop:
                 return
             self.client._ensure_listener_thread()
-
-        @rumps.timer(120.0)
-        def _auto_update_hint(self, _sender) -> None:
-            if self._auto_update_hint_done or self.client._run_stop:
-                return
-            self._auto_update_hint_done = True
-            if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
-                return
-            try:
-                run_mac_update_flow(notify_newer_only=True)
-            except Exception:
-                _MAC_LOGGER.debug("auto_update_hint", exc_info=True)
 
 else:
     WhisperMenuBarApp = None  # type: ignore[misc, assignment]
@@ -1518,9 +1566,12 @@ def main() -> int:
         ),
     )
 
-    spk = args.speaker_verify or (
-        os.environ.get("WHISPER_SPEAKER_VERIFY", "").strip().lower() in ("1", "true", "yes")
-    )
+    if os.environ.get("WHISPER_MAC_NO_SPEAKER_VERIFY", "").strip() == "1":
+        spk = False
+    else:
+        spk = args.speaker_verify or (
+            os.environ.get("WHISPER_SPEAKER_VERIFY", "").strip().lower() in ("1", "true", "yes")
+        )
     client = WhisperClientMac(
         server_url=args.server,
         language=args.language,

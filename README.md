@@ -232,6 +232,10 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 
+### Простая инструкция (Word)
+
+- Открой в Word: **[docs/ИНСТРУКЦИЯ_Whisper_Mac_Windows.html](docs/ИНСТРУКЦИЯ_Whisper_Mac_Windows.html)** → «Файл» → «Сохранить как» → `.docx` при необходимости.
+
 ### Версия
 
 - Источник правды: **`packaging/VERSION`** (строка `1.2.0`). В CI при теге `v*` файл перезаписывается из имени тега.
@@ -261,12 +265,11 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 
 ### Верификация говорящего (опционально)
 
-1. Установи зависимости: `pip install -r requirements-speaker.txt` (torch + resemblyzer).
-2. Запиши эталон (WAV 30–60 с):  
-   `python3 whisper-client-mac.py --enroll-speaker ./мой_голос.wav`  
-   Эталон: `~/.whisper/speaker_embedding.npy` (или **`WHISPER_SPEAKER_EMBEDDING_PATH`**).
-3. Включи проверку: **`--speaker-verify`** или **`WHISPER_SPEAKER_VERIFY=1`**. Порог: **`--speaker-threshold 0.7`** или **`WHISPER_SPEAKER_THRESHOLD`** (по умолчанию `0.72`).
-4. **Сервер:** эталон тот же формат на диске Windows; включение: **`WHISPER_SPEAKER_VERIFY=1`** (и при необходимости **`WHISPER_SPEAKER_EMBEDDING_PATH`**). При несовпадении — **HTTP 403**.
+**Из .app (без Терминала):** меню 🎤 → **Записать эталон голоса (45 с)…** (нужны `torch` + `resemblyzer`, см. HTML-инструкцию). Если файл **`~/.whisper/speaker_embedding.npy`** уже есть, **`run.sh`** внутри .app выставляет **`WHISPER_SPEAKER_VERIFY=1`** автоматически. Отключить автоматику: **`WHISPER_MAC_NO_SPEAKER_VERIFY=1`** в `packaging/mac/run.sh` перед сборкой.
+
+**Через Терминал:** `pip install -r requirements-speaker.txt`, затем `python3 whisper-client-mac.py --enroll-speaker ./мой.wav` (без `--server`). Порог: **`WHISPER_SPEAKER_THRESHOLD`** или **`--speaker-threshold`**.
+
+**Сервер:** **`WHISPER_SPEAKER_VERIFY=1`** + тот же формат эталона на диске Windows → при несовпадении **HTTP 403**.
 
 ## Файлы
 

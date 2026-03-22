@@ -22,7 +22,7 @@
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		AWeyT44VhnngWQd7UfHrmTwRjbs=
+		LWAvOY5iD/HIqKVbhtKqSexj5ME=
 		</data>
 		<key>Resources/whisper_update_check.py</key>
 		<data>
@@ -48,10 +48,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			HkcnfJ2Xl0y6ishvx2gf1OMd640=
+			J9Z+LX+mMV2N7tRgPQ9KKwE/0RI=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"1e47277c9d97974cba8ac86fc7681fd4e31deb8d"</string>
+			<string>cdhash H"27d67e2d7fa6315d8deed4603d0f4a2b013fd112"</string>
 		</dict>
 		<key>MacOS/whisper_notify</key>
 		<dict>
@@ -94,7 +94,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			ja+lDABy1MZItHRnsRV/Mt0Gx1fU2xi9QOfUY21wPXM=
+			2x8gG4T0ESM23R93nhWSxMXIEJjHrpXFJNoKWxVlqRc=
 			</data>
 		</dict>
 		<key>Resources/whisper_update_check.py</key>
