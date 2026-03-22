@@ -45,6 +45,9 @@ echo.
 echo Для остановки: Ctrl+C
 echo.
 
+REM Опционально: русский fine-tune в faster-whisper (CT2 на HF), см. README
+REM set WHISPER_MODEL=ru-ct2-pav88
+
 "%PY%" "%~dp0whisper-server.py" --host 0.0.0.0 --port %PORT%
 
 echo.

@@ -751,11 +751,19 @@ def main() -> int:
 
     import argparse
 
+    from whisper_models import resolve_model
 
+
+
+    _def_model = os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3"
 
     p = argparse.ArgumentParser(description="Whisper: запись пока зажаты Ctrl+Win")
 
-    p.add_argument("--model", default="large-v3", help="Модель Whisper")
+    p.add_argument(
+        "--model",
+        default=_def_model,
+        help="Модель или ключ пресета (large-v3, ru-ct2-pav88, …)",
+    )
 
     p.add_argument("--device", default="cuda", help="cuda | cpu")
 
@@ -815,7 +823,7 @@ def main() -> int:
 
     service = WhisperHotkey(
 
-        model=args.model,
+        model=resolve_model(args.model),
 
         device=args.device,
 

@@ -57,6 +57,8 @@ WINDOWS_LOCAL_HOTKEY_DESC = (
     "whisper-hotkey.py на этом ПК: зажми Ctrl+Win — запись с микрофона, отпусти — распознавание и вставка в активное окно."
 )
 
+from whisper_models import resolve_model
+
 app = FastAPI(title="Whisper API Server")
 
 app.add_middleware(
@@ -68,9 +70,9 @@ app.add_middleware(
 )
 
 _model: WhisperModel | None = None
-_model_name = "large-v3"
-_device = "cuda"
-_compute_type = "int8"
+_model_name = resolve_model(os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3")
+_device = (os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda")
+_compute_type = (os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8")
 
 _clients_lock = threading.Lock()
 # ip -> (unix_ts, метка клиента из X-Whisper-Client)
@@ -212,15 +214,22 @@ def main() -> int:
     import argparse
 
     p = argparse.ArgumentParser(description="Whisper HTTP API сервер")
+    _def_model = os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3"
+    _def_dev = os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda"
+    _def_ct = os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
     p.add_argument("--host", default="0.0.0.0", help="IP для прослушивания (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Порт (default: 8000)")
-    p.add_argument("--model", default="large-v3", help="Модель Whisper")
-    p.add_argument("--device", default="cuda", help="cuda | cpu")
-    p.add_argument("--compute-type", default="int8", help="int8, float16, …")
+    p.add_argument(
+        "--model",
+        default=_def_model,
+        help="Модель или ключ пресета (large-v3, ru-ct2-pav88, org/repo на HF)",
+    )
+    p.add_argument("--device", default=_def_dev, help="cuda | cpu")
+    p.add_argument("--compute-type", default=_def_ct, help="int8, float16, …")
     args = p.parse_args()
 
     global _model_name, _device, _compute_type
-    _model_name = args.model
+    _model_name = resolve_model(args.model)
     _device = args.device
     _compute_type = args.compute_type
 

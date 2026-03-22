@@ -100,6 +100,26 @@ def _write_port_file(port: int) -> None:
         pass
 
 
+GUI_PREFS_PATH = ROOT / "whisper_gui_prefs.json"
+
+
+def _load_gui_prefs() -> dict:
+    try:
+        return json.loads(GUI_PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _save_gui_prefs(data: dict) -> None:
+    try:
+        GUI_PREFS_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _maybe_check_updates_gui(root: object, current_ver: str) -> None:
     import threading
     import tempfile
@@ -161,11 +181,10 @@ def _fetch_clients_json(port: int) -> dict | None:
         return None
 
 
-def _run_uvicorn(port: int, host: str, ready_event: threading.Event) -> None:
+def _run_uvicorn(port: int, host: str) -> None:
     import uvicorn
     from whisper_server import app
 
-    ready_event.set()
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
@@ -173,28 +192,73 @@ def main() -> int:
     import tkinter as tk
     from tkinter import ttk
 
+    from whisper_models import MODEL_PRESETS
+
     port = _find_free_port()
     _firewall_allow(port)
     _write_port_file(port)
     ts_ip = _tailscale_ipv4()
 
-    ready = threading.Event()
-    srv_thread = threading.Thread(
-        target=lambda: _run_uvicorn(port, "0.0.0.0", ready),
-        name="uvicorn",
-        daemon=True,
-    )
-    srv_thread.start()
-    ready.wait(timeout=30)
+    prefs = _load_gui_prefs()
+    saved_key = str(prefs.get("model_key", "large-v3")).strip() or "large-v3"
+    preset_keys = [k for k, _, _ in MODEL_PRESETS]
+    if saved_key not in preset_keys:
+        saved_key = "large-v3"
+    label_by_key = {k: lbl for k, _, lbl in MODEL_PRESETS}
 
     app_ver = _get_app_version()
     root = tk.Tk()
     root.title(f"Whisper GPU Server  v{app_ver}")
-    root.geometry("560x420")
-    root.minsize(480, 360)
+    root.geometry("560x460")
+    root.minsize(480, 400)
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill=tk.BOTH, expand=True)
+
+    ttk.Label(frm, text="Модель (faster-whisper)", font=("", 12, "bold")).pack(anchor=tk.W)
+    model_var = tk.StringVar(value=label_by_key[saved_key])
+    combo_models = ttk.Combobox(
+        frm,
+        textvariable=model_var,
+        values=[lbl for _, _, lbl in MODEL_PRESETS],
+        state="readonly",
+        width=64,
+    )
+    combo_models.pack(anchor=tk.W, pady=(4, 2))
+    ttk.Label(
+        frm,
+        text="Сначала выбери модель, затем «Запустить сервер». Сменить модель можно только после перезапуска этого окна.",
+        font=("", 9),
+        foreground="#444",
+    ).pack(anchor=tk.W, pady=(0, 6))
+
+    def _model_key_from_ui() -> str:
+        cur = model_var.get()
+        for k, _, lbl in MODEL_PRESETS:
+            if lbl == cur:
+                return k
+        return "large-v3"
+
+    srv_started = {"ok": False}
+
+    def on_start_server() -> None:
+        if srv_started["ok"]:
+            return
+        srv_started["ok"] = True
+        key = _model_key_from_ui()
+        _save_gui_prefs({"model_key": key})
+        os.environ["WHISPER_MODEL"] = key
+        threading.Thread(
+            target=lambda: _run_uvicorn(port, "0.0.0.0"),
+            name="uvicorn",
+            daemon=True,
+        ).start()
+        combo_models.configure(state="disabled")
+        start_btn.state(["disabled"])
+        status.config(text="Сервер запущен. Закрой окно — остановка.", foreground="#0a0")
+
+    start_btn = ttk.Button(frm, text="Запустить сервер", command=on_start_server)
+    start_btn.pack(anchor=tk.W, pady=(4, 8))
 
     ttk.Label(frm, text="HTTP API (удалённые клиенты)", font=("", 12, "bold")).pack(anchor=tk.W)
     ttk.Label(frm, text=f"Порт: {port}   •   Локально: http://127.0.0.1:{port}/").pack(anchor=tk.W, pady=(4, 0))
@@ -223,7 +287,11 @@ def main() -> int:
     tree.column("sec", width=80)
     tree.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
 
-    status = ttk.Label(frm, text="Сервер запущен. Закрой окно — остановка.", foreground="#0a0")
+    status = ttk.Label(
+        frm,
+        text="Выбери модель и нажми «Запустить сервер».",
+        foreground="#666",
+    )
     status.pack(anchor=tk.W)
 
     def refresh_tree() -> None:

@@ -37,7 +37,7 @@ def main() -> int:
     p.add_argument(
         "--model",
         default="large-v3",
-        help="Имя модели: tiny, base, small, medium, large-v2, large-v3 (default)",
+        help="Имя модели или ключ пресета (large-v3, ru-ct2-pav88, … см. whisper_models.py)",
     )
     p.add_argument(
         "--device",
@@ -67,12 +67,15 @@ def main() -> int:
 
     from faster_whisper import WhisperModel
 
+    from whisper_models import resolve_model
+
+    model_id = resolve_model(args.model)
     print(
-        f"Загрузка модели {args.model} ({args.device}, {args.compute_type})...",
+        f"Загрузка модели {model_id} ({args.device}, {args.compute_type})...",
         flush=True,
     )
     model = WhisperModel(
-        args.model,
+        model_id,
         device=args.device,
         compute_type=args.compute_type,
     )

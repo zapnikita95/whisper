@@ -3,6 +3,7 @@
 __pycache__/
 test_sample.mp3
 server_port.txt
+whisper_gui_prefs.json
 dist/
 build/
 *.spec.bak

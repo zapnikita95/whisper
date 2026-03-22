@@ -14,6 +14,19 @@
 
 **Заметка:** связка `tiny` + `int8` + CUDA в CTranslate2 иногда даёт пустой текст; для GPU бери `medium` / `large-v3` или `float16`.
 
+## Пресеты моделей (оригинал и русский fine-tune)
+
+`faster-whisper` грузит репозитории с **раскладкой CTranslate2** на Hugging Face. Чисто PyTorch-веса без конверсии в этот формат **напрямую** не подставлять.
+
+| Что на HF | Заметка |
+|-----------|---------|
+| [antony66/whisper-large-v3-russian](https://huggingface.co/antony66/whisper-large-v3-russian) | Полный **large-v3** (не turbo), fine-tune под русский; ориентир по WER — в карточке модели. |
+| [dvislobokov/whisper-large-v3-turbo-russian](https://huggingface.co/dvislobokov/whisper-large-v3-turbo-russian) | База **large-v3-turbo** (меньше параметров, быстрее) — **другой** размер/скорость vs полный large-v3; сравнивать по своим тестам и метрикам на HF. |
+| [pav88/whisper-large-v3-russian-ct2](https://huggingface.co/pav88/whisper-large-v3-russian-ct2) | CT2-версия для faster-whisper (в проекте пресет **`ru-ct2-pav88`**). |
+| [bzikst/faster-whisper-large-v3-russian](https://huggingface.co/bzikst/faster-whisper-large-v3-russian) | Альтернативная CT2-сборка (**`ru-ct2-bzikst`**). |
+
+Список ключей — в `whisper_models.py`. **Окно WhisperServer (Windows):** выбери модель в списке и нажми **«Запустить сервер»**. Консоль: `set WHISPER_MODEL=ru-ct2-pav88` перед запуском или `whisper-server.py --model ru-ct2-pav88`. Для hotkey то же через `WHISPER_MODEL` или `--model`.
+
 ## Установка
 
 Нужны **Python 3.10+** и драйвер NVIDIA. Полный [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) не обязателен: в `requirements.txt` есть пакет **nvidia-cublas-cu12** (DLL для cuBLAS 12, ~550 МБ). Скрипт `transcribe.py` сам добавляет его `bin` в `PATH` на Windows.
@@ -140,6 +153,7 @@ Whisper иногда пишет фразу с ошибкой («восклица
    ```powershell
    .\start-server-gui.bat
    ```
+   В GUI сначала выбери **модель** (оригинал `large-v3` или русский CT2-пресет), затем **«Запустить сервер»**; выбор сохраняется в `whisper_gui_prefs.json` рядом с exe/скриптом.
    Или напрямую:
    ```powershell
    & "$env:USERPROFILE\.venvs\faster-whisper\Scripts\python.exe" .\whisper-server.py --host 0.0.0.0 --port 8000
@@ -277,6 +291,7 @@ python3 whisper-client-mac.py --server 'http://…' --speaker-verify
 |------|------------|
 | `transcribe.py` | CLI: файл → текст в консоль |
 | `whisper-hotkey.py` | Ctrl+Win удерживаешь — запись, отпускаешь — текст (Windows) |
+| `whisper_models.py` | пресеты моделей (ключ → HF id для faster-whisper) |
 | `whisper_server.py` | код HTTP API (импорт GUI / uvicorn) |
 | `whisper-server.py` | shim: запуск CLI как раньше |
 | `whisper_server_gui.py` | окно сервера: порт, Ctrl+Win, список HTTP-клиентов |
