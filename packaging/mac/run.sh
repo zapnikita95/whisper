@@ -33,4 +33,5 @@ for a in "$@"; do
 	esac
 done
 export WHISPER_FROM_APP_BUNDLE=1
+export WHISPER_NOTIFY_TOOL="$MACOS_DIR/whisper_notify"
 exec "${CMD[@]}"

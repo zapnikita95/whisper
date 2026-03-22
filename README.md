@@ -160,7 +160,7 @@ Whisper иногда пишет фразу с ошибкой («восклица
 1. Установи зависимости:
    ```bash
    pip3 install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip
-   pip3 install rumps   # опционально: иконка 🎤 в строке меню (клиент не «пропал»); отключить: `--no-menu-bar` или `WHISPER_MAC_NO_MENU=1`
+   pip3 install rumps   # рекомендуется: иконка 🎤/🔴 в строке меню (запись/обработка); `pick_python_for_whisper` выберет Python, где есть rumps, если таких несколько. Отключить: `--no-menu-bar` или `WHISPER_MAC_NO_MENU=1`
    ```
 
 2. Скопируй `whisper-client-mac.py` на Mac.
@@ -197,6 +197,8 @@ Whisper иногда пишет фразу с ошибкой («восклица
 
    **Отладка вставки / сервера:** файл **`~/Library/Logs/WhisperMacClient.log`** (строки с **`[WHISPER_MAC]`**). Вставка идёт в приложение, которое было **активным в момент начала записи** (перед Cmd+V фокус возвращается туда). Если в буфере мусор — в логе будет `clipboard_mismatch` или `paste_target_captured`. Полный текст распознавания в лог: `WHISPER_MAC_DEBUG=1`.
 
+   **Уведомления и «молчит после фразы»:** после `build_mac_app.sh` в бандле есть **`whisper_notify`** — баннеры в Центре уведомлений идут **от бинаря внутри .app** (не от «Python»). Показываются: старт из Finder, «отправка на сервер» (из .app), **готово** с превью текста, пустой ответ, ошибки сети. Отключить всё: `WHISPER_MAC_NO_NOTIFICATIONS=1`. Только убрать «готово»: `WHISPER_MAC_NOTIFY_SUCCESS=0`. Прогресс «отправка…» в терминале по умолчанию выключен; из .app включён; принудительно: `WHISPER_MAC_NOTIFY_PROGRESS=1`.
+
 ### Опции клиента
 
 ```bash
@@ -221,8 +223,8 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 
 1. В том же venv, где стоят `fastapi`, `faster-whisper`, `uvicorn`: `pip install pyinstaller`.
 2. В репозитории должен быть `assets\app_icon.ico` (собирается на Mac: `packaging/regenerate_icons.sh` или кладётся вручную).
-3. Запусти `packaging\build-server-gui-exe.bat` — получишь `dist\WhisperServer\WhisperServer.exe` с иконкой (первый запуск может быть долгим из‑за CTranslate2).
-4. Положи рядом с exe файлы из репозитория при необходимости (`server_port.txt` создаётся сам). Для «красивого» ярлыка: закрепи exe на панели задач / создай ярлык в автозагрузке.
+3. Запусти `packaging\build-server-gui-exe.bat` — получишь **onedir** `dist\WhisperServer\WhisperServer.exe` с иконкой (рядом папка `_internal`; не переноси только один exe). Первый запуск может быть долгим из‑за CTranslate2 и загрузки модели.
+4. Запуск **двойным кликом по WhisperServer.exe** — окно с портом и списком HTTP‑клиентов; `server_port.txt` создаётся в той же папке, что и exe. Для автозагрузки — ярлык на этот exe.
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 

@@ -18,6 +18,12 @@ if ! xcrun clang -O2 -Wall -Wextra -o "$APP/Contents/MacOS/WhisperClient" "$MAC/
 	exit 1
 fi
 
+if xcrun clang -O2 -Wall -Wextra -framework Cocoa -o "$APP/Contents/MacOS/whisper_notify" "$MAC/whisper_notify.m" 2>/dev/null; then
+	:
+else
+	echo "Предупреждение: не собран whisper_notify — уведомления останутся через osascript (часто «Python»)."
+fi
+
 if [ -f "$ROOT/assets/AppIcon.icns" ]; then
 	cp -f "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 else

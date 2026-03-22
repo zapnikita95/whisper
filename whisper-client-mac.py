@@ -8,7 +8,7 @@
 Переопределение: WHISPER_MAC_HOTKEY или флаг --hotkey; в WhisperClient.app хоткей задаётся в packaging/mac/run.sh.
 См. PORTAL_AND_WHISPER_MAC.md
 
-Журнал (вставка/сервер): ~/Library/Logs/WhisperMacClient.log — в Console фильтр «WHISPER_MAC».
+Журнал (вставка/сервер): ~/Library/Logs/WhisperMacClient.log (если нет прав — /tmp/WhisperMacClient.log); в Console фильтр «WHISPER_MAC»; после каждой строки flush на диск.
 Полный текст распознавания в лог: WHISPER_MAC_DEBUG=1.
 Перехват клавиш — отдельный поток с автоперезапуском; иконка в меню — пакет rumps (опционально). Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
@@ -49,17 +49,47 @@ except ImportError as e:
 
 
 _MAC_LOGGER = logging.getLogger("whisper_mac")
+_LOG_PATH: Path | None = None
+
+
+class _FlushingFileHandler(logging.FileHandler):
+    """После каждой записи flush — иначе при краше .app последние строки не попадают на диск."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
 
 
 def configure_whisper_mac_logging() -> Path:
-    """Файл ~/Library/Logs/WhisperMacClient.log + в терминале — строки с префиксом [WHISPER_MAC] (фильтр в Console)."""
-    log_dir = Path.home() / "Library" / "Logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "WhisperMacClient.log"
+    """Файл ~/Library/Logs/WhisperMacClient.log; при ошибке — /tmp; всегда flush."""
+    global _LOG_PATH
+    fmt = logging.Formatter("%(asctime)s [WHISPER_MAC] %(levelname)s %(message)s")
     _MAC_LOGGER.setLevel(logging.DEBUG)
     _MAC_LOGGER.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [WHISPER_MAC] %(levelname)s %(message)s")
-    fh = logging.FileHandler(log_path, encoding="utf-8")
+
+    candidates: list[Path] = []
+    try:
+        log_dir = Path.home() / "Library" / "Logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        candidates.append(log_dir / "WhisperMacClient.log")
+    except OSError:
+        pass
+    candidates.append(Path(tempfile.gettempdir()) / "WhisperMacClient.log")
+
+    log_path = Path(tempfile.gettempdir()) / "WhisperMacClient.log"
+    fh: logging.Handler | None = None
+    for p in candidates:
+        try:
+            fh = _FlushingFileHandler(p, encoding="utf-8")
+            log_path = p
+            break
+        except OSError as e:
+            print(f"[Client] Лог-файл {p}: {e}", file=sys.stderr, flush=True)
+
+    if fh is None:
+        fh = logging.StreamHandler(sys.stderr)
+        print("[Client] Пишу лог только в stderr (не удалось создать файл).", file=sys.stderr, flush=True)
+
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
     _MAC_LOGGER.addHandler(fh)
@@ -68,6 +98,17 @@ def configure_whisper_mac_logging() -> Path:
         sh.setFormatter(fmt)
         sh.setLevel(logging.INFO)
         _MAC_LOGGER.addHandler(sh)
+
+    _LOG_PATH = log_path if fh is not None and isinstance(fh, _FlushingFileHandler) else None
+
+    def _excepthook(exc_type, exc, tb) -> None:
+        if _MAC_LOGGER.handlers:
+            _MAC_LOGGER.error("uncaught_exception", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+    _MAC_LOGGER.info("logging_ok path=%s", log_path)
     return log_path
 
 
@@ -77,6 +118,52 @@ def _mac_log(level: str, msg: str, *args: object) -> None:
         log_fn(msg, *args)
     else:
         _MAC_LOGGER.info(msg, *args)
+
+
+def mac_banner_notification(title: str, body: str = "") -> None:
+    """macOS: баннер в Центре уведомлений. Из .app — бинарь whisper_notify (не «Python»); иначе osascript."""
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("WHISPER_MAC_NO_NOTIFICATIONS") == "1":
+        return
+    t = (title or "Whisper Client").strip()[:200]
+    b = (body or "").strip()[:650]
+    payload = (t + "\n" + b).encode("utf-8")
+    tool = (os.environ.get("WHISPER_NOTIFY_TOOL") or "").strip()
+    if tool and Path(tool).is_file() and os.access(tool, os.X_OK):
+        try:
+            subprocess.run(
+                [tool],
+                input=payload,
+                capture_output=True,
+                timeout=8.0,
+                check=False,
+            )
+            return
+        except Exception:
+            _MAC_LOGGER.debug("whisper_notify_tool_failed", exc_info=True)
+    esc_t = t.replace("\\", "\\\\").replace('"', '\\"')
+    esc_b = b.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{esc_b}" with title "{esc_t}"',
+            ],
+            check=False,
+            capture_output=True,
+            timeout=10.0,
+        )
+    except Exception:
+        pass
+
+
+def _mac_notify_progress(body: str) -> None:
+    """«Отправка на сервер» — по умолчанию только при запуске из .app (меньше шума в терминале)."""
+    if os.environ.get("WHISPER_MAC_NOTIFY_PROGRESS", "1" if os.environ.get("WHISPER_FROM_APP_BUNDLE") else "0") != "1":
+        return
+    mac_banner_notification("Whisper", body)
 
 
 def tray_icon_path() -> str | None:
@@ -396,6 +483,19 @@ class WhisperClientMac:
             except Exception:
                 pass
 
+    def _schedule_listener_kick(self, delay: float = 0.28) -> None:
+        """Отложенный restart tap: сразу после Cmd+V из потока work иногда ловится дедлок/залипание CGEventTap."""
+
+        def _run() -> None:
+            time.sleep(delay)
+            try:
+                self._kick_listener_restart()
+                _mac_log("debug", "listener_kick_after_delay delay=%.2fs", delay)
+            except Exception:
+                _MAC_LOGGER.exception("listener_kick_scheduled_failed")
+
+        threading.Thread(target=_run, name="whisper-listener-kick", daemon=True).start()
+
     def _on_press_hotkey(self, key) -> None:
         target = self.hotkey.tokens
         try:
@@ -412,7 +512,7 @@ class WhisperClientMac:
             if should_start:
                 self._start_recording()
         except Exception:
-            _MAC_LOGGER.debug("on_press_hotkey", exc_info=True)
+            _MAC_LOGGER.exception("on_press_hotkey")
 
     def _on_release_hotkey(self, key) -> None:
         target = self.hotkey.tokens
@@ -431,7 +531,7 @@ class WhisperClientMac:
             if should_stop:
                 self._stop_recording_and_process()
         except Exception:
-            _MAC_LOGGER.debug("on_release_hotkey", exc_info=True)
+            _MAC_LOGGER.exception("on_release_hotkey")
 
     def _listener_loop(self) -> None:
         """Отдельный поток: бесконечно поднимает pynput Listener; при падении tap — пауза и снова."""
@@ -464,8 +564,8 @@ class WhisperClientMac:
             err_backoff = 0.25
             if self._run_stop:
                 break
-            _mac_log("debug", "listener_join_ended (kick or macOS); immediate restart")
-            time.sleep(0.12)
+            _mac_log("debug", "listener_join_ended (kick or macOS); restart after pause")
+            time.sleep(0.22)
 
     def _release_sticky_modifiers(self) -> None:
         """Сбрасываем модификаторы после горячих клавиш — иначе они «дотягиваются» до синтетической вставки."""
@@ -541,7 +641,7 @@ class WhisperClientMac:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=10.0,
+                timeout=2.5,
             )
             if r.returncode != 0:
                 _mac_log(
@@ -639,6 +739,7 @@ class WhisperClientMac:
                 self._audio_chunks = chunks
         except Exception as e:
             print(f"[Client] Ошибка записи: {e}", file=sys.stderr, flush=True)
+            _mac_log("error", "record_worker_error %s", e)
 
     def _start_recording(self) -> None:
         with self._lock:
@@ -650,15 +751,37 @@ class WhisperClientMac:
             self._recording = True
         self._stop_record.clear()
         self._audio_chunks.clear()
-        # Звуковой сигнал (через системный beep на Mac)
-        try:
-            subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], check=False, timeout=1.0)
-        except Exception:
-            print("\a", end="", flush=True)  # Fallback: ASCII bell
-        print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
-        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
-        self._record_thread = threading.Thread(target=self._record_worker, daemon=True)
+        self._paste_target_unix_id = None
+        # Микрофон сразу — до любых afplay/osascript (иначе съедается первое слово).
+        self._record_thread = threading.Thread(
+            target=self._record_worker,
+            name="whisper-record",
+            daemon=True,
+        )
         self._record_thread.start()
+        _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
+
+        def _snapshot_bg() -> None:
+            self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
+
+        threading.Thread(target=_snapshot_bg, name="whisper-paste-target", daemon=True).start()
+
+        def _beep_async() -> None:
+            try:
+                subprocess.Popen(
+                    ["afplay", "-v", "0.2", "/System/Library/Sounds/Pop.aiff"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception:
+                try:
+                    print("\a", end="", flush=True)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_beep_async, name="whisper-beep", daemon=True).start()
+        print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
 
     def _stop_recording_and_process(self) -> None:
         with self._lock:
@@ -675,6 +798,7 @@ class WhisperClientMac:
 
         if not chunks:
             print("[Client] Нет аудио.", flush=True)
+            mac_banner_notification("Whisper", "Нет аудио — проверь микрофон и доступ.")
             self._reset_hotkey_tracker()
             with self._lock:
                 self._busy = False
@@ -685,6 +809,7 @@ class WhisperClientMac:
         min_samples = int(0.25 * self.sample_rate)
         if audio_data.size < min_samples:
             print("[Client] Запись слишком короткая.", flush=True)
+            mac_banner_notification("Whisper", "Запись слишком короткая — держи хоткей дольше.")
             self._reset_hotkey_tracker()
             with self._lock:
                 self._busy = False
@@ -704,7 +829,7 @@ class WhisperClientMac:
                     self._reset_hotkey_tracker()
                     with self._lock:
                         self._busy = False
-                    self._kick_listener_restart()
+                    self._schedule_listener_kick()
 
         def _work_body(paste_pid: int | None) -> None:
             try:
@@ -734,6 +859,7 @@ class WhisperClientMac:
 
                     # Отправляем на сервер с повторными попытками
                     print("[Client] Отправка на сервер…", flush=True)
+                    _mac_notify_progress("Отправка на сервер, жди ответ…")
                     _mac_log("info", "transcribe_upload_start url=%s paste_target_pid=%s", self.server_url, paste_pid)
                     max_retries = 3
                     response = None
@@ -777,6 +903,7 @@ class WhisperClientMac:
                         body = (response.text or "")[:400]
                         _mac_log("error", "transcribe_bad_json status=%s body_prefix=%r", response.status_code, body)
                         print("[Client] Ответ сервера не JSON — см. ~/Library/Logs/WhisperMacClient.log", flush=True)
+                        mac_banner_notification("Whisper — ошибка", "Некорректный ответ сервера (не JSON).")
                         raise
                     text = result.get("text", "").strip()
                     _mac_log(
@@ -791,6 +918,7 @@ class WhisperClientMac:
 
                     if text:
                         # Не даём synthetic release от Controller/osascript попасть в pressed — иначе hotkey ломается.
+                        paste_ok = False
                         with self._hk_lock:
                             self._hk_suppress = True
                         try:
@@ -823,6 +951,7 @@ class WhisperClientMac:
                                 )
                             time.sleep(0.12)
                             ok = self._paste_via_system_events()
+                            paste_ok = bool(ok)
                             if ok:
                                 print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
                                 _mac_log("info", "paste_cmd_v_ok")
@@ -844,9 +973,19 @@ class WhisperClientMac:
                             _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
                         finally:
                             self._reset_hotkey_tracker()
+                        if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                            prev = text[:130] + ("…" if len(text) > 130 else "")
+                            if paste_ok:
+                                mac_banner_notification("Whisper — готово", prev)
+                            else:
+                                mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
                     else:
                         print("[Client] Текст не распознан.", flush=True)
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
+                        mac_banner_notification(
+                            "Whisper",
+                            "Текст не распознан — говори громче или подольше.",
+                        )
                 finally:
                     try:
                         os.unlink(tmp_path)
@@ -856,16 +995,20 @@ class WhisperClientMac:
                 print(f"[Client] Ошибка соединения с сервером: {e}", file=sys.stderr, flush=True)
                 print(f"[Client] Убедись, что сервер запущен на {self.server_url}", file=sys.stderr, flush=True)
                 print(f"[Client] Проверь Tailscale соединение и брандмауэр Windows", file=sys.stderr, flush=True)
+                mac_banner_notification("Whisper — нет связи", f"Сервер недоступен: {self.server_url}")
             except requests.exceptions.Timeout as e:
                 print(f"[Client] Таймаут при обработке (слишком долго)", file=sys.stderr, flush=True)
                 print(f"[Client] Попробуй более короткую запись или проверь сервер", file=sys.stderr, flush=True)
+                mac_banner_notification("Whisper — таймаут", "Сервер долго не отвечает — попробуй короче или проверь ПК.")
             except Exception as e:
                 print(f"[Client] Ошибка: {e}", file=sys.stderr, flush=True)
+                _MAC_LOGGER.exception("work_body_error")
+                mac_banner_notification("Whisper — ошибка", str(e)[:200])
                 import traceback
 
                 traceback.print_exc()
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, name="whisper-transcribe", daemon=True).start()
 
     def run(self, *, menu_bar: bool = False) -> None:
         print(f"[Client] Удерживай {self._hotkey_label} — запись, отпусти все клавиши сочетания — распознавание.", flush=True)
@@ -934,6 +1077,8 @@ if rumps is not None:
 
         def _open_log(self, _sender) -> None:
             logf = Path.home() / "Library" / "Logs" / "WhisperMacClient.log"
+            if not logf.is_file():
+                logf = Path(tempfile.gettempdir()) / "WhisperMacClient.log"
             subprocess.run(["open", "-R", str(logf)], check=False)
 
         def _quit(self, _sender) -> None:
@@ -963,6 +1108,23 @@ else:
 def main() -> int:
     log_path = configure_whisper_mac_logging()
     _mac_log("info", "=== старт whisper-client-mac ===")
+
+    if hasattr(threading, "excepthook"):
+        _orig_thread_excepthook = threading.excepthook
+
+        def _thread_excepthook(args: object) -> None:
+            th = getattr(args, "thread", None)
+            exc_t = getattr(args, "exc_type", None)
+            exc_v = getattr(args, "exc_value", None)
+            exc_tb = getattr(args, "exc_traceback", None)
+            _MAC_LOGGER.error(
+                "thread_crash name=%s",
+                getattr(th, "name", "?"),
+                exc_info=(exc_t, exc_v, exc_tb) if exc_t else None,
+            )
+            _orig_thread_excepthook(args)
+
+        threading.excepthook = _thread_excepthook  # type: ignore[method-assign]
 
     # macOS при запуске .app из Finder добавляет -psn_0_… в argv; иначе parse_args() падает и приложение сразу завершается.
     sys.argv = [sys.argv[0]] + [
@@ -1082,16 +1244,10 @@ def main() -> int:
             check=False,
         )
         if not sys.stdin.isatty():
-            hk_safe = describe_hotkey(hotkey).replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    f'display notification "Клиент в фоне. Удерживай {hk_safe} — запись; отпусти все клавиши сочетания — распознавание." '
-                    'with title "Whisper Client"',
-                ],
-                check=False,
-                capture_output=True,
+            hk = describe_hotkey(hotkey)
+            mac_banner_notification(
+                "Whisper Client",
+                f"Клиент в фоне. Удерживай {hk} — запись; отпусти все клавиши сочетания — распознавание.",
             )
 
     use_menu_bar = (

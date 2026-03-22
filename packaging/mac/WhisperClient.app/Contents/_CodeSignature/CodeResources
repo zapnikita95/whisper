@@ -14,7 +14,7 @@
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		dpjYhIqJHsiywULKN8sFNfvTAAk=
+		dh5ev/CWC/FY8EwbdKHaDTk4ehA=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -23,19 +23,28 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			nmy4z51lWhj6ZA/wnpujsX6FbjQ=
+			OFkA9mP+kzWL4iA7ova+vHg+SfU=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"9e6cb8cf9d655a18fa640ff09e9ba3b17e856e34"</string>
+			<string>cdhash H"385900f663fe93358be2203ba2f6bebc783e49f5"</string>
 		</dict>
 		<key>MacOS/run.sh</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			HW4y1XEO6dyy6YIcAfZmXVxoMZ8=
+			M2Ci7IBpYpItQfugXuWZe5jZTDM=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"1d6e32d5710ee9dcb2e9821c01f6665d5c68319f"</string>
+			<string>cdhash H"3360a2ec806962922d41fba05ee5997b98d94c33"</string>
+		</dict>
+		<key>MacOS/whisper_notify</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			6wtLcxkH1N3uyxRZs7+ge4mv+8g=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"eb0b4b731907d4ddeecb1459b3bfa07b89affbc8"</string>
 		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
@@ -55,7 +64,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			kuf2q8fcafdB8AYetBAc4bjwwPdziodSTQz83/1tS84=
+			xX1rSneguOptyvuz5qJCv2sD53z/rooC88QB8E/hJMQ=
 			</data>
 		</dict>
 	</dict>

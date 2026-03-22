@@ -20,6 +20,7 @@ if sys.platform != "win32":
 
 
 def _project_root() -> Path:
+    """Каталог рядом с exe (PyInstaller onedir: dist/WhisperServer/). server_port.txt пишется туда же."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent

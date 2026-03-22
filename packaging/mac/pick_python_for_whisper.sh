@@ -26,16 +26,25 @@ pick_python_for_whisper() {
 	x="$(command -v python3 2>/dev/null || true)"
 	[ -n "$x" ] && cands+=("$x")
 	cands+=("/usr/bin/python3")
-	local seen="" c
+	local seen="" c fallback=""
 	for c in "${cands[@]}"; do
 		[ -z "$c" ] && continue
 		[ ! -x "$c" ] && continue
 		case " $seen " in *" $c "*) continue ;; esac
 		seen="$seen $c"
 		if "$c" -c "import requests, sounddevice, numpy, soundfile, pynput, pyperclip" 2>/dev/null; then
-			echo "$c"
-			return 0
+			if [ -z "$fallback" ]; then
+				fallback="$c"
+			fi
+			if "$c" -c "import rumps" 2>/dev/null; then
+				echo "$c"
+				return 0
+			fi
 		fi
 	done
+	if [ -n "$fallback" ]; then
+		echo "$fallback"
+		return 0
+	fi
 	return 1
 }
