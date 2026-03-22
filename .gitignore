@@ -1,4 +1,8 @@
+.DS_Store
 .venv/
 __pycache__/
 test_sample.mp3
 server_port.txt
+dist/
+build/
+*.spec.bak

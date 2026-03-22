@@ -1,0 +1,10 @@
+#!/bin/bash
+R="$(cd "$(dirname "$0")/../Resources" && pwd)"
+export PYTHONUNBUFFERED=1
+if URL="$(python3 "$R/pick_server_url.py" 2>/dev/null)" && [ -n "$URL" ]; then
+	:
+else
+	URL="http://100.115.68.2:8000"
+fi
+# Из Finder нет TTY — без промпта горячих клавиш; свою строку задавай из Терминала.
+exec python3 "$R/whisper-client-mac.py" --server "$URL" --no-hotkey-prompt "$@"
