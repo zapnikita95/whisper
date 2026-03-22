@@ -1,5 +1,6 @@
 #!/bin/bash
 # Запуск из Finder даёт урезанный PATH — без Homebrew, из-за этого «краш» (не тот python / нет модулей).
+# Вызывается из Mach-O stub Contents/MacOS/WhisperClient; $0 = .../run.sh
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export PYTHONUNBUFFERED=1

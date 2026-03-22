@@ -8,7 +8,12 @@ REM Запускать из venv с faster-whisper / fastapi / uvicorn.
 set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
+REM После cd корень репо — иконка без пробелов в пути
+set "ICONLINE="
+if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
+
 "%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperServer ^
+  %ICONLINE% ^
   --collect-all uvicorn --collect-all fastapi --collect-all starlette ^
   --hidden-import whisper_server --hidden-import faster_whisper ^
   whisper_server_gui.py

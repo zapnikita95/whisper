@@ -1,0 +1,2 @@
+- `app_icon.png` — исходник (можно заменить).
+- `AppIcon.icns` / `app_icon.ico` — пересборка: `../packaging/regenerate_icons.sh` (macOS, нужен Pillow для `.ico`).

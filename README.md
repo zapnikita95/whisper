@@ -168,7 +168,7 @@ Whisper иногда пишет фразу с ошибкой («восклица
    ```bash
    ./packaging/build_mac_app.sh
    ```
-   Затем открой `packaging/mac/WhisperClient.app`. Лаунчер подставляет **PATH с Homebrew** (из Finder он пустой — иначе берётся «голый» `/usr/bin/python3` без твоих pip-пакетов и приложение «падает»). При отсутствии модулей покажется диалог. Свой Python: `WHISPER_PYTHON3` (см. `packaging/mac/launcher.sh`). Из Finder: `--no-hotkey-prompt`; свой `--hotkey` — из Терминала. После правок `whisper-client-mac.py`: `./packaging/build_mac_app.sh`.
+   Затем открой `packaging/mac/WhisperClient.app`. **CFBundleExecutable** — не bash, а маленький **Mach-O stub** (`whisper_stub.c`), иначе Finder даёт ошибку вроде «нет разрешения открыть (null)». Скрипт `run.sh` подставляет PATH с Homebrew и проверяет pip-модули. Нужны **Xcode Command Line Tools** (`clang`) для сборки. Иконка: `assets/AppIcon.icns`. Перегенерация из PNG: `./packaging/regenerate_icons.sh`. Свой Python: `WHISPER_PYTHON3` (см. `packaging/mac/run.sh`). После правок `whisper-client-mac.py`: `./packaging/build_mac_app.sh`.
 
 4. **Простой способ (скрипт):** двойной клик на `start-client-mac.command` в Finder  
    **Или из терминала:**
@@ -212,8 +212,9 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 ### Упаковка: exe без консоли (Windows)
 
 1. В том же venv, где стоят `fastapi`, `faster-whisper`, `uvicorn`: `pip install pyinstaller`.
-2. Запусти `packaging\build-server-gui-exe.bat` — получишь `dist\WhisperServer\WhisperServer.exe` (первый запуск может быть долгим из‑за CTranslate2).
-3. Положи рядом с exe файлы из репозитория при необходимости (`server_port.txt` создаётся сам). Для «красивого» ярлыка: закрепи exe на панели задач / создай ярлык в автозагрузке.
+2. В репозитории должен быть `assets\app_icon.ico` (собирается на Mac: `packaging/regenerate_icons.sh` или кладётся вручную).
+3. Запусти `packaging\build-server-gui-exe.bat` — получишь `dist\WhisperServer\WhisperServer.exe` с иконкой (первый запуск может быть долгим из‑за CTranslate2).
+4. Положи рядом с exe файлы из репозитория при необходимости (`server_port.txt` создаётся сам). Для «красивого» ярлыка: закрепи exe на панели задач / создай ярлык в автозагрузке.
 
 Чтобы **вообще не открывать батники**, достаточно **WhisperServer.exe** (GUI) для сервера и **WhisperClient.app** на Mac после `build_mac_app.sh`.
 
@@ -232,6 +233,9 @@ python3 whisper-client-mac.py --server 'http://100.x.x.x:8002' --bind-hotkey
 | `start-server.bat` | запуск HTTP API сервера (консоль) |
 | `start-server-gui.bat` | запуск сервера с GUI (как start-server.bat по правам) |
 | `packaging/mac/WhisperClient.app` | Mac-приложение (обновлять через `build_mac_app.sh`) |
+| `packaging/mac/whisper_stub.c` | Mach-O загрузчик для .app (Finder) |
+| `assets/app_icon.png` | исходник иконки; `AppIcon.icns`, `app_icon.ico` — для .app / exe |
+| `packaging/regenerate_icons.sh` | PNG → icns + ico |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
 | `run-transcribe.ps1` | transcribe через venv |
 | `run-hotkey.ps1` | hotkey через venv |

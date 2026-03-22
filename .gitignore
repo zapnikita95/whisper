@@ -6,3 +6,4 @@ server_port.txt
 dist/
 build/
 *.spec.bak
+assets/AppIcon.iconset/
