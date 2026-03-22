@@ -87,6 +87,20 @@ def _prepend_nvidia_cublas_to_path() -> bool:
 
     candidates: list[Path] = []
 
+    if getattr(sys, "frozen", False):
+
+        exe_dir = Path(sys.executable).resolve().parent
+
+        meip = getattr(sys, "_MEIPASS", None)
+
+        if meip:
+
+            candidates.append(Path(meip))
+
+        candidates.append(exe_dir / "_internal")
+
+        candidates.append(exe_dir)
+
     try:
 
         candidates.append(Path(site.getusersitepackages()))
@@ -103,7 +117,15 @@ def _prepend_nvidia_cublas_to_path() -> bool:
 
         pass
 
+    seen: set[Path] = set()
+
     for base in candidates:
+
+        if not base or base in seen:
+
+            continue
+
+        seen.add(base.resolve())
 
         bin_dir = base / "nvidia" / "cublas" / "bin"
 
@@ -114,6 +136,23 @@ def _prepend_nvidia_cublas_to_path() -> bool:
             return True
 
     return False
+
+
+def _transcribe_timeout_sec_default() -> float:
+
+    raw = (os.environ.get("WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT") or "").strip()
+
+    if not raw:
+
+        return 300.0
+
+    try:
+
+        return max(30.0, min(float(raw), 3600.0))
+
+    except ValueError:
+
+        return 300.0
 
 
 
@@ -313,6 +352,8 @@ class WhisperHotkey:
         self._speaker_verify = speaker_verify
 
         self._speaker_threshold = speaker_threshold
+
+        self._transcribe_timeout_sec = _transcribe_timeout_sec_default()
 
 
 
@@ -782,8 +823,10 @@ class WhisperHotkey:
 
                 self._emit_status("Распознавание…")
 
-                # Транскрипция с таймаутом (60 секунд максимум)
+                # Транскрипция с таймаутом (large-v3 / холодный GPU легко > 60 с)
                 text = None
+
+                tmo = self._transcribe_timeout_sec
 
                 def transcribe_with_timeout() -> str | None:
 
@@ -825,15 +868,23 @@ class WhisperHotkey:
 
                 transcribe_thread.start()
 
-                transcribe_thread.join(timeout=60.0)  # таймаут 60 секунд
+                transcribe_thread.join(timeout=tmo)
 
                 if transcribe_thread.is_alive():
 
-                    print("[Whisper] Таймаут транскрипции (60 сек), отмена.", flush=True)
+                    print(f"[Whisper] Таймаут транскрипции ({tmo:.0f} с), отмена.", flush=True)
 
-                    log.warning("Таймаут транскрипции 60 с")
+                    log.warning("Таймаут транскрипции %.0f с", tmo)
 
-                    self._emit_toast("Таймаут", "Распознавание длилось дольше 60 с — отменено.", True)
+                    self._emit_toast(
+
+                        "Таймаут",
+
+                        f"Распознавание дольше {tmo:.0f} с — отменено. Увеличь WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT или уменьши модель.",
+
+                        True,
+
+                    )
 
                     self._cancel_processing.set()
 

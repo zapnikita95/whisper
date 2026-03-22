@@ -1,8 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 # distpath/workpath задавай в packaging\build-hotkey-gui-exe.bat (--distpath dist\.whisper_hotkey_stage).
+import sysconfig
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
+_pylib = Path(sysconfig.get_paths()["purelib"])
 datas = [('packaging\\VERSION', 'packaging'), ('assets\\app_icon.ico', 'assets')]
+# Иначе в exe: RuntimeError cublas64_12.dll — venv site-packages не виден, кладём CUDA-библиотеки в _internal.
+for _nv_sub in ("cublas", "cudnn", "cusparse", "cufft", "curand", "nvjitlink"):
+    _p = _pylib / "nvidia" / _nv_sub
+    if _p.is_dir():
+        datas.append((str(_p), f"nvidia/{_nv_sub}"))
 binaries = []
 hiddenimports = ['whisper_hotkey_core', 'whisper_hotkey_tray', 'whisper_models', 'whisper_file_log', 'speaker_verify', 'faster_whisper', 'whisper_version', 'keyboard', 'pyaudio', 'pyperclip', 'soundfile', 'numpy', 'plyer.platforms.win.notification', 'pystray', 'PIL', 'PIL.Image']
 tmp_ret = collect_all('torch')

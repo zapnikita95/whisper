@@ -13,7 +13,8 @@ set "FINAL=%CD%\dist\WhisperHotkey"
 set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
-echo [1/4] pip: torch + scipy + librosa + resemblyzer (Windows, без webrtcvad)...
+echo [1/4] pip: CUDA DLL для exe ^(nvidia-cublas-cu12 из requirements.txt^) + speaker...
+"%PY%" -m pip install -q "nvidia-cublas-cu12>=12.4.5.8"
 "%PY%" -m pip install -q -r "%CD%\packaging\requirements-speaker-windows-pyi.txt"
 if errorlevel 1 exit /b 1
 "%PY%" -m pip install -q --no-deps "resemblyzer>=0.1.1"
@@ -56,7 +57,10 @@ echo Готово: %FINAL%\WhisperHotkey.exe
 :done
 echo.
 echo ============================================================
-echo   Запускай: %FINAL%\WhisperHotkey.exe ^(+ папка _internal^)
+echo   ГДЕ EXE:
+echo   • Нормально:  %FINAL%\WhisperHotkey.exe ^(вся папка dist\WhisperHotkey^)
+echo   • Если перенос не вышел:  %STAGE%\WhisperHotkey\WhisperHotkey.exe
+echo   • Вручную: packaging\promote-whisper-hotkey-dist.bat
 echo   НЕ из build\ — только dist\
 echo ============================================================
 echo.

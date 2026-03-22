@@ -315,6 +315,7 @@ Set-Location $Repo
 После успешной сборки:
 
 - Запускай **`dist\WhisperServer\WhisperServer.exe`** (и hotkey: **`dist\WhisperHotkey\WhisperHotkey.exe`**).
+- **Hotkey:** если осталась только папка **`dist\.whisper_hotkey_stage\WhisperHotkey\`** (перенос в `dist\WhisperHotkey` не удался из‑за блокировки файлов), запускай **`WhisperHotkey.exe` именно оттуда** или выполни **`packaging\promote-whisper-hotkey-dist.bat`** после закрытия старого exe. **Не нужно** держать две копии — целевая одна: **`dist\WhisperHotkey\`**.
 - Рядом обязательно лежит папка **`_internal`** — копируй/переноси **всю** папку `dist\WhisperServer` / `dist\WhisperHotkey`, а не один файл.
 
 **Ошибка `Failed to load Python DLL` … `build\…\_internal\python312.dll`:** ты запускаешь **не тот** exe. PyInstaller кладёт **рабочую** сборку только в **`dist\`**. Папка **`build\`** — временная, оттуда запуск **нельзя**. Открой именно `dist\WhisperServer\` или `dist\WhisperHotkey\`.
@@ -338,6 +339,8 @@ Set-Location $Repo
 **Проверка голоса (как на Mac):** тот же эталон **`%USERPROFILE%\.whisper\speaker_embedding.npy`**. В трее: **«Записать эталон голоса (~45 с)…»** и пункт **«Проверка голоса»** (после переключения — перезапуск hotkey). Либо **`WHISPER_SPEAKER_VERIFY=1`** и опционально **`WHISPER_SPEAKER_THRESHOLD`**. Сборка **`packaging\build-hotkey-gui-exe.bat`** сама ставит **`packaging\requirements-speaker-windows-pyi.txt`** и **resemblyzer** (без MSVC: заглушка **webrtcvad** в **`speaker_verify.py`**). На Mac/Linux по-прежнему **`requirements-speaker.txt`**. Сообщение в логе про **cuBLAS** (`cublas64_12.dll`) пишет **`whisper_hotkey_core`** — попадает в exe после пересборки; при отсутствии DLL: **`pip install nvidia-cublas-cu12`** в venv.
 
 Консольный вариант: `whisper-hotkey.py` / `start-whisper-hotkey.bat` → тот же **`whisper_hotkey.log`**, флаги **`--speaker-verify`** / **`--speaker-threshold`**.
+
+Таймаут распознавания (поток ожидания Whisper): по умолчанию **300 с**; было 60 с и давало ложные «таймаут» на тяжёлых моделях. Переменная **`WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT`** (секунды, 30…3600).
 
 #### Коротко по шагам (сервер)
 
@@ -417,6 +420,7 @@ Set-Location $Repo
 | `whisper_hotkey_tray.py` | hotkey в трее (точка входа `WhisperHotkey.exe`) |
 | `packaging/build-server-gui-exe.bat` | сборка `WhisperServer.exe` через PyInstaller |
 | `packaging/build-hotkey-gui-exe.bat` | сборка `WhisperHotkey.exe` через PyInstaller |
+| `packaging/promote-whisper-hotkey-dist.bat` | перенос `dist\.whisper_hotkey_stage\…` → `dist\WhisperHotkey\` |
 | `packaging/windows/WhisperServer.iss` | Inno Setup → `WhisperSetup-{версия}.exe` |
 | `packaging/windows/WhisperHotkey.iss` | Inno Setup → `WhisperHotkeySetup-{версия}.exe` |
 | `packaging/mac/make_dmg.sh` | DMG для `WhisperClient.app` (create-dmg) |
