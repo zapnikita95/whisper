@@ -352,7 +352,7 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
         wrap=tk.NONE,
         font=("Consolas", 9),
         height=22,
-        state=tk.DISABLED,
+        state=tk.NORMAL,
         bg="#1e1e1e",
         fg="#d4d4d4",
         insertbackground="#d4d4d4",
@@ -360,12 +360,79 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
     )
     log_text.pack(fill=tk.BOTH, expand=True)
 
-    def _clear_log_view() -> None:
-        log_text.configure(state=tk.NORMAL)
-        log_text.delete("1.0", tk.END)
-        log_text.configure(state=tk.DISABLED)
+    def _log_key_readonly(e: tk.Event) -> str | None:
+        """Текст только для чтения, но выделение и Ctrl+C / Ctrl+A работают."""
+        ks = e.keysym
+        ctrl = (e.state & 0x4) != 0
+        shift = (e.state & 0x1) != 0
+        if ctrl and ks.lower() in ("c", "a", "insert"):
+            return None
+        if ctrl and ks.lower() in ("v", "x"):
+            return "break"
+        nav = (
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Next",
+            "Prior",
+            "KP_Left",
+            "KP_Right",
+            "KP_Up",
+            "KP_Down",
+        )
+        if ks in nav or (shift and ks in nav):
+            return None
+        if ks in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Win_L", "Win_R"):
+            return None
+        return "break"
 
-    ttk.Button(log_top, text="Очистить окно", command=_clear_log_view).pack(side=tk.LEFT)
+    log_text.bind("<Key>", _log_key_readonly)
+
+    def _log_select_all(e: tk.Event | None = None) -> str | None:
+        log_text.tag_add(tk.SEL, "1.0", tk.END)
+        log_text.mark_set(tk.INSERT, tk.END)
+        log_text.see(tk.INSERT)
+        return "break" if e is not None else None
+
+    log_text.bind("<Control-a>", _log_select_all)
+    log_text.bind("<Control-A>", _log_select_all)
+
+    def _copy_log_clipboard(text: str) -> None:
+        if not text:
+            return
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update_idletasks()
+
+    def _copy_log_selection() -> None:
+        try:
+            if log_text.tag_ranges(tk.SEL):
+                _copy_log_clipboard(log_text.get(tk.SEL_FIRST, tk.SEL_LAST))
+        except tk.TclError:
+            pass
+
+    def _copy_log_all() -> None:
+        _copy_log_clipboard(log_text.get("1.0", "end-1c"))
+
+    def _log_context_menu(e: tk.Event) -> None:
+        m = tk.Menu(root, tearoff=0)
+        m.add_command(label="Копировать", command=_copy_log_selection)
+        m.add_command(label="Копировать всё", command=_copy_log_all)
+        m.add_separator()
+        m.add_command(label="Выделить всё", command=lambda: _log_select_all(None))
+        m.tk_popup(e.x_root, e.y_root)
+
+    log_text.bind("<Button-3>", _log_context_menu)
+
+    def _clear_log_view() -> None:
+        log_text.delete("1.0", tk.END)
+
+    ttk.Button(log_top, text="Очистить окно", command=_clear_log_view).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Button(log_top, text="Копировать выделение", command=_copy_log_selection).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Button(log_top, text="Копировать всё", command=_copy_log_all).pack(side=tk.LEFT, padx=(6, 0))
 
     def _on_log_source_change(_evt: object | None = None) -> None:
         v = log_src_var.get()
@@ -389,12 +456,10 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
     def _append_log_chunk(chunk: str) -> None:
         if not chunk:
             return
-        log_text.configure(state=tk.NORMAL)
         log_text.insert(tk.END, chunk)
         _trim_log_widget()
         if autoscroll_var.get():
             log_text.see(tk.END)
-        log_text.configure(state=tk.DISABLED)
 
     def _pull_log_lines(*, initial: bool = False) -> None:
         path = _active_log_path()
@@ -418,9 +483,7 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
         prev_off = _log_state["offset"]
         if initial or size < prev_off:
             if (not initial) and size < prev_off:
-                log_text.configure(state=tk.NORMAL)
                 log_text.delete("1.0", tk.END)
-                log_text.configure(state=tk.DISABLED)
             start = 0 if size <= _log_tail_bytes else size - _log_tail_bytes
             _log_state["offset"] = start
             if start > 0 and initial:
@@ -439,9 +502,7 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
             return
 
         if prefix:
-            log_text.configure(state=tk.NORMAL)
             log_text.delete("1.0", tk.END)
-            log_text.configure(state=tk.DISABLED)
             _append_log_chunk(prefix)
         if chunk:
             _append_log_chunk(chunk)
