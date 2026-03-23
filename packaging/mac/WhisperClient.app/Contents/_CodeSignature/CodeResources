@@ -12,17 +12,25 @@
 		<data>
 		z3RL0AeFCwRgHchlgV7A9eYMaXA=
 		</data>
+		<key>Resources/__pycache__/whisper_update_check.cpython-313.pyc</key>
+		<data>
+		4qpaSgh4SVLOq8wQPMkX6S8/Mvc=
+		</data>
+		<key>Resources/__pycache__/whisper_version.cpython-313.pyc</key>
+		<data>
+		PACM8r/ysMMv0klDYpBslvUk8PY=
+		</data>
 		<key>Resources/pick_server_url.py</key>
 		<data>
 		PChu88ZsJ5eBIw3+GjuQkFnTnyk=
 		</data>
 		<key>Resources/speaker_verify.py</key>
 		<data>
-		kOxh0EejXEI5fiQue5naBF5IwUU=
+		4sgUeeQpU9pxVL9wRi2uTnQnk+8=
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		LWAvOY5iD/HIqKVbhtKqSexj5ME=
+		iIynsDDZXNnVRcKj7bZ2aowHwVY=
 		</data>
 		<key>Resources/whisper_update_check.py</key>
 		<data>
@@ -39,28 +47,28 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			43eTjkNiBjpzDqRA4Pi0YG5ip/8=
+			EXDkujbQ0hKLOjiZcjqj8rZVuPM=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"e377938e4362063a730ea440e0f8b4606e62a7ff"</string>
+			<string>cdhash H"1170e4ba36d0d2128b3a3899723aa3f2b655b8f3"</string>
 		</dict>
 		<key>MacOS/run.sh</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			J9Z+LX+mMV2N7tRgPQ9KKwE/0RI=
+			wqVUB6rPCsu03NRHvnqOB3x3yS8=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"27d67e2d7fa6315d8deed4603d0f4a2b013fd112"</string>
+			<string>cdhash H"c2a55407aacf0acbb4dcd447be7a8e077c77c92f"</string>
 		</dict>
 		<key>MacOS/whisper_notify</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			6wtLcxkH1N3uyxRZs7+ge4mv+8g=
+			XDA5XOh896DU4WGqpj4ShHepDkA=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"eb0b4b731907d4ddeecb1459b3bfa07b89affbc8"</string>
+			<string>cdhash H"5c30395ce87cf7a0d4e161aaa63e128477a90e40"</string>
 		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
@@ -76,6 +84,20 @@
 			HltRzeUVOWqfp2KQnPjKZYTMxWSzJdLuvup2F1/pXE0=
 			</data>
 		</dict>
+		<key>Resources/__pycache__/whisper_update_check.cpython-313.pyc</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			fcId4aBmjBoyBv6SMXZWG1YdQn0tN7GdVj7k4xI/lOo=
+			</data>
+		</dict>
+		<key>Resources/__pycache__/whisper_version.cpython-313.pyc</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			wOId052hJ5jDKLBqCclwSV2/UI5/6ZjB870mrbmsgKo=
+			</data>
+		</dict>
 		<key>Resources/pick_server_url.py</key>
 		<dict>
 			<key>hash2</key>
@@ -87,14 +109,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			D0de0oOV/O6BDkw32xKnePdZ7wMcRtPkGZSTzN1SO0E=
+			rJAtFIOIYUKGmF16TLXIXhNr0rd7jeBtpZ4f8HLP8aI=
 			</data>
 		</dict>
 		<key>Resources/whisper-client-mac.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			2x8gG4T0ESM23R93nhWSxMXIEJjHrpXFJNoKWxVlqRc=
+			0OrPGr2JI0POGVfQ0Ah+BYuHXQ0fo6k2qIaVaUjR3Bw=
 			</data>
 		</dict>
 		<key>Resources/whisper_update_check.py</key>

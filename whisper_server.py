@@ -13,7 +13,6 @@ import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 try:
@@ -133,21 +132,62 @@ def _safe_language_probability(info: Any) -> float | None:
     return f
 
 
+def _cuda_init_failure(exc: BaseException) -> bool:
+    """Ошибки загрузки CUDA DLL / драйвера на Windows — имеет смысл пробовать CPU."""
+    if sys.platform != "win32":
+        return False
+    msg = str(exc).lower()
+    return any(
+        s in msg
+        for s in (
+            "cublas",
+            "cudnn",
+            "nvrtc",
+            "dll is not found",
+            "cannot be loaded",
+            "cannot load",
+            "error loading",
+        )
+    )
+
+
+def _cpu_safe_compute_type(ct: str) -> str:
+    c = (ct or "int8").strip().lower()
+    if c in ("float16", "int8_float16", "float32"):
+        return "int8"
+    return c or "int8"
+
+
 def get_model() -> Any:
-    global _model
+    global _model, _device, _compute_type
     if _model is None:
         print(f"[Server] Загрузка модели {_model_name} ({_device}, {_compute_type})...", flush=True)
         log.info("Загрузка модели %s (%s, %s)", _model_name, _device, _compute_type)
         try:
             _model = WhisperModel(_model_name, device=_device, compute_type=_compute_type)
-        except OSError:
-            log.exception("Модель: OSError (сеть/диск/Hugging Face)")
-            raise
-        except Exception:
-            log.exception("Модель: ошибка загрузки")
-            raise
+        except Exception as e:
+            if _device == "cuda" and _cuda_init_failure(e):
+                log.warning(
+                    "CUDA недоступна (%s) — переключение на CPU (медленнее, без GPU). "
+                    "На Windows: pip install nvidia-cublas-cu12 в том же venv, что и сервер.",
+                    e,
+                )
+                _device = "cpu"
+                _compute_type = _cpu_safe_compute_type(_compute_type)
+                print(
+                    f"[Server] Повторная загрузка на CPU ({_compute_type})…",
+                    flush=True,
+                )
+                _model = WhisperModel(
+                    _model_name,
+                    device="cpu",
+                    compute_type=_compute_type,
+                )
+            else:
+                log.exception("Модель: ошибка загрузки")
+                raise
         print("[Server] Модель загружена.", flush=True)
-        log.info("Модель загружена")
+        log.info("Модель загружена device=%s compute_type=%s", _device, _compute_type)
     return _model
 
 

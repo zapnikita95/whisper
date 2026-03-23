@@ -5,6 +5,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)" || exit 1
 SELF="$HERE/$(basename "$0")"
 cd "$HERE" || exit 1
 
+# Локальный venv в корне репо (см. packaging/mac/setup_mac_venv.sh)
+if [ -z "${WHISPER_PYTHON3:-}" ] && [ -x "$HERE/.venv/bin/python3" ]; then
+	export WHISPER_PYTHON3="$HERE/.venv/bin/python3"
+fi
+
 if [ ! -t 0 ] && [ -z "${WHISPER_MAC_COMMAND_SKIP_TTY_REDIRECT:-}" ]; then
 	echo "Нет интерактивного TTY (часто при «Run» из Cursor). Открываю Terminal.app…" >&2
 	exec open -a Terminal "$SELF"
@@ -15,9 +20,9 @@ fi
 source "$HERE/packaging/mac/pick_python_for_whisper.sh"
 
 if ! PY="$(pick_python_for_whisper)"; then
-	echo "Ошибка: нет python3 с модулями requests, sounddevice, pynput, pyperclip…"
-	echo "  Установи: /opt/homebrew/bin/python3 -m pip install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip"
-	echo "  Или задай WHISPER_PYTHON3=/путь/к/python3 с уже установленными пакетами."
+	echo "Ошибка: нет python3 с модулями Mac-клиента."
+	echo "  Один раз: bash packaging/mac/setup_mac_venv.sh"
+	echo "  Или вручную: WHISPER_PYTHON3=/путь/к/python3 с requests, sounddevice, numpy, soundfile, 'pynput>=1.8.1', pyperclip, rumps"
 	[ -t 0 ] && read -p "Нажми Enter для выхода..."
 	exit 1
 fi

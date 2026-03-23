@@ -1,0 +1,32 @@
+(function () {
+	LeadCoreEnv = {
+		servicePath: {
+			baseUri: "https://cdn.leadgenic.ru",
+			location: "/lg_widgets/"
+		},
+		mode: "production" // dev | labs | production
+	};
+	function init_LGWG_scripts() {
+		const utilsLink = LeadCoreEnv.servicePath.baseUri + LeadCoreEnv.servicePath.location + "lgwg_utils.js";
+		const serviceLink = LeadCoreEnv.servicePath.baseUri + LeadCoreEnv.servicePath.location + "lgwg_service.js";
+		Promise.all([utilsLink, serviceLink].map(_ => load_LGWG_script(_)));
+	}
+	function load_LGWG_script(link) {
+		return new Promise(function(resolve, reject){
+			const script = document.createElement('script');
+
+			script.setAttribute("type", "text/javascript");
+			script.setAttribute("charset", "UTF-8");
+			script.setAttribute("defer", "");
+
+			script.addEventListener('load', function() {
+				this.removeEventListener('load', arguments.callee);
+				resolve(true);
+			});
+
+			script.src = link;
+			document.getElementsByTagName("body")[0].appendChild(script);
+		})
+	}
+	init_LGWG_scripts();
+})();

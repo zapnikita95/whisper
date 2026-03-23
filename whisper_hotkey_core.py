@@ -32,6 +32,8 @@ from pathlib import Path
 
 from collections.abc import Callable
 
+from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+
 
 log = logging.getLogger("whisper.hotkey")
 

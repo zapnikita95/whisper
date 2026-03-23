@@ -1,6 +1,7 @@
 """
 Верификация говорящего по embedding (Resemblyzer). Опциональные зависимости: requirements-speaker.txt
 Эталон: ~/.whisper/speaker_embedding.npy (или WHISPER_SPEAKER_EMBEDDING_PATH).
+Файл в домашней папке — пересборка WhisperClient.app его не трогает; переустановка клиента тоже, пока не удаляешь ~/.whisper.
 """
 from __future__ import annotations
 
@@ -34,7 +35,39 @@ def threshold() -> float:
         return DEFAULT_THRESHOLD
 
 
+def _install_webrtcvad_stub_if_needed() -> None:
+    """
+    webrtcvad на Windows часто требует MSVC для сборки. Резерв: заглушка — весь сигнал «с речью»,
+    trim_long_silences по сути не режет (качество VAD хуже, но embedding и проверка работают).
+    """
+    import sys
+    import types
+
+    if "webrtcvad" in sys.modules:
+        return
+    try:
+        import webrtcvad  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return
+    m = types.ModuleType("webrtcvad")
+
+    class Vad:
+        __slots__ = ()
+
+        def __init__(self, mode: int = 3) -> None:
+            pass
+
+        def is_speech(self, pcm: bytes, sample_rate: int = 16000) -> bool:
+            return True
+
+    m.Vad = Vad
+    sys.modules["webrtcvad"] = m
+
+
 def _load_encoder():
+    _install_webrtcvad_stub_if_needed()
     try:
         import torch
         from resemblyzer import VoiceEncoder, preprocess_wav
@@ -82,7 +115,9 @@ def score_wav_file(wav_path: str | Path) -> float:
     """Косинусное сходство с эталоном [0..1] для целого utterance."""
     ref = load_reference()
     if ref is None:
-        raise SpeakerVerifyUnavailable("Нет эталона — выполни enroll (Mac: --enroll-speaker).")
+        raise SpeakerVerifyUnavailable(
+            "Нет эталона — Mac: --enroll-speaker или меню трея; Windows hotkey: «Записать эталон голоса»."
+        )
     encoder, preprocess_wav = _load_encoder()
     wav = preprocess_wav(Path(wav_path))
     if wav.size < 4000:
@@ -107,6 +142,10 @@ def should_verify_server() -> bool:
 
 def verify_if_enabled_server(wav_path: str | Path) -> None:
     """Вызывать из transcribe: при включённом verify и наличии эталона — проверить."""
+    import logging
+
+    _log = logging.getLogger(__name__)
+
     if not should_verify_server():
         return
     ref = load_reference()
@@ -114,5 +153,13 @@ def verify_if_enabled_server(wav_path: str | Path) -> None:
         return
     try:
         verify_wav_file_or_raise(wav_path, thr_override=None)
+    except SpeakerRejected:
+        raise
     except SpeakerVerifyUnavailable:
+        return
+    except Exception:
+        # Реземблер/torch/CUDA не должны ронять транскрипцию целиком — только лог.
+        _log.exception(
+            "speaker_verify: внутренняя ошибка, проверка пропущена для этого запроса"
+        )
         return

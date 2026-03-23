@@ -20,10 +20,12 @@
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Whisper Client показывает статус записи, готовности текста и ошибки сервера.</string>
 	<key>LSEnvironment</key>
 	<dict>
 		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<string>/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 </dict>
 </plist>
