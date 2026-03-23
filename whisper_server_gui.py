@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,43 @@ def _find_free_port() -> int:
         timeout=60,
     )
     return int(r.stdout.strip())
+
+
+def _port_is_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+    except OSError:
+        return False
+    return True
+
+
+def _pick_listen_port(prefs: dict) -> tuple[int, str | None]:
+    """
+    Стабильный порт: сначала server_port.txt и last_listen_port из prefs, если свободны.
+    Иначе новый свободный порт (Mac/клиентам нужно обновить URL).
+    """
+    sticky: list[int] = []
+    try:
+        pf = ROOT / "server_port.txt"
+        if pf.is_file():
+            sticky.append(int(pf.read_text().strip()))
+    except (ValueError, OSError):
+        pass
+    lp = prefs.get("last_listen_port")
+    if isinstance(lp, int) and lp not in sticky:
+        sticky.append(lp)
+    for want in sticky:
+        if 1024 <= want <= 65535 and _port_is_available(want):
+            return want, None
+    if sticky:
+        fb = _find_free_port()
+        return (
+            fb,
+            f"Порт {sticky[0]} занят — сервер слушает {fb}. Обнови URL на Mac и в hotkey (Tailscale / IP).",
+        )
+    return _find_free_port(), None
 
 
 def _firewall_allow(port: int) -> None:
@@ -271,7 +309,15 @@ def _run_uvicorn(port: int, host: str) -> None:
         raise
 
 
-def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, app_ver: str) -> None:
+def _build_server_main_form(
+    root: object,
+    port: int,
+    ts_ip: str,
+    prefs: dict,
+    app_ver: str,
+    *,
+    port_note: str | None = None,
+) -> None:
     import tkinter as tk
     from tkinter import ttk, scrolledtext
 
@@ -644,6 +690,15 @@ def _build_server_main_form(root: object, port: int, ts_ip: str, prefs: dict, ap
     api_health.pack(anchor=tk.W, pady=(2, 0))
 
     ttk.Label(frm, text=f"Порт: {port}   •   Локально: http://127.0.0.1:{port}/").pack(anchor=tk.W, pady=(4, 0))
+    if port_note:
+        ttk.Label(
+            frm,
+            text=port_note,
+            wraplength=540,
+            justify=tk.LEFT,
+            foreground="#a30",
+            font=("", 9, "bold"),
+        ).pack(anchor=tk.W, pady=(2, 0))
 
     lan_line = f"В сети (0.0.0.0:{port}) — подключай Mac / другие ПК по IP этого компьютера."
     if ts_ip:
@@ -773,8 +828,9 @@ def main() -> int:
             root,
             int(boot_state["port"]),
             str(boot_state.get("ts_ip") or ""),
-            prefs,
+            _load_gui_prefs(),
             app_ver,
+            port_note=boot_state.get("port_note"),
         )
 
     def boot_worker() -> None:
@@ -792,15 +848,18 @@ def main() -> int:
                 pass
 
         try:
-            upd("Свободный порт…")
-            p = _find_free_port()
+            upd("Порт (приоритет: сохранённый)…")
+            p, port_note = _pick_listen_port(prefs)
+            merged = dict(prefs)
+            merged["last_listen_port"] = p
+            _save_gui_prefs(merged)
             upd(f"Порт {p}. Правило брандмауэра…")
             _firewall_allow(p)
             _write_port_file(p)
             upd("Tailscale…")
             ts = _tailscale_ipv4()
             boot_state.clear()
-            boot_state.update(port=p, ts_ip=ts)
+            boot_state.update(port=p, ts_ip=ts, port_note=port_note)
         except Exception as e:
             boot_state.clear()
             boot_state["error"] = str(e)

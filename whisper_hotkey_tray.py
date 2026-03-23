@@ -73,7 +73,7 @@ def _notifications_enabled() -> bool:
 
 
 _NOTIFY_LOCK = threading.Lock()
-_NOTIFY_STATE: dict = {"t": 0.0, "sig": ""}
+_NOTIFY_STATE: dict = {"t": 0.0, "sig": "", "title_t": {}}
 
 
 def _notify(title: str, body: str, error: bool = False, *, force: bool = False) -> None:
@@ -82,12 +82,22 @@ def _notify(title: str, body: str, error: bool = False, *, force: bool = False) 
     sig = f"{title}\x00{body[:160]}"
     now = time.monotonic()
     if not force:
-        gap = 1.0 if error else 3.0
+        gap = 4.0 if error else 5.0
+        if error and title in ("Таймаут", "Распознавание", "Модель", "Сеть или диск"):
+            gap = max(gap, 20.0)
         with _NOTIFY_LOCK:
-            if sig == _NOTIFY_STATE.get("sig") and now - float(_NOTIFY_STATE.get("t", 0)) < 15.0:
+            dup_win = 45.0 if error else 25.0
+            if sig == _NOTIFY_STATE.get("sig") and now - float(_NOTIFY_STATE.get("t", 0)) < dup_win:
                 return
             if now - float(_NOTIFY_STATE.get("t", 0)) < gap:
                 return
+            tt = _NOTIFY_STATE.setdefault("title_t", {})
+            if isinstance(tt, dict):
+                last_t = float(tt.get(title) or 0.0)
+                title_gap = 30.0 if title in ("Таймаут", "Распознавание") else 12.0
+                if error and last_t > 0.0 and now - last_t < title_gap:
+                    return
+                tt[title] = now
             _NOTIFY_STATE["sig"] = sig
             _NOTIFY_STATE["t"] = now
     else:

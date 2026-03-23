@@ -16,8 +16,6 @@ import os
 
 import re
 
-import site
-
 import sys
 
 import tempfile
@@ -81,61 +79,11 @@ except ImportError as e:
 
 def _prepend_nvidia_cublas_to_path() -> bool:
 
-    if sys.platform != "win32":
+    from whisper_nvidia_path import prepend_nvidia_cuda_bin_dirs_to_path
 
-        return True
+    _n, cublas_ok = prepend_nvidia_cuda_bin_dirs_to_path()
 
-    candidates: list[Path] = []
-
-    if getattr(sys, "frozen", False):
-
-        exe_dir = Path(sys.executable).resolve().parent
-
-        meip = getattr(sys, "_MEIPASS", None)
-
-        if meip:
-
-            candidates.append(Path(meip))
-
-        candidates.append(exe_dir / "_internal")
-
-        candidates.append(exe_dir)
-
-    try:
-
-        candidates.append(Path(site.getusersitepackages()))
-
-    except Exception:
-
-        pass
-
-    try:
-
-        candidates.extend(Path(p) for p in site.getsitepackages())
-
-    except Exception:
-
-        pass
-
-    seen: set[Path] = set()
-
-    for base in candidates:
-
-        if not base or base in seen:
-
-            continue
-
-        seen.add(base.resolve())
-
-        bin_dir = base / "nvidia" / "cublas" / "bin"
-
-        if (bin_dir / "cublas64_12.dll").is_file():
-
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-
-            return True
-
-    return False
+    return cublas_ok
 
 
 def _transcribe_timeout_sec_default() -> float:
@@ -471,7 +419,7 @@ class WhisperHotkey:
 
                 "Сеть или диск",
 
-                "Не удалось загрузить модель (сеть, Hugging Face или место на диске).",
+                "Не удалось загрузить модель для Ctrl+Win (локально в Hotkey, не HTTP-сервер): сеть, Hugging Face или диск.",
 
                 True,
 
@@ -487,7 +435,7 @@ class WhisperHotkey:
 
                 "Модель",
 
-                f"Не удалось загрузить веса: {type(e).__name__}",
+                f"Hotkey (локально): не загрузить веса — {type(e).__name__}. Сервер для Mac — отдельное окно Whisper GPU Server.",
 
                 True,
 
@@ -823,7 +771,21 @@ class WhisperHotkey:
 
                 self._emit_status("Распознавание…")
 
-                # Транскрипция с таймаутом (large-v3 / холодный GPU легко > 60 с)
+                try:
+
+                    self._load_model()
+
+                except Exception:
+
+                    with self._lock:
+
+                        self._busy = False
+
+                    self._emit_status("Готов · Ctrl+Win")
+
+                    return
+
+                # Таймаут WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT только на transcribe, не на загрузку весов
                 text = None
 
                 tmo = self._transcribe_timeout_sec
@@ -880,7 +842,7 @@ class WhisperHotkey:
 
                         "Таймаут",
 
-                        f"Распознавание дольше {tmo:.0f} с — отменено. Увеличь WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT или уменьши модель.",
+                        f"Обработка на GPU дольше {tmo:.0f} с (лимит WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT) — отменено. Это не длина записи; при необходимости увеличь лимит.",
 
                         True,
 
@@ -981,8 +943,6 @@ class WhisperHotkey:
 
 
     def _transcribe_audio(self, audio: np.ndarray) -> str:
-
-        self._load_model()
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
 
@@ -1110,6 +1070,18 @@ class WhisperHotkey:
             raise
 
         self._emit_status("Готов · Ctrl+Win")
+
+        def _preload_model() -> None:
+
+            try:
+
+                self._load_model()
+
+            except Exception:
+
+                pass
+
+        threading.Thread(target=_preload_model, name="whisper-model-preload", daemon=True).start()
 
         try:
 

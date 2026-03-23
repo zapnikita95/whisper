@@ -22,6 +22,7 @@ hiddenimports = [
     "whisper_server",
     "whisper_models",
     "whisper_file_log",
+    "whisper_nvidia_path",
     "faster_whisper",
     "whisper_version",
     "whisper_update_check",
