@@ -20,6 +20,8 @@ import sys
 
 import tempfile
 
+import concurrent.futures
+
 import logging
 
 import threading
@@ -303,6 +305,24 @@ class WhisperHotkey:
 
         self._transcribe_timeout_sec = _transcribe_timeout_sec_default()
 
+        self._gpu_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+
+    def _gpu_pool_get(self) -> concurrent.futures.ThreadPoolExecutor:
+
+        if self._gpu_pool is None:
+
+            self._gpu_pool = concurrent.futures.ThreadPoolExecutor(
+
+                max_workers=1,
+
+                thread_name_prefix="whisper-gpu",
+
+            )
+
+        return self._gpu_pool
+
 
 
     def _emit_status(self, msg: str) -> None:
@@ -365,7 +385,7 @@ class WhisperHotkey:
 
 
 
-    def _load_model(self) -> None:
+    def _load_model_impl(self) -> None:
 
         if self.model is not None:
 
@@ -446,6 +466,40 @@ class WhisperHotkey:
         print("[Whisper] Модель загружена.", flush=True)
 
         log.info("Модель загружена")
+
+
+
+    def _gpu_transcribe_job(self, audio: np.ndarray) -> str | None:
+
+        """Всегда выполняется в одном GPU-потоке (CUDA/CT2 иначе на Windows зависают)."""
+
+        if self._cancel_processing.is_set():
+
+            return None
+
+        try:
+
+            self._load_model_impl()
+
+            return self._transcribe_audio(audio)
+
+        except Exception as e:
+
+            print(f"[Ошибка транскрипции] {e}", file=sys.stderr, flush=True)
+
+            log.exception("Транскрипция (GPU-поток)")
+
+            self._emit_toast(
+
+                "Распознавание",
+
+                f"Ошибка: {type(e).__name__}: {str(e)[:160]}",
+
+                True,
+
+            )
+
+            return None
 
 
 
@@ -771,78 +825,27 @@ class WhisperHotkey:
 
                 self._emit_status("Распознавание…")
 
-                try:
-
-                    self._load_model()
-
-                except Exception:
-
-                    with self._lock:
-
-                        self._busy = False
-
-                    self._emit_status("Готов · Ctrl+Win")
-
-                    return
-
-                # Таймаут WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT только на transcribe, не на загрузку весов
                 text = None
 
                 tmo = self._transcribe_timeout_sec
 
-                def transcribe_with_timeout() -> str | None:
+                fut = self._gpu_pool_get().submit(self._gpu_transcribe_job, audio)
 
-                    try:
+                try:
 
-                        return self._transcribe_audio(audio)
+                    text = fut.result(timeout=tmo)
 
-                    except Exception as e:
+                except concurrent.futures.TimeoutError:
 
-                        print(f"[Ошибка транскрипции] {e}", file=sys.stderr, flush=True)
+                    print(f"[Whisper] Таймаут GPU ({tmo:.0f} с) — задача ещё в очереди/на видеокарте.", flush=True)
 
-                        log.exception("Транскрипция")
-
-                        self._emit_toast(
-
-                            "Распознавание",
-
-                            f"Ошибка: {type(e).__name__}: {str(e)[:160]}",
-
-                            True,
-
-                        )
-
-                        return None
-
-                # Запускаем транскрипцию в отдельном потоке с таймаутом
-
-                result_container: list[str | None] = []
-
-                def run_transcribe() -> None:
-
-                    if self._cancel_processing.is_set():
-
-                        return
-
-                    result_container.append(transcribe_with_timeout())
-
-                transcribe_thread = threading.Thread(target=run_transcribe, daemon=True)
-
-                transcribe_thread.start()
-
-                transcribe_thread.join(timeout=tmo)
-
-                if transcribe_thread.is_alive():
-
-                    print(f"[Whisper] Таймаут транскрипции ({tmo:.0f} с), отмена.", flush=True)
-
-                    log.warning("Таймаут транскрипции %.0f с", tmo)
+                    log.warning("Таймаут future.result %.0f с (один GPU-поток)", tmo)
 
                     self._emit_toast(
 
                         "Таймаут",
 
-                        f"Обработка на GPU дольше {tmo:.0f} с (лимит WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT) — отменено. Это не длина записи; при необходимости увеличь лимит.",
+                        f"GPU не ответил за {tmo:.0f} с (WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT). Это не длина записи; после обновления hotkey короткая речь не должна упираться в минуту.",
 
                         True,
 
@@ -852,9 +855,15 @@ class WhisperHotkey:
 
                     text = None
 
-                elif result_container:
+                except Exception as e:
 
-                    text = result_container[0]
+                    print(f"[Ошибка распознавания] {e}", file=sys.stderr, flush=True)
+
+                    log.exception("future.result распознавания")
+
+                    self._emit_toast("Распознавание", str(e)[:200], True)
+
+                    text = None
 
                 # Проверяем отмену перед дальнейшей обработкой
 
@@ -1071,17 +1080,7 @@ class WhisperHotkey:
 
         self._emit_status("Готов · Ctrl+Win")
 
-        def _preload_model() -> None:
-
-            try:
-
-                self._load_model()
-
-            except Exception:
-
-                pass
-
-        threading.Thread(target=_preload_model, name="whisper-model-preload", daemon=True).start()
+        self._gpu_pool_get().submit(self._load_model_impl)
 
         try:
 
