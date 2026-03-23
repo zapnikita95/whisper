@@ -51,26 +51,65 @@ log.info(
 
 
 def _prepend_nvidia_cublas_to_path() -> None:
+    """
+    В venv DLL лежат в site-packages/nvidia/*/bin.
+    В PyInstaller onedir — в _MEIPASS (…/_internal), иначе cublas64_12.dll не находится при транскрипции.
+    Добавляем все nvidia/*/bin с DLL в начало PATH (cudnn, cufft и т.д.).
+    """
     if sys.platform != "win32":
         return
-    candidates: list[Path] = []
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        meip = getattr(sys, "_MEIPASS", None)
+        if meip:
+            roots.append(Path(meip))
+        roots.append(exe_dir / "_internal")
+        roots.append(exe_dir)
     try:
-        candidates.append(Path(site.getusersitepackages()))
+        roots.append(Path(site.getusersitepackages()))
     except Exception:
         pass
     try:
-        candidates.extend(Path(p) for p in site.getsitepackages())
+        roots.extend(Path(p) for p in site.getsitepackages())
     except Exception:
         pass
-    for base in candidates:
-        bin_dir = base / "nvidia" / "cublas" / "bin"
-        if (bin_dir / "cublas64_12.dll").is_file():
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            return
+
+    bin_paths: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        nvidia = root / "nvidia"
+        if not nvidia.is_dir():
+            continue
+        try:
+            subs = sorted(nvidia.iterdir())
+        except OSError:
+            continue
+        for sub in subs:
+            bd = sub / "bin"
+            if not bd.is_dir():
+                continue
+            try:
+                if not any(bd.glob("*.dll")):
+                    continue
+                rs = str(bd.resolve())
+            except OSError:
+                continue
+            if rs in seen:
+                continue
+            seen.add(rs)
+            bin_paths.append(rs)
+
+    if bin_paths:
+        os.environ["PATH"] = os.pathsep.join(bin_paths) + os.pathsep + os.environ.get("PATH", "")
+        log.info("PATH (nvidia): в начало добавлено %d каталогов …/nvidia/*/bin", len(bin_paths))
+    else:
+        log.info("PATH (nvidia): каталоги nvidia/*/bin не найдены — возможны ошибки cublas64_12.dll в exe")
 
 
 _prepend_nvidia_cublas_to_path()
-log.info("PATH (cublas): проверка завершена")
 
 log.info(
     "Импорт faster_whisper (CTranslate2, CUDA DLL и т.д.) — часто 10–90 с, это норма; HTTP ещё не слушает."

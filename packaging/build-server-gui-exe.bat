@@ -4,7 +4,8 @@ chcp 65001 >nul
 cd /d "%~dp0.."
 
 REM Сборка WhisperServer.exe (окно без консоли). Нужен: pip install pyinstaller
-REM Запускать из venv с faster-whisper / fastapi / uvicorn.
+REM Запускать из venv с faster-whisper / fastapi / uvicorn / nvidia-cublas-cu12 (из requirements.txt).
+REM Сборка через WhisperServer.spec — в _internal кладутся nvidia/*/dll (иначе cublas64_12 при /transcribe).
 REM
 REM WinError 5 при удалении dist\WhisperServer: закрой WhisperServer.exe и окно Проводника
 REM в этой папке. Сборка идёт в dist\.whisper_stage, затем move в dist\WhisperServer.
@@ -16,9 +17,6 @@ set "FINAL=%CD%\dist\WhisperServer"
 set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
-set "ICONLINE="
-if exist "assets\app_icon.ico" set "ICONLINE=--icon assets\app_icon.ico"
-
 echo.
 echo --- Закрой WhisperServer.exe и не держи открытой папку dist\WhisperServer в Проводнике ---
 echo.
@@ -26,16 +24,11 @@ taskkill /IM WhisperServer.exe /F >nul 2>&1
 REM ~2 с без timeout: из PowerShell cmd /c без TTY даёт "Input redirection is not supported"
 ping 127.0.0.1 -n 3 >nul
 
-"%PY%" -m PyInstaller --noconfirm --clean --windowed --name WhisperServer ^
+echo PyInstaller WhisperServer.spec ^(nvidia DLL + uvicorn/fastapi^)...
+"%PY%" -m PyInstaller --noconfirm --clean ^
   --distpath "%STAGE%" ^
   --workpath "%WORK%" ^
-  %ICONLINE% ^
-  --collect-all uvicorn --collect-all fastapi --collect-all starlette ^
-  --hidden-import whisper_server --hidden-import whisper_models --hidden-import whisper_file_log ^
-  --hidden-import faster_whisper ^
-  --hidden-import whisper_version --hidden-import whisper_update_check ^
-  --add-data "packaging\VERSION;packaging" ^
-  whisper_server_gui.py
+  WhisperServer.spec
 
 if errorlevel 1 (
   echo.
