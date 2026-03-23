@@ -7,7 +7,6 @@ whisper_gui_prefs.json
 dist/
 build/
 *.spec.bak
-/WhisperServer.spec
 whisper_hotkey_gui_prefs.json
 whisper_hotkey_prefs.json
 whisper_hotkey.log
