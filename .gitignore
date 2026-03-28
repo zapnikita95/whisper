@@ -1,4 +1,7 @@
 .DS_Store
+# Случайные выгрузки / сохранённые страницы — не в репозиторий
+assets/волга_files/
+assets/search.json
 .venv/
 __pycache__/
 test_sample.mp3

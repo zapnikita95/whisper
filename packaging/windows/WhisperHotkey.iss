@@ -7,10 +7,10 @@
 #endif
 #define MyAppPublisher "Whisper"
 #define MyAppExeName "WhisperHotkey.exe"
-#define MyAppGuid "B8C9D0E1-F2A3-4B5C-9D0E-1F2A3B4C5D6E"
+#define MyAppId "{{B8C9D0E1-F2A3-4B5C-9D0E-1F2A3B4C5D6E}}"
 
 [Setup]
-AppId={{#MyAppGuid}}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
