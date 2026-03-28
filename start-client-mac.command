@@ -10,6 +10,21 @@ if [ -z "${WHISPER_PYTHON3:-}" ] && [ -x "$HERE/.venv/bin/python3" ]; then
 	export WHISPER_PYTHON3="$HERE/.venv/bin/python3"
 fi
 
+# Нативный CGEventTap daemon (нет SIGTRAP / зависаний pynput на macOS 15+).
+# Собираем один раз при первом запуске если бинарь ещё не существует.
+_DAEMON_BIN="$HERE/packaging/mac/whisper_hotkey_daemon"
+_DAEMON_SRC="$HERE/packaging/mac/whisper_hotkey_daemon.c"
+if [ ! -x "$_DAEMON_BIN" ] && [ -f "$_DAEMON_SRC" ] && command -v clang >/dev/null 2>&1; then
+	echo "Компилирую whisper_hotkey_daemon (CGEventTap, один раз)…"
+	clang -O2 -framework ApplicationServices -framework Carbon \
+		-o "$_DAEMON_BIN" "$_DAEMON_SRC" 2>/dev/null && \
+		echo "✓ whisper_hotkey_daemon готов." || \
+		echo "⚠ Не удалось скомпилировать whisper_hotkey_daemon (fallback на pynput)."
+fi
+if [ -x "$_DAEMON_BIN" ]; then
+	export WHISPER_HOTKEY_DAEMON="$_DAEMON_BIN"
+fi
+
 if [ ! -t 0 ] && [ -z "${WHISPER_MAC_COMMAND_SKIP_TTY_REDIRECT:-}" ]; then
 	echo "Нет интерактивного TTY (часто при «Run» из Cursor). Открываю Terminal.app…" >&2
 	exec open -a Terminal "$SELF"

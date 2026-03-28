@@ -10,7 +10,7 @@
 		</data>
 		<key>Resources/VERSION</key>
 		<data>
-		z3RL0AeFCwRgHchlgV7A9eYMaXA=
+		lXbfvUf+z3JCDUIXHWu3oucoodg=
 		</data>
 		<key>Resources/__pycache__/whisper_update_check.cpython-313.pyc</key>
 		<data>
@@ -20,21 +20,29 @@
 		<data>
 		PACM8r/ysMMv0klDYpBslvUk8PY=
 		</data>
+		<key>Resources/kill_whisper_client.command</key>
+		<data>
+		lkXNU6D5Z48NoQ6cpY/C7SpwbEY=
+		</data>
 		<key>Resources/pick_server_url.py</key>
 		<data>
 		PChu88ZsJ5eBIw3+GjuQkFnTnyk=
 		</data>
+		<key>Resources/reset_whisper_client_privacy.command</key>
+		<data>
+		eDJxEZE+diVFtVe4KuYk0xtF1n4=
+		</data>
 		<key>Resources/speaker_verify.py</key>
 		<data>
-		4sgUeeQpU9pxVL9wRi2uTnQnk+8=
+		y9DXEmXEiEslVbu2KM9iVrx+aM0=
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		iIynsDDZXNnVRcKj7bZ2aowHwVY=
+		rKpfjienJzLPoKLQAt98c3NzV4w=
 		</data>
 		<key>Resources/whisper_update_check.py</key>
 		<data>
-		IaqOfEtq96UvTyI6zDHTG34tqsI=
+		Prnq7uiNoKnnphEEsK4ZljhLVI4=
 		</data>
 		<key>Resources/whisper_version.py</key>
 		<data>
@@ -56,19 +64,28 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			wqVUB6rPCsu03NRHvnqOB3x3yS8=
+			SmmPFbeipFTDft9sKhBFoFdO49w=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"c2a55407aacf0acbb4dcd447be7a8e077c77c92f"</string>
+			<string>cdhash H"4a698f15b7a2a454c37edf6c2a1045a0574ee3dc"</string>
+		</dict>
+		<key>MacOS/whisper_hotkey_daemon</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			bMHsfSSt3d9w+i52gQPNmq6eprk=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"6cc1ec7d24addddf70fa2e768103cd9aae9ea6b9" or cdhash H"fdfe824c6f89b205f669429016f2f17f831600ec"</string>
 		</dict>
 		<key>MacOS/whisper_notify</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			XDA5XOh896DU4WGqpj4ShHepDkA=
+			ijySMJCdh4B49+PEikHVQP9YKgU=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"5c30395ce87cf7a0d4e161aaa63e128477a90e40"</string>
+			<string>cdhash H"8a3c9230909d878078f7e3c48a41d540ff582a05" or cdhash H"d4f7d71df9d59e59b95c49daaecebb4d68ad0448"</string>
 		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
@@ -81,7 +98,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			HltRzeUVOWqfp2KQnPjKZYTMxWSzJdLuvup2F1/pXE0=
+			bPTghLR/M8mwLveSedFXgzho+PcFFBaadovjU+4yj+o=
 			</data>
 		</dict>
 		<key>Resources/__pycache__/whisper_update_check.cpython-313.pyc</key>
@@ -98,6 +115,13 @@
 			wOId052hJ5jDKLBqCclwSV2/UI5/6ZjB870mrbmsgKo=
 			</data>
 		</dict>
+		<key>Resources/kill_whisper_client.command</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			KJT5S2KojwhNsk2TnbVC5j/9bOODen4IMPfhujsS+BI=
+			</data>
+		</dict>
 		<key>Resources/pick_server_url.py</key>
 		<dict>
 			<key>hash2</key>
@@ -105,25 +129,32 @@
 			a1TdgBrZmIBz804UxS4JbDG2ScjzNYg0JF7ufbLah5Y=
 			</data>
 		</dict>
+		<key>Resources/reset_whisper_client_privacy.command</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			+wSNtKoVCxg1UDqagOQJRSOD6+E0BrzoVeRtT4ngfuE=
+			</data>
+		</dict>
 		<key>Resources/speaker_verify.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			rJAtFIOIYUKGmF16TLXIXhNr0rd7jeBtpZ4f8HLP8aI=
+			v7gRUkNAN44bkGrxWPKhipyXx/7TJMbN08qLRZXmNfU=
 			</data>
 		</dict>
 		<key>Resources/whisper-client-mac.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			0OrPGr2JI0POGVfQ0Ah+BYuHXQ0fo6k2qIaVaUjR3Bw=
+			33Hjo8oFh5/56G4ibtoRpkE6zjCqzWpL54e1iAphPIM=
 			</data>
 		</dict>
 		<key>Resources/whisper_update_check.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			c9C+mYV9bOHRTAAHnAx5OandpqZ5SbQU1DrGINd730E=
+			f9m4+CJfVW1nqdvu1rH3nzvQwvJqG4Jh5yngGlm4DjM=
 			</data>
 		</dict>
 		<key>Resources/whisper_version.py</key>

@@ -2,30 +2,50 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleExecutable</key>
-	<string>WhisperClient</string>
-	<key>CFBundleIdentifier</key>
-	<string>local.whisper.client</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
-	<key>CFBundleName</key>
-	<string>Whisper Client</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>11.0</string>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<key>NSUserNotificationsUsageDescription</key>
-	<string>Whisper Client показывает статус записи, готовности текста и ошибки сервера.</string>
-	<key>LSEnvironment</key>
-	<dict>
-		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-	</dict>
+    <key>CFBundleExecutable</key>
+    <string>WhisperClient</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.whisper.client</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleName</key>
+    <string>Whisper Client</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.1</string>
+    <key>CFBundleVersion</key>
+    <string>2</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Whisper Client использует микрофон для записи голоса.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Whisper Client использует Apple Events для вставки текста.</string>
+    <key>NSUserNotificationsUsageDescription</key>
+    <string>Whisper Client показывает уведомления.</string>
+
+    <key>NSAppSleepDisabled</key>
+    <true/>
+    <key>NSRequiresAppNap</key>
+    <false/>
+
+    <key>LSBackgroundOnly</key>
+    <false/>
+    <key>LSUIElement</key>
+    <true/>
+
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <!-- Не вшивать $HOME/.venv конкретного разработчика — у коллеги путь другой и Finder подмешает мусор в PATH. -->
+    <key>LSEnvironment</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Library/Frameworks/Python.framework/Versions/Current/bin</string>
+    </dict>
 </dict>
 </plist>

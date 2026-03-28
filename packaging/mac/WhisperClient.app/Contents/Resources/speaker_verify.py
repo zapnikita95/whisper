@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_THRESHOLD = 0.72
+DEFAULT_THRESHOLD = 0.70
 
 
 class SpeakerRejected(Exception):

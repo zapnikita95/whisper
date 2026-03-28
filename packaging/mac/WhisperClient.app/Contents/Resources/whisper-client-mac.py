@@ -12,12 +12,17 @@
 Полный текст распознавания в лог: WHISPER_MAC_DEBUG=1.
 Перехват клавиш — отдельный поток с автоперезапуском; иконка 🎤/🔴 в строке меню — rumps (рекомендуется: pip install rumps; pick_python выберет интерпретатор с rumps).
 Уведомления: whisper_notify, при сбое — osascript (отключить запасной путь: WHISPER_MAC_NO_OSASCRIPT_NOTIFY=1).
-Опционально: WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC=N (авто-kick tap каждые N с простоя; по умолчанию выкл).
+Опционально: WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC=N (авто-kick tap; по умолчанию ВЫКЛ — на macOS часто ломает хоткей, не включай без нужды).
+osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вставка Cmd+V часто по таймауту.
+Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
+Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
 Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
 
 import argparse
+import atexit
+import json
 import logging
 import os
 import queue
@@ -83,6 +88,83 @@ _LOG_PATH: Path | None = None
 _LAST_MAC_BANNER: tuple[str, str, float] | None = None
 _MAC_BANNER_DEDUP_SEC = 2.5
 
+# Старт/стоп записи с хоткея: CoreAudio/sounddevice на части macOS не поднимают вход с потока CGEventTap
+# (и с reader-потока внешнего hotkey daemon) — выполняем на main thread (NSRunLoop / headless drain).
+_WhisperMainJobThunk = None
+if sys.platform == "darwin":
+    try:
+        from Foundation import NSObject as _NSObjectJob  # type: ignore[import-untyped]
+
+        class _WhisperMainJobThunk(_NSObjectJob):  # type: ignore[misc, valid-type]
+            def apply_(self, ctx: object) -> None:
+                d = ctx  # NSMutableDictionary или dict
+                fn = d["fn"]
+                try:
+                    fn()
+                except BaseException:
+                    _MAC_LOGGER.exception("main_job_thunk_apply")
+
+    except ImportError:
+        _WhisperMainJobThunk = None
+
+# Один процесс с меню-баром: две копии = две иконки 🎤 и «мёртвые» клики.
+_MAC_MENU_BAR_LOCK_FP: object | None = None
+
+
+def _mac_menu_bar_singleton_release() -> None:
+    global _MAC_MENU_BAR_LOCK_FP
+    fp = _MAC_MENU_BAR_LOCK_FP
+    _MAC_MENU_BAR_LOCK_FP = None
+    if fp is not None:
+        try:
+            fp.close()
+        except OSError:
+            pass
+
+
+def _mac_menu_bar_singleton_acquire() -> tuple[bool, str]:
+    """flock на ~/.whisper/mac_client_menu_bar.lock; второй экземпляр получает False."""
+    global _MAC_MENU_BAR_LOCK_FP
+    if sys.platform != "darwin":
+        return True, ""
+    try:
+        import fcntl
+    except ImportError:
+        return True, ""
+    d = Path.home() / ".whisper"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return True, ""
+    p = d / "mac_client_menu_bar.lock"
+    try:
+        fp = open(p, "a+", encoding="utf-8")
+    except OSError:
+        return True, ""
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        hint = ""
+        try:
+            t = p.read_text(encoding="utf-8", errors="replace").strip().split()
+            if t:
+                hint = t[0]
+        except OSError:
+            pass
+        return False, hint
+    try:
+        fp.seek(0)
+        fp.truncate()
+        fp.write(f"{os.getpid()}\n")
+        fp.flush()
+    except OSError:
+        pass
+    _MAC_MENU_BAR_LOCK_FP = fp
+    atexit.register(_mac_menu_bar_singleton_release)
+    _mac_log("info", "menu_bar_singleton_lock_ok pid=%s", os.getpid())
+    return True, ""
+
 
 class _FlushingFileHandler(logging.FileHandler):
     """После каждой записи flush — иначе при краше .app последние строки не попадают на диск."""
@@ -144,12 +226,153 @@ def configure_whisper_mac_logging() -> Path:
     return log_path
 
 
+def ingest_macos_python_crash_reports_into_log() -> None:
+    """
+    После SIGTRAP/краша Python не пишет в WhisperMacClient.log — отчёт остаётся в
+    ~/Library/Logs/DiagnosticReports/Python-*.ips. При следующем старте подтягиваем
+    новые отчёты, похожие на наш клиент (coalition / whisper-client-mac), одной строкой в лог.
+    Отключить: WHISPER_MAC_SKIP_DIAGNOSTIC_INGEST=1
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("WHISPER_MAC_SKIP_DIAGNOSTIC_INGEST", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    root = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+    if not root.is_dir():
+        return
+    state_dir = Path.home() / ".whisper"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    state_path = state_dir / "logged_macos_crash_incidents.json"
+    try:
+        blob = json.loads(state_path.read_text(encoding="utf-8"))
+        seen: set[str] = set(blob.get("incidents", []))
+    except Exception:
+        seen = set()
+
+    def _is_whisper_related(snippet: str) -> bool:
+        s = snippet.lower()
+        return (
+            "local.whisper.client" in snippet
+            or "whisper-client-mac.py" in snippet
+            or "whisperclient.app" in s
+            or "/whisper/whisper-client-mac" in s
+        )
+
+    try:
+        files = sorted(
+            root.glob("Python-*.ips"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:15]
+    except OSError:
+        return
+
+    new_ids: list[str] = []
+    for p in files:
+        try:
+            raw = p.read_bytes()[:200_000].decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _is_whisper_related(raw):
+            continue
+        first_line = raw.split("\n", 1)[0].strip()
+        try:
+            meta = json.loads(first_line)
+        except json.JSONDecodeError:
+            continue
+        inc = str(meta.get("incident_id") or p.stem).strip()
+        if not inc or inc in seen:
+            continue
+        exc_type = ""
+        term = ""
+        m_exc = re.search(r'"exception"\s*:\s*\{[^}]*"type"\s*:\s*"([^"]+)"', raw)
+        if m_exc:
+            exc_type = m_exc.group(1)
+        m_term = re.search(r'"indicator"\s*:\s*"([^"]+)"', raw)
+        if m_term:
+            term = m_term.group(1).replace("\\/", "/")
+        top = ""
+        m_tsm = re.search(r"TSMGetInputSourceProperty|_dispatch_assert_queue_fail", raw)
+        if m_tsm:
+            top = " (стек: dispatch_assert_queue / TSM — см. .ips)"
+        _MAC_LOGGER.warning(
+            "macos_diagnostic_ingested file=%s incident=%s captureTime=%s exception=%s termination=%s%s "
+            "полный отчёт: %s",
+            p.name,
+            inc,
+            meta.get("timestamp", "?"),
+            exc_type or "?",
+            term or "?",
+            top,
+            p,
+        )
+        seen.add(inc)
+        new_ids.append(inc)
+
+    if not new_ids:
+        return
+    try:
+        # не раздуваем файл бесконечно
+        keep = list(seen)[-400:]
+        state_path.write_text(json.dumps({"incidents": keep}), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _mac_log(level: str, msg: str, *args: object) -> None:
     log_fn = getattr(_MAC_LOGGER, level.lower(), None)
     if log_fn:
         log_fn(msg, *args)
     else:
         _MAC_LOGGER.info(msg, *args)
+
+
+def _macos_touch_microphone_permission_if_bundle() -> None:
+    """Один раз открываем default input при старте из .app.
+
+    macOS не добавляет приложение в «Микрофон», пока кто-то реально не откроет вход.
+    Раньше это происходило только при зажатии хоткея — из-за этого список казался «пустым».
+    """
+    if sys.platform != "darwin":
+        return
+    if not os.environ.get("WHISPER_FROM_APP_BUNDLE"):
+        return
+    try:
+        with sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            dtype="float32",
+            blocksize=256,
+        ):
+            pass
+    except OSError as e:
+        _mac_log(
+            "info",
+            "mic_touch_bundle err=%s — проверь «Конфиденциальность и безопасность → Микрофон» (или «Python», если так в списке)",
+            e,
+        )
+    except Exception as e:
+        _mac_log("debug", "mic_touch_bundle unexpected err=%s", e)
+    else:
+        _mac_log("info", "mic_touch_bundle opened_default_input (диалог TCC мог появиться)")
+
+
+def _rumps_apply_accessory_activation_policy() -> None:
+    """Accessory-после инициализации статус-бара: иначе ранний setActivationPolicy ломает клики по NSStatusItem."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory  # type: ignore[import]
+
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        _mac_log("debug", "ns_activation_policy=accessory (rumps before_start)")
+    except Exception as _e:
+        _mac_log("debug", "ns_activation_policy_skip err=%s", _e)
 
 
 def _fastapi_error_detail(resp: requests.Response) -> str:
@@ -219,22 +442,32 @@ def mac_banner_notification(title: str, body: str = "") -> None:
 
     if tool and Path(tool).is_file() and os.access(tool, os.X_OK):
         for attempt in (1, 2):
+            _proc = None
             try:
-                r = subprocess.run(
+                _proc = subprocess.Popen(
                     [tool],
-                    input=payload,
-                    capture_output=True,
-                    timeout=12.0,
-                    check=False,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                 )
-                if r.returncode == 0:
+                _, _err = _proc.communicate(input=payload, timeout=3.0)
+                if _proc.returncode == 0:
                     return
                 _MAC_LOGGER.debug(
                     "whisper_notify_nonzero_exit attempt=%s code=%s stderr=%r",
                     attempt,
-                    r.returncode,
-                    (r.stderr or b"")[:300],
+                    _proc.returncode,
+                    (_err or b"")[:300],
                 )
+            except subprocess.TimeoutExpired:
+                # subprocess.run НЕ убивает дочерний процесс — делаем явно
+                if _proc:
+                    try:
+                        _proc.kill()
+                        _proc.communicate()
+                    except Exception:
+                        pass
+                _MAC_LOGGER.debug("whisper_notify_timeout attempt=%s — killed", attempt)
             except Exception:
                 _MAC_LOGGER.debug("whisper_notify_tool_failed attempt=%s", attempt, exc_info=True)
             if attempt == 1:
@@ -280,11 +513,78 @@ def _listener_idle_recycle_sec() -> float:
         return 0.0
 
 
+def _mac_osascript_timeout_sec(*, fallback: float) -> float:
+    """
+    Таймаут для osascript → System Events (вставка, фокус, снимок PID).
+    При первом запуске macOS может долго будить System Events; 3 с часто мало → TimeoutExpired.
+    Переопределение: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (секунды, 4…120).
+    """
+    raw = (os.environ.get("WHISPER_MAC_OSASCRIPT_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            return max(4.0, min(120.0, float(raw)))
+        except ValueError:
+            pass
+    return max(4.0, min(120.0, fallback))
+
+
 def _mac_notify_progress(body: str) -> None:
     """«Отправка на сервер» — по умолчанию только при запуске из .app (меньше шума в терминале)."""
     if os.environ.get("WHISPER_MAC_NOTIFY_PROGRESS", "1" if os.environ.get("WHISPER_FROM_APP_BUNDLE") else "0") != "1":
         return
     mac_banner_notification("Whisper", body)
+
+
+_MAC_CLIENT_PREF_KEYS = frozenset(
+    {"health_timeout", "transcribe_timeout", "transcribe_connect_timeout", "speaker_threshold"}
+)
+
+
+def _mac_client_prefs_path() -> Path:
+    return Path.home() / ".whisper" / "mac_client_prefs.json"
+
+
+def load_mac_client_prefs() -> dict[str, float]:
+    path = _mac_client_prefs_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k in _MAC_CLIENT_PREF_KEYS:
+        if k not in raw:
+            continue
+        try:
+            out[k] = float(raw[k])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def merge_mac_client_prefs(updates: dict[str, float | None]) -> None:
+    path = _mac_client_prefs_path()
+    cur: dict[str, object] = {}
+    try:
+        if path.is_file():
+            cur = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
+    for k, v in updates.items():
+        if k not in _MAC_CLIENT_PREF_KEYS:
+            continue
+        if v is None:
+            cur.pop(k, None)
+        else:
+            try:
+                cur[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool = False) -> None:
@@ -320,8 +620,19 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
     picked = pick_asset_url(rel, suffix=".dmg", contains="whisperclient")
     html = (rel.get("html_url") or "").strip() or "https://github.com/zapnikita95/whisper/releases"
     if not picked:
+        assets = rel.get("assets") or []
+        names = [(a.get("name") or "") for a in assets if isinstance(a, dict)]
+        _mac_log(
+            "warning",
+            "update_no_dmg_asset tag=%s assets=%r — в релизе должен быть .dmg (CI: build-macos → publish)",
+            tag,
+            names[:20],
+        )
         webbrowser.open(html)
-        mac_banner_notification("Whisper", "Открыта страница релиза — скачай DMG вручную.")
+        mac_banner_notification(
+            "Whisper",
+            "В релизе нет DMG в assets — открыта страница GitHub; скачай вручную или попроси собрать тег v*.",
+        )
         return
     name, url = picked
     dest = Path.home() / "Downloads" / name
@@ -625,6 +936,483 @@ def bind_hotkey_interactive(timeout: float = 90.0) -> HotkeySpec:
     return HotkeySpec.default_mac_with_portal()
 
 
+class _InProcessCGEventTap:
+    """
+    CGEventTap внутри Python-процесса через PyObjC Quartz.
+
+    Преимущества перед внешним бинарём (whisper_hotkey_daemon):
+    - Использует права Input Monitoring САМОГО Python-процесса → работает из .app без
+      дополнительных разрешений (Python уже авторизован, т.к. pynput его добавил).
+    - Нет TSM-крашей (SIGTRAP) — мы не вызываем pynput.Listener, только CGEventGetFlags.
+    - Нет зависаний CGEventTapCreate — работает в том же процессе, что и rumps.
+    - Автоматически переподключает tap при kCGEventTapDisabledByTimeout.
+
+    Requires: pyobjc-framework-Quartz (уже в venv через pynput/rumps).
+    """
+
+    # Флаги по умолчанию: ⌃+⌥+⇧ без ⌘
+    _DEFAULT_TARGET = 0xe0000   # ctrl|alt|shift
+    _DEFAULT_REJECT = 0x100000  # cmd
+
+    def __init__(
+        self,
+        on_down: "Callable[[], None]",
+        on_up: "Callable[[], None]",
+        target_flags: int = _DEFAULT_TARGET,
+        reject_flags: int = _DEFAULT_REJECT,
+    ) -> None:
+        self._on_down = on_down
+        self._on_up = on_up
+        self._target_flags = target_flags
+        self._reject_flags = reject_flags
+        self._pressed = False
+        self._stop = threading.Event()
+        self._tap = None          # CGEventTapRef (CFMachPortRef)
+        self._runloop = None      # CFRunLoopRef текущего tap-потока
+        self._thread: threading.Thread | None = None
+        self._callback_ref = None  # держим callable от GC
+
+    @classmethod
+    def flags_for_spec(cls, spec: "HotkeySpec") -> "tuple[int, int]":
+        """Конвертирует HotkeySpec в (target_flags, reject_flags)."""
+        _MAP = {
+            "ctrl":  0x40000,
+            "alt":   0x80000,
+            "shift": 0x20000,
+            "cmd":   0x100000,
+        }
+        target = 0
+        reject = 0x100000  # по умолчанию отклоняем cmd
+        for t in spec.tokens:
+            if t.startswith("m:"):
+                k = t[2:]
+                if k in _MAP:
+                    target |= _MAP[k]
+                    if k == "cmd":
+                        reject &= ~0x100000  # cmd в сочетании — не отклоняем
+        return target, reject
+
+    def start(self) -> bool:
+        """Запускает CGEventTap в фоновом потоке. Возвращает True при успехе."""
+        try:
+            from Quartz import (
+                CGEventTapCreate,
+                CGEventGetFlags,
+                CGEventTapEnable,
+                kCGEventFlagsChanged,
+                kCGHIDEventTap,
+                kCGHeadInsertEventTap,
+                kCGEventTapOptionDefault,
+                kCGEventTapDisabledByTimeout,
+                kCGEventTapDisabledByUserInput,
+            )
+            from CoreFoundation import (
+                CFMachPortCreateRunLoopSource,
+                CFRunLoopAddSource,
+                CFRunLoopGetCurrent,
+                CFRunLoopRun,
+                CFRunLoopStop,
+                kCFRunLoopCommonModes,
+            )
+        except ImportError as e:
+            _mac_log("debug", "in_process_tap_no_quartz %s", e)
+            return False
+
+        self._stop.clear()
+        ready_ev = threading.Event()
+        fail: list[str] = []
+
+        target = self._target_flags
+        reject = self._reject_flags
+
+        def _tap_thread() -> None:
+            try:
+                # Callback: вызывается из C-слоя PyObjC (GIL захватывается автоматически)
+                def _cb(proxy, event_type, event, refcon):
+                    if event_type in (
+                        kCGEventTapDisabledByTimeout,
+                        kCGEventTapDisabledByUserInput,
+                    ):
+                        t = self._tap
+                        if t:
+                            CGEventTapEnable(t, True)
+                            _mac_log("debug", "in_process_tap_reenabled type=%s", event_type)
+                        return event
+
+                    if event_type != kCGEventFlagsChanged:
+                        return event
+
+                    flags = CGEventGetFlags(event)
+                    combo = bool(
+                        (flags & target) == target
+                        and (flags & reject) == 0
+                    )
+
+                    if combo and not self._pressed:
+                        self._pressed = True
+                        try:
+                            self._on_down()
+                        except Exception:
+                            _MAC_LOGGER.exception("in_process_tap_on_down")
+                    elif not combo and self._pressed:
+                        self._pressed = False
+                        try:
+                            self._on_up()
+                        except Exception:
+                            _MAC_LOGGER.exception("in_process_tap_on_up")
+
+                    return event
+
+                self._callback_ref = _cb  # защита от GC
+
+                mask = 1 << kCGEventFlagsChanged
+                tap = CGEventTapCreate(
+                    kCGHIDEventTap,
+                    kCGHeadInsertEventTap,
+                    kCGEventTapOptionDefault,
+                    mask,
+                    _cb,
+                    None,
+                )
+
+                if tap is None:
+                    fail.append("CGEventTapCreate returned None — нет Input Monitoring?")
+                    ready_ev.set()
+                    return
+
+                self._tap = tap
+                src = CFMachPortCreateRunLoopSource(None, tap, 0)
+                rl = CFRunLoopGetCurrent()
+                self._runloop = rl
+                CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes)
+                CGEventTapEnable(tap, True)
+
+                ready_ev.set()
+                _mac_log("debug", "in_process_tap_runloop_start target_flags=0x%x", target)
+                CFRunLoopRun()  # блокирует до CFRunLoopStop
+
+            except Exception as e:
+                fail.append(str(e))
+                ready_ev.set()
+                _MAC_LOGGER.exception("in_process_tap_thread_error")
+
+        self._thread = threading.Thread(
+            target=_tap_thread,
+            name="whisper-cg-event-tap",
+            daemon=True,
+        )
+        self._thread.start()
+        ready_ev.wait(timeout=3.0)
+
+        if fail:
+            _mac_log("warning", "in_process_tap_failed: %s", fail[0])
+            return False
+
+        if not (self._thread.is_alive() and self._tap is not None):
+            _mac_log("warning", "in_process_tap_not_alive")
+            return False
+
+        _mac_log(
+            "info",
+            "in_process_cgeventtap_active target_flags=0x%x reject_flags=0x%x",
+            target,
+            reject,
+        )
+        return True
+
+    def is_running(self) -> bool:
+        return (
+            self._thread is not None
+            and self._thread.is_alive()
+            and self._tap is not None
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._pressed = False
+        rl = self._runloop
+        if rl is not None:
+            try:
+                from CoreFoundation import CFRunLoopStop
+                CFRunLoopStop(rl)
+            except Exception:
+                pass
+        tap = self._tap
+        if tap is not None:
+            try:
+                from Quartz import CGEventTapEnable
+                CGEventTapEnable(tap, False)
+            except Exception:
+                pass
+            self._tap = None
+        if self._thread:
+            self._thread.join(timeout=3.0)
+
+
+class _HotkeyDaemon:
+    """
+    Нативный CGEventTap-процесс вместо pynput Listener.
+
+    Запускает whisper_hotkey_daemon (C-бинарь), читает DOWN/UP из его stdout
+    и вызывает on_down/on_up. Автоматически отвечает на PING (heartbeat) и
+    пересоздаёт процесс если он упал.
+
+    Нет TSM-крашей (SIGTRAP на macOS 15+), нет зависания CGEventTapCreate.
+    """
+
+    _SEARCH_ENV = "WHISPER_HOTKEY_DAEMON"
+
+    def __init__(
+        self,
+        on_down: "Callable[[], None]",
+        on_up: "Callable[[], None]",
+        hotkey_spec: str = "ctrl+alt+shift",
+    ) -> None:
+        self._on_down = on_down
+        self._on_up = on_up
+        self._hotkey_spec = hotkey_spec
+        self._proc: subprocess.Popen[str] | None = None
+        self._reader_t: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._binary: Path | None = None
+
+    # ── Поиск бинаря ──────────────────────────────────────────────────────────
+    @classmethod
+    def find_binary(cls) -> "Path | None":
+        candidates: list[Path] = []
+
+        env_val = (os.environ.get(cls._SEARCH_ENV) or "").strip()
+        if env_val:
+            candidates.append(Path(env_val))
+
+        script_dir = Path(__file__).resolve().parent
+        # рядом со скриптом (dev-режим + app-bundle Contents/MacOS)
+        candidates.append(script_dir / "whisper_hotkey_daemon")
+        # packaging/mac/ (после ручной сборки)
+        candidates.append(script_dir / "packaging" / "mac" / "whisper_hotkey_daemon")
+        # внутри собранного .app рядом с репо
+        candidates.append(
+            script_dir / "packaging" / "mac" / "WhisperClient.app"
+            / "Contents" / "MacOS" / "whisper_hotkey_daemon"
+        )
+
+        for p in candidates:
+            try:
+                if p.is_file() and os.access(str(p), os.X_OK):
+                    return p
+            except OSError:
+                continue
+        return None
+
+    # ── Старт ─────────────────────────────────────────────────────────────────
+    def start(self) -> bool:
+        binary = self.find_binary()
+        if binary is None:
+            _mac_log("warning", "hotkey_daemon_binary_not_found search_env=%s", self._SEARCH_ENV)
+            return False
+        self._binary = binary
+        self._stop.clear()
+        try:
+            self._proc = subprocess.Popen(
+                [str(binary), "--hotkey", self._hotkey_spec],
+                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            _mac_log("warning", "hotkey_daemon_popen_failed %s", e)
+            return False
+
+        # Ждём READY (daemon пишет его немедленно) или быстрый exit с ошибкой.
+        ready = False
+        if self._proc.stdout:
+            import select as _select
+            try:
+                rlist, _, _ = _select.select([self._proc.stdout], [], [], 2.0)
+            except Exception:
+                rlist = []
+            if rlist:
+                try:
+                    first_line = self._proc.stdout.readline()
+                    stripped = first_line.strip()
+                    if stripped == "READY":
+                        ready = True
+                    else:
+                        rc = self._proc.poll()
+                        stderr_tail = ""
+                        if self._proc.stderr:
+                            try:
+                                stderr_tail = self._proc.stderr.read(2000)
+                            except Exception:
+                                pass
+                        _mac_log(
+                            "warning",
+                            "hotkey_daemon_unexpected_first_line %r rc=%s stderr_tail=%r",
+                            stripped,
+                            rc,
+                            (stderr_tail[-500:] if stderr_tail else ""),
+                        )
+                except Exception as e:
+                    _mac_log("warning", "hotkey_daemon_readline_error %s", e)
+            else:
+                # 2с прошло без READY — проверяем, живой ли
+                rc = self._proc.poll()
+                stderr_txt = ""
+                if rc is not None:
+                    if self._proc.stderr:
+                        try:
+                            stderr_txt = self._proc.stderr.read(2000)
+                        except Exception:
+                            pass
+                    _mac_log(
+                        "warning",
+                        "hotkey_daemon_exited_early rc=%s stderr=%r",
+                        rc,
+                        stderr_txt[:300],
+                    )
+                else:
+                    _mac_log("warning", "hotkey_daemon_no_ready_in_2s")
+
+        if not ready:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            return False
+
+        # Поток чтения stderr (DEBUG-уровень)
+        if self._proc.stderr:
+            threading.Thread(
+                target=self._stderr_reader,
+                daemon=True,
+                name="whisper-hkd-stderr",
+            ).start()
+
+        # Основной поток: читает DOWN/UP/PONG
+        self._reader_t = threading.Thread(
+            target=self._stdout_reader,
+            daemon=True,
+            name="whisper-hkd-stdout",
+        )
+        self._reader_t.start()
+
+        _mac_log(
+            "info",
+            "hotkey_daemon_started pid=%s binary=%s hotkey=%s",
+            self._proc.pid,
+            binary,
+            self._hotkey_spec,
+        )
+        return True
+
+    def _stderr_reader(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stderr:
+            return
+        try:
+            for line in proc.stderr:
+                line = line.rstrip()
+                if line:
+                    _mac_log("debug", "hkd_stderr: %s", line)
+        except Exception:
+            pass
+
+    def _stdout_reader(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+        try:
+            for line in proc.stdout:
+                if self._stop.is_set():
+                    break
+                token = line.strip()
+                if token == "DOWN":
+                    try:
+                        self._on_down()
+                    except Exception:
+                        _MAC_LOGGER.exception("hotkey_daemon_on_down")
+                elif token == "UP":
+                    try:
+                        self._on_up()
+                    except Exception:
+                        _MAC_LOGGER.exception("hotkey_daemon_on_up")
+                # PONG — просто игнорируем (подтверждение heartbeat)
+        except Exception as exc:
+            if not self._stop.is_set():
+                _mac_log("warning", "hotkey_daemon_stdout_reader_error %s", exc)
+        finally:
+            if not self._stop.is_set():
+                _mac_log("error", "hotkey_daemon_process_died rc=%s", proc.returncode)
+
+    # ── Heartbeat ─────────────────────────────────────────────────────────────
+    def ping(self) -> bool:
+        """Возвращает True если процесс ещё жив."""
+        if not self.is_running():
+            return False
+        try:
+            proc = self._proc
+            if proc and proc.stdin:
+                proc.stdin.write("PING\n")
+                proc.stdin.flush()
+        except Exception:
+            return False
+        return True
+
+    # ── Состояние ─────────────────────────────────────────────────────────────
+    def is_running(self) -> bool:
+        if self._proc is None:
+            return False
+        return self._proc.poll() is None
+
+    def pid(self) -> "int | None":
+        return self._proc.pid if self._proc else None
+
+    def path(self) -> "Path | None":
+        return self._binary
+
+    # ── Остановка ─────────────────────────────────────────────────────────────
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc:
+            try:
+                if proc.stdin:
+                    proc.stdin.write("STOP\n")
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self._reader_t:
+            self._reader_t.join(timeout=3.0)
+
+
+def _hotkey_spec_for_daemon(spec: "HotkeySpec") -> str:
+    """Конвертирует HotkeySpec в строку для whisper_hotkey_daemon (ctrl+alt+shift)."""
+    _mod_map = {"ctrl": "ctrl", "alt": "alt", "shift": "shift", "cmd": "cmd"}
+    parts: list[str] = []
+    for t in spec.tokens:
+        if t.startswith("m:"):
+            name = t[2:]
+            if name in _mod_map:
+                parts.append(_mod_map[name])
+    # Стабильный порядок: ctrl alt shift cmd
+    order = ["ctrl", "alt", "shift", "cmd"]
+    parts.sort(key=lambda x: order.index(x) if x in order else 99)
+    return "+".join(parts) if parts else "ctrl+alt+shift"
+
+
 class WhisperClientMac:
     def __init__(
         self,
@@ -672,12 +1460,189 @@ class WhisperClientMac:
         # run() выставляет: строка меню = main thread + NSRunLoop → безопасен performSelectorOnMainThread для kbd.
         self._menu_bar_mode = False
         self._listener_aux_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._main_thread_job_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        # Нативный CGEventTap-демон (заменяет pynput Listener на macOS 15+)
+        self._hotkey_daemon: _HotkeyDaemon | None = None
+        self._using_daemon = False
+        self._pref_health_timeout: float | None = None
+        self._pref_transcribe_timeout: float | None = None
+        self._pref_transcribe_connect_timeout: float | None = None
+        self._pref_speaker_threshold: float | None = None
+        self._reload_mac_prefs_from_disk()
+
+    def _reload_mac_prefs_from_disk(self) -> None:
+        p = load_mac_client_prefs()
+        self._pref_health_timeout = p.get("health_timeout")
+        self._pref_transcribe_timeout = p.get("transcribe_timeout")
+        self._pref_transcribe_connect_timeout = p.get("transcribe_connect_timeout")
+        self._pref_speaker_threshold = p.get("speaker_threshold")
+
+    def _merge_save_mac_prefs(self, **kwargs: float | None) -> None:
+        merge_mac_client_prefs(dict(kwargs))
+        self._reload_mac_prefs_from_disk()
+        _mac_log("info", "mac_client_prefs_saved %s", load_mac_client_prefs())
+
+    def _effective_health_timeout_sec(self) -> float:
+        if self._pref_health_timeout is not None:
+            return max(5.0, min(120.0, float(self._pref_health_timeout)))
+        try:
+            _hc_to = float((os.environ.get("WHISPER_MAC_HEALTH_TIMEOUT") or "30").strip() or "30")
+        except ValueError:
+            _hc_to = 30.0
+        return max(5.0, min(120.0, _hc_to))
+
+    def _effective_transcribe_timeouts(self) -> tuple[float, float]:
+        if self._pref_transcribe_timeout is not None:
+            _tx_read = max(60.0, min(3600.0, float(self._pref_transcribe_timeout)))
+        else:
+            try:
+                _tx_read = float(
+                    (os.environ.get("WHISPER_MAC_TRANSCRIBE_TIMEOUT") or "900").strip() or "900"
+                )
+            except ValueError:
+                _tx_read = 900.0
+            _tx_read = max(60.0, min(3600.0, _tx_read))
+        if self._pref_transcribe_connect_timeout is not None:
+            _tx_conn = max(10.0, min(300.0, float(self._pref_transcribe_connect_timeout)))
+        else:
+            try:
+                _tx_conn = float(
+                    (os.environ.get("WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT") or "60").strip()
+                    or "60"
+                )
+            except ValueError:
+                _tx_conn = 60.0
+            _tx_conn = max(10.0, min(300.0, _tx_conn))
+        return _tx_conn, _tx_read
+
+    def _effective_speaker_threshold_override(self) -> float | None:
+        if self._pref_speaker_threshold is not None:
+            return float(self._pref_speaker_threshold)
+        return self._speaker_threshold
 
     def request_shutdown(self) -> None:
         """Остановка клиента (меню «Выход», SIGINT)."""
         self._run_stop = True
         self._listener_cycle_restart.set()
         self._kick_listener_restart(force=True)
+        d = self._hotkey_daemon
+        if d:
+            try:
+                d.stop()
+            except Exception:
+                pass
+
+    def _drain_main_thread_jobs(self) -> None:
+        """Очередь задач для Python main (headless; запасной путь если thunk недоступен)."""
+        while True:
+            try:
+                job = self._main_thread_job_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                job()
+            except Exception:
+                _MAC_LOGGER.exception("main_thread_job_queue")
+
+    def _invoke_recording_on_main_thread(self, fn: Callable[[], None]) -> None:
+        """Старт/стоп записи с потока хоткея: на main — стабильнее CoreAudio (sounddevice)."""
+        if sys.platform != "darwin":
+            fn()
+            return
+        try:
+            from Foundation import NSThread  # type: ignore[import-untyped]
+
+            if NSThread.isMainThread():
+                fn()
+                return
+        except Exception:
+            pass
+        if threading.current_thread() is threading.main_thread():
+            fn()
+            return
+
+        if self._menu_bar_mode and _WhisperMainJobThunk is not None:
+            try:
+                thunk = _WhisperMainJobThunk.alloc().init()
+                thunk.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "apply:", {"fn": fn}, False
+                )
+                return
+            except Exception:
+                _MAC_LOGGER.exception("invoke_recording_on_main_thunk_failed")
+
+        self._main_thread_job_queue.put(fn)
+
+    # ── Нативный CGEventTap daemon (macOS 15+, без TSM-крашей) ────────────────
+
+    def _try_start_hotkey_daemon(self) -> bool:
+        """
+        Пробует запустить нативный CGEventTap (без pynput Listener).
+        Порядок: 1) _InProcessCGEventTap (Quartz в Python-процессе) → нет проблем с правами .app
+                 2) _HotkeyDaemon (внешний C-бинарь) → fallback для Terminal/dev-режима
+        Возвращает True при успехе; иначе нужен pynput fallback.
+        """
+        if sys.platform != "darwin":
+            return False
+
+        # ── Вариант 1: CGEventTap прямо в Python-процессе (рекомендуется) ──────
+        target, reject = _InProcessCGEventTap.flags_for_spec(self.hotkey)
+        tap = _InProcessCGEventTap(
+            on_down=lambda: self._invoke_recording_on_main_thread(self._start_recording),
+            on_up=lambda: self._invoke_recording_on_main_thread(self._stop_recording_and_process),
+            target_flags=target,
+            reject_flags=reject,
+        )
+        if tap.start():
+            self._hotkey_daemon = tap
+            _mac_log("info", "hotkey=in_process_cgeventtap pynput_listener=DISABLED")
+            return True
+
+        # ── Вариант 2: внешний C-бинарь whisper_hotkey_daemon ─────────────────
+        _mac_log("debug", "in_process_tap_failed trying external daemon")
+        spec = _hotkey_spec_for_daemon(self.hotkey)
+        daemon = _HotkeyDaemon(
+            on_down=lambda: self._invoke_recording_on_main_thread(self._start_recording),
+            on_up=lambda: self._invoke_recording_on_main_thread(self._stop_recording_and_process),
+            hotkey_spec=spec,
+        )
+        if daemon.start():
+            self._hotkey_daemon = daemon
+            _mac_log(
+                "info",
+                "hotkey=external_daemon pid=%s binary=%s pynput_listener=DISABLED",
+                daemon.pid(),
+                daemon.path(),
+            )
+            return True
+
+        return False
+
+    def _ensure_daemon_running(self) -> None:
+        """Watchdog: перезапускает tap если упал; fallback на pynput."""
+        if self._run_stop:
+            return
+        d = self._hotkey_daemon
+        if d and d.is_running():
+            return
+        _mac_log("warning", "hotkey_tap_dead restarting")
+        ok = self._try_start_hotkey_daemon()
+        if ok:
+            try:
+                mac_banner_notification("Whisper", "Перехват клавиш перезапущен.")
+            except Exception:
+                pass
+        else:
+            _mac_log("error", "hotkey_tap_restart_failed falling_back_to_pynput")
+            self._using_daemon = False
+            self._ensure_listener_thread()
+            try:
+                mac_banner_notification(
+                    "Whisper",
+                    "Нативный перехватчик недоступен — переключено на pynput.",
+                )
+            except Exception:
+                pass
 
     def _ensure_listener_thread(self) -> None:
         """Поток pynput не должен «тихо умереть» и гасить весь клиент — поднимаем снова."""
@@ -706,6 +1671,30 @@ class WhisperClientMac:
                 daemon=False,
             )
             self._listener_thread.start()
+
+    def _maybe_recover_stale_listener(self) -> None:
+        """
+        Поток whisper-pynput-listener жив, но экземпляр pynput.Listener внутри уже мёртв —
+        иначе можно годами «молчать» без событий. Отличие от idle-recycle: реагируем только
+        на is_alive()==False, а не по таймеру.
+        """
+        if self._run_stop:
+            return
+        with self._lock:
+            if self._recording or self._busy:
+                return
+        with self._listener_ref_lock:
+            lr = self._listener_ref
+        if lr is None:
+            return
+        try:
+            ok = lr.is_alive()
+        except Exception:
+            return
+        if ok:
+            return
+        _mac_log("warning", "pynput_listener_instance_dead recovering_tap")
+        self._kick_listener_restart(force=False)
 
     def _reset_hotkey_tracker(self) -> None:
         """Сброс модели «какие клавиши зажаты» — после вставки и после цикла распознавания."""
@@ -755,7 +1744,7 @@ class WhisperClientMac:
                     self._hk_combo_active = True
                     should_start = True
             if should_start:
-                self._start_recording()
+                self._invoke_recording_on_main_thread(self._start_recording)
         except Exception:
             _MAC_LOGGER.exception("on_press_hotkey")
 
@@ -775,7 +1764,7 @@ class WhisperClientMac:
                         self._hk_combo_active = False
                         should_stop = True
             if should_stop:
-                self._stop_recording_and_process()
+                self._invoke_recording_on_main_thread(self._stop_recording_and_process)
         except Exception:
             _MAC_LOGGER.exception("on_release_hotkey")
 
@@ -792,9 +1781,7 @@ class WhisperClientMac:
                     with self._listener_ref_lock:
                         self._listener_ref = listener
                     self._listener_cycle_restart.clear()
-                    if not getattr(self, "_listener_started_logged", False):
-                        self._listener_started_logged = True
-                        _mac_log("info", "pynput_listener_active hotkey=%s", self._hotkey_label)
+                    _mac_log("info", "pynput_listener_active hotkey=%s", self._hotkey_label)
                     try:
                         while not self._run_stop:
                             self._drain_listener_aux_queue()
@@ -979,7 +1966,7 @@ class WhisperClientMac:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=2.5,
+                timeout=_mac_osascript_timeout_sec(fallback=10.0),
             )
             if r.returncode != 0:
                 _mac_log(
@@ -1016,7 +2003,7 @@ class WhisperClientMac:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=5.0,
+                timeout=_mac_osascript_timeout_sec(fallback=15.0),
             )
             if r.returncode != 0:
                 _mac_log(
@@ -1035,26 +2022,43 @@ class WhisperClientMac:
 
     def _paste_via_system_events(self) -> bool:
         """Cmd+V через key code 9 (клавиша V), без keystroke — стабильнее при разных раскладках."""
-        r = subprocess.run(
-            [
-                "osascript",
-                "-e",
-                "delay 0.18",
-                "-e",
-                'tell application "System Events" to key code 9 using command down',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3.0,
-        )
-        if r.returncode != 0:
+        timeout = _mac_osascript_timeout_sec(fallback=18.0)
+        # delay внутри osascript иногда «висит» вместе с tell — делаем паузу в Python.
+        key_script = 'tell application "System Events" to key code 9 using command down'
+        for attempt in range(1, 4):
+            time.sleep(0.18)
+            try:
+                r = subprocess.run(
+                    ["osascript", "-e", key_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _mac_log(
+                    "warning",
+                    "paste_osascript_timeout attempt=%s/%s timeout=%ss (System Events занят или нет доступа Automation)",
+                    attempt,
+                    3,
+                    timeout,
+                )
+                if attempt < 3:
+                    time.sleep(0.45)
+                continue
+            if r.returncode == 0:
+                if attempt > 1:
+                    _mac_log("info", "paste_keycode_ok_after_retry attempt=%s", attempt)
+                return True
             _mac_log(
                 "warning",
-                "paste_keycode_failed code=%s err=%s",
+                "paste_keycode_failed attempt=%s code=%s err=%s",
+                attempt,
                 r.returncode,
                 (r.stderr or "").strip(),
             )
-        return r.returncode == 0
+            if attempt < 3:
+                time.sleep(0.35)
+        return False
 
     def _record_worker(self, max_duration: float = 120.0) -> None:
         chunks = []
@@ -1167,7 +2171,9 @@ class WhisperClientMac:
                     self._reset_hotkey_tracker()
                     with self._lock:
                         self._busy = False
-                    self._schedule_listener_kick()
+                    # Рестарт tap нужен только при pynput (daemon живёт своей жизнью).
+                    if not self._using_daemon:
+                        self._schedule_listener_kick()
 
         def _work_body(paste_pid: int | None) -> None:
             try:
@@ -1198,7 +2204,7 @@ class WhisperClientMac:
                                 try:
                                     verify_wav_file_or_raise(
                                         tmp_path,
-                                        thr_override=self._speaker_threshold,
+                                        thr_override=self._effective_speaker_threshold_override(),
                                     )
                                 except SpeakerRejected as e:
                                     print(f"[Client] {e}", flush=True)
@@ -1212,9 +2218,10 @@ class WhisperClientMac:
                                         e,
                                     )
 
-                    # Проверяем доступность сервера перед отправкой
+                    # Проверяем доступность сервера перед отправкой (меню / ~/.whisper/mac_client_prefs.json / env).
                     try:
-                        health_check = requests.get(f"{self.server_url}/", timeout=5.0)
+                        _hc_to = self._effective_health_timeout_sec()
+                        health_check = requests.get(f"{self.server_url}/", timeout=_hc_to)
                         if health_check.status_code != 200:
                             print(f"[Client] Сервер недоступен (код {health_check.status_code})", flush=True)
                             _mac_log(
@@ -1236,12 +2243,8 @@ class WhisperClientMac:
                     _mac_log("info", "transcribe_upload_start url=%s paste_target_pid=%s", self.server_url, paste_pid)
                     max_retries = 3
                     response = None
-                    try:
-                        _tx_to = float(
-                            (os.environ.get("WHISPER_MAC_TRANSCRIBE_TIMEOUT") or "300").strip() or "300"
-                        )
-                    except ValueError:
-                        _tx_to = 300.0
+                    _tx_conn, _tx_read = self._effective_transcribe_timeouts()
+                    _post_timeout: float | tuple[float, float] = (_tx_conn, _tx_read)
 
                     for attempt in range(max_retries):
                         try:
@@ -1257,7 +2260,7 @@ class WhisperClientMac:
                                     files=files,
                                     params=params,
                                     headers={"X-Whisper-Client": "mac"},
-                                    timeout=_tx_to,
+                                    timeout=_post_timeout,
                                 )
                                 if response.status_code >= 400:
                                     detail = _fastapi_error_detail(response)
@@ -1316,7 +2319,10 @@ class WhisperClientMac:
                         with self._hk_lock:
                             self._hk_suppress = True
                         try:
-                            self._release_sticky_modifiers_safe()
+                            # В режиме daemon ключи уже физически отпущены до UP → synthetic release не нужен
+                            # (и может вызвать ложный DOWN у daemon через CGEventPost).
+                            if not self._using_daemon:
+                                self._release_sticky_modifiers_safe()
                             time.sleep(0.15)
                             if paste_pid is not None:
                                 activated = self._activate_process_by_unix_id(paste_pid)
@@ -1329,7 +2335,8 @@ class WhisperClientMac:
                             else:
                                 _mac_log(
                                     "warning",
-                                    "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно",
+                                    "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно "
+                                    "(кликни в поле ввода до хоткея; если Terminal/Python был активен — снимок PID отброшен)",
                                 )
                             time.sleep(0.08)
                             self._copy_to_clipboard_mac(text)
@@ -1391,9 +2398,17 @@ class WhisperClientMac:
                 print(f"[Client] Проверь Tailscale соединение и брандмауэр Windows", file=sys.stderr, flush=True)
                 mac_banner_notification("Whisper — нет связи", f"Сервер недоступен: {self.server_url}")
             except requests.exceptions.Timeout as e:
-                print(f"[Client] Таймаут при обработке (слишком долго)", file=sys.stderr, flush=True)
-                print(f"[Client] Попробуй более короткую запись или проверь сервер", file=sys.stderr, flush=True)
-                mac_banner_notification("Whisper — таймаут", "Сервер долго не отвечает — попробуй короче или проверь ПК.")
+                print(f"[Client] Таймаут HTTP: {e}", file=sys.stderr, flush=True)
+                print(
+                    "[Client] Увеличь ожидание: WHISPER_MAC_HEALTH_TIMEOUT, "
+                    "WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT, WHISPER_MAC_TRANSCRIBE_TIMEOUT (см. шапку whisper-client-mac.py).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                mac_banner_notification(
+                    "Whisper — таймаут",
+                    "Сеть или сервер не ответили в срок. Проверь Tailscale/ПК; при долгом Whisper задай WHISPER_MAC_TRANSCRIBE_TIMEOUT.",
+                )
             except Exception as e:
                 print(f"[Client] Ошибка: {e}", file=sys.stderr, flush=True)
                 _MAC_LOGGER.exception("work_body_error")
@@ -1425,14 +2440,42 @@ class WhisperClientMac:
 
         signal.signal(signal.SIGINT, _sigint)
 
-        self._ensure_listener_thread()
+        # Пробуем нативный CGEventTap (в Python-процессе); если не вышло — pynput fallback.
+        if sys.platform == "darwin":
+            self._using_daemon = self._try_start_hotkey_daemon()
+            if self._using_daemon:
+                print(
+                    "[Client] Нативный CGEventTap активен — "
+                    "pynput Listener не используется.",
+                    flush=True,
+                )
+            else:
+                _mac_log(
+                    "warning",
+                    "native_tap_unavailable — fallback на pynput",
+                )
+
+        if not self._using_daemon:
+            self._ensure_listener_thread()
 
         def _headless_main_loop() -> None:
+            last_daemon_watchdog = 0.0
             while not self._run_stop:
-                self._ensure_listener_thread()
-                t = self._listener_thread
-                if t is not None:
-                    t.join(timeout=0.6)
+                self._drain_main_thread_jobs()
+                if self._using_daemon:
+                    now = time.monotonic()
+                    if now - last_daemon_watchdog >= 2.0:
+                        self._ensure_daemon_running()
+                        last_daemon_watchdog = now
+                    time.sleep(0.02)
+                else:
+                    self._ensure_listener_thread()
+                    self._maybe_recover_stale_listener()
+                    t = self._listener_thread
+                    if t is not None:
+                        t.join(timeout=0.6)
+                    else:
+                        time.sleep(0.6)
 
         try:
             if menu_bar and WhisperMenuBarApp is not None:
@@ -1463,6 +2506,7 @@ if rumps is not None:
 
         def __init__(self, client: WhisperClientMac) -> None:
             ip = tray_icon_path()
+            _mac_log("debug", "tray_icon_path=%r", ip)
             try:
                 from whisper_version import get_version as _gv
 
@@ -1475,23 +2519,127 @@ if rumps is not None:
             else:
                 super().__init__("Whisper", title="🎤", quit_button=None)
                 self._emoji_mode = True
+                _mac_log("warning", "tray_icon_missing — emoji fallback (icon файл не найден)")
+
             self.client = client
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
+            _menu_timeouts = [
+                rumps.MenuItem(
+                    "По умолчанию (сброс файла настроек)",
+                    callback=self._timeouts_preset_reset,
+                ),
+                rumps.MenuItem(
+                    "Быстро · health 15с, TCP 30с, ответ 8 мин",
+                    callback=self._timeouts_preset_fast,
+                ),
+                rumps.MenuItem(
+                    "Норма · 30с, TCP 60с, ответ 15 мин",
+                    callback=self._timeouts_preset_normal,
+                ),
+                rumps.MenuItem(
+                    "Долго · 60с, TCP 90с, ответ 30 мин",
+                    callback=self._timeouts_preset_long,
+                ),
+                rumps.MenuItem("Свои значения…", callback=self._timeouts_custom),
+            ]
+            _menu_speaker = [
+                rumps.MenuItem(
+                    "Сброс порога (как при запуске)",
+                    callback=self._speaker_threshold_reset,
+                ),
+                rumps.MenuItem("Порог 0.60", callback=self._speaker_threshold_set_factory(0.60)),
+                rumps.MenuItem("Порог 0.65", callback=self._speaker_threshold_set_factory(0.65)),
+                rumps.MenuItem("Порог 0.70", callback=self._speaker_threshold_set_factory(0.70)),
+                rumps.MenuItem("Порог 0.72", callback=self._speaker_threshold_set_factory(0.72)),
+                rumps.MenuItem("Порог 0.75", callback=self._speaker_threshold_set_factory(0.75)),
+                rumps.MenuItem("Своё число…", callback=self._speaker_threshold_custom),
+            ]
             self.menu = [
                 rumps.MenuItem(f"Версия {self._app_version}", callback=None),
                 self._mi_server,
                 rumps.separator,
+                ("Таймауты сервера", _menu_timeouts),
+                ("Порог эталона голоса", _menu_speaker),
+                rumps.separator,
                 rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
                 rumps.MenuItem("Записать эталон голоса (45 с)…", callback=self._enroll_speaker_menu),
                 rumps.separator,
+                rumps.MenuItem("Перезапустить перехват клавиш", callback=self._restart_hotkey),
                 rumps.MenuItem("Показать лог…", callback=self._open_log),
                 rumps.MenuItem("Выход", callback=self._quit),
             ]
+            # После initializeStatusBar() в rumps.App.run(), иначе клики по иконке часто «мёртвые».
+            rumps.events.before_start.register(_rumps_apply_accessory_activation_policy)
+            # Запрашиваем разрешение на уведомления из контекста работающего NSApp.
+            # Таймер 3 с: к тому времени RunLoop уже запущен → completionHandler доставляется корректно.
+            threading.Timer(3.0, self._request_notifications_permission).start()
             threading.Timer(12.0, self._startup_update_check_once).start()
+            _ir = _listener_idle_recycle_sec()
+            if _ir > 0:
+                _mac_log(
+                    "warning",
+                    "listener_idle_recycle_on interval=%.0fs — на macOS периодический restart pynput часто роняет ⌃⌥⇧; "
+                    "для стабильной работы убери WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC и не передавай --listener-idle-recycle-sec",
+                    _ir,
+                )
 
         def _server_title(self) -> str:
             u = self.client.server_url
             return u if len(u) <= 56 else u[:53] + "…"
+
+        def _apply_status_bar_menu_fix(self) -> None:
+            """macOS 11+: повесить NSMenu на NSStatusBarButton — иначе клик по иконке часто молчит."""
+            try:
+                inst = getattr(rumps.App, "*app_instance", None)
+                if inst is None or not hasattr(inst, "_nsapp"):
+                    return
+                item = inst._nsapp.nsstatusitem
+                if item is None:
+                    return
+                m = item.menu()
+                btn = item.button()
+                if btn is None or m is None:
+                    return
+                btn.setEnabled_(True)
+                try:
+                    btn.setAppearsDisabledWhenInactive_(False)
+                except Exception:
+                    pass
+                try:
+                    btn.setMenu_(m)
+                except Exception:
+                    pass
+                item.setHighlightMode_(True)
+                _mac_log("debug", "status_bar_menu_fix_applied")
+            except Exception as _e:
+                _mac_log("debug", "status_bar_menu_fix_skip err=%s", _e)
+
+        def _request_notifications_permission(self) -> None:
+            """Запрашивает разрешение на уведомления из контекста работающего NSApp.
+            Только из работающего RunLoop completionHandler гарантированно достигает главного потока,
+            а значит диалог авторизации реально появится на экране.
+            """
+            try:
+                import UserNotifications as UN  # type: ignore[import]
+
+                center = UN.UNUserNotificationCenter.currentNotificationCenter()
+
+                def _handler(granted: bool, err: object) -> None:
+                    if granted:
+                        _mac_log("info", "notification_auth_granted")
+                    else:
+                        _mac_log(
+                            "warning",
+                            "notification_auth_denied — перейди в «Системные настройки → "
+                            "Уведомления» и разреши «Whisper Client»",
+                        )
+
+                center.requestAuthorizationWithOptions_completionHandler_(
+                    UN.UNAuthorizationOptionAlert | UN.UNAuthorizationOptionSound,
+                    _handler,
+                )
+            except Exception as _e:
+                _mac_log("debug", "notification_auth_request_skip err=%s", _e)
 
         def _open_log(self, _sender) -> None:
             logf = Path.home() / "Library" / "Logs" / "WhisperMacClient.log"
@@ -1505,6 +2653,116 @@ if rumps is not None:
                 name="whisper-mac-update",
                 daemon=True,
             ).start()
+
+        def _timeouts_preset_reset(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(
+                health_timeout=None,
+                transcribe_timeout=None,
+                transcribe_connect_timeout=None,
+            )
+            rumps.alert(
+                "Таймауты",
+                "Сброшены. Снова действуют значения по умолчанию и переменные окружения.",
+            )
+
+        def _timeouts_preset_fast(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(
+                health_timeout=15.0,
+                transcribe_connect_timeout=30.0,
+                transcribe_timeout=480.0,
+            )
+            rumps.alert("Таймауты", "Сохранено: быстрый профиль (ответ до 8 мин).")
+
+        def _timeouts_preset_normal(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(
+                health_timeout=30.0,
+                transcribe_connect_timeout=60.0,
+                transcribe_timeout=900.0,
+            )
+            rumps.alert("Таймауты", "Сохранено: нормальный профиль (ответ до 15 мин).")
+
+        def _timeouts_preset_long(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(
+                health_timeout=60.0,
+                transcribe_connect_timeout=90.0,
+                transcribe_timeout=1800.0,
+            )
+            rumps.alert("Таймауты", "Сохранено: долгий профиль (ответ до 30 мин).")
+
+        def _timeouts_custom(self, _sender) -> None:
+            tc, tr = self.client._effective_transcribe_timeouts()
+            h = self.client._effective_health_timeout_sec()
+            default = f"{int(h)} {int(tc)} {int(tr)}"
+            w = rumps.Window(
+                message="Три числа через пробел: health_сек · tcp_сек · ответ_сек",
+                title="Таймауты Whisper",
+                default_text=default,
+                dimensions=(420, 160),
+            )
+            out = w.run()
+            if out is None:
+                return
+            parts = out.strip().split()
+            if len(parts) != 3:
+                rumps.alert("Ошибка", "Нужно ровно три числа через пробел.")
+                return
+            try:
+                hv, cv, rv = float(parts[0]), float(parts[1]), float(parts[2])
+            except ValueError:
+                rumps.alert("Ошибка", "Введи три числа.")
+                return
+            self.client._merge_save_mac_prefs(
+                health_timeout=hv,
+                transcribe_connect_timeout=cv,
+                transcribe_timeout=rv,
+            )
+            rumps.alert("Таймауты", f"Сохранено: {hv:.0f} / {cv:.0f} / {rv:.0f} с")
+
+        def _speaker_threshold_reset(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(speaker_threshold=None)
+            rumps.alert(
+                "Порог эталона",
+                "Сброшен — используется порог при запуске и WHISPER_SPEAKER_THRESHOLD.",
+            )
+
+        def _speaker_threshold_set_factory(self, val: float):
+            def _cb(_s) -> None:
+                self.client._merge_save_mac_prefs(speaker_threshold=val)
+                rumps.alert(
+                    "Порог эталона",
+                    f"Сохранено {val:.2f} (~/.whisper/mac_client_prefs.json).",
+                )
+
+            return _cb
+
+        def _speaker_threshold_custom(self, _sender) -> None:
+            cur: float | None = self.client._pref_speaker_threshold
+            if cur is None:
+                try:
+                    from speaker_verify import threshold as _sv_thr
+
+                    cur = float(_sv_thr())
+                except Exception:
+                    cur = 0.70
+            w = rumps.Window(
+                message="Косинусное сходство с эталоном: 0.50 … 0.95",
+                title="Порог эталона",
+                default_text=f"{cur:.4f}".rstrip("0").rstrip("."),
+                dimensions=(380, 120),
+            )
+            out = w.run()
+            if out is None:
+                return
+            try:
+                v = float(out.replace(",", ".").strip())
+            except ValueError:
+                rumps.alert("Ошибка", "Нужно число.")
+                return
+            if not 0.45 <= v <= 0.99:
+                rumps.alert("Ошибка", "Ожидается число от 0.45 до 0.99.")
+                return
+            self.client._merge_save_mac_prefs(speaker_threshold=v)
+            rumps.alert("Порог эталона", f"Сохранено {v:.3f}")
 
         def _startup_update_check_once(self) -> None:
             if self.client._run_stop:
@@ -1571,6 +2829,43 @@ if rumps is not None:
                 self.client._listener_thread.join(timeout=5.0)
             rumps.quit_application()
 
+        def _restart_hotkey(self, _sender) -> None:
+            """Перезапустить перехват клавиш вручную из меню."""
+            if self.client._using_daemon:
+                d = self.client._hotkey_daemon
+                if d:
+                    try:
+                        d.stop()
+                    except Exception:
+                        pass
+                    self.client._hotkey_daemon = None
+                ok = self.client._try_start_hotkey_daemon()
+                if ok:
+                    mac_banner_notification("Whisper", "Перехват клавиш перезапущен.")
+                else:
+                    self.client._using_daemon = False
+                    self.client._ensure_listener_thread()
+                    mac_banner_notification("Whisper", "Нативный tap недоступен — переключено на pynput.")
+            else:
+                self.client._reset_hotkey_tracker()
+                self.client._kick_listener_restart(force=True)
+                mac_banner_notification("Whisper", "Перехват клавиш (pynput) перезапущен.")
+
+        @rumps.timer(0.05)
+        def _once_statusbar_menu_fix(self, sender) -> None:
+            """Сразу после старта RunLoop: меню на кнопке статус-бара (macOS 11+)."""
+            try:
+                sender.stop()
+            except Exception:
+                pass
+            if not getattr(self, "_statusbar_menu_fix_done", False):
+                self._statusbar_menu_fix_done = True
+                self._apply_status_bar_menu_fix()
+
+        @rumps.timer(0.05)
+        def _drain_main_thread_jobs_tick(self, _sender) -> None:
+            self.client._drain_main_thread_jobs()
+
         @rumps.timer(0.5)
         def _tick(self, _sender) -> None:
             if self.client._run_stop:
@@ -1589,7 +2884,11 @@ if rumps is not None:
         def _watchdog_listener(self, _sender) -> None:
             if self.client._run_stop:
                 return
-            self.client._ensure_listener_thread()
+            if self.client._using_daemon:
+                self.client._ensure_daemon_running()
+            else:
+                self.client._ensure_listener_thread()
+                self.client._maybe_recover_stale_listener()
 
         @rumps.timer(30.0)
         def _idle_recycle_listener(self, _sender) -> None:
@@ -1643,6 +2942,7 @@ else:
 
 def main() -> int:
     log_path = configure_whisper_mac_logging()
+    ingest_macos_python_crash_reports_into_log()
     _mac_log("info", "=== старт whisper-client-mac ===")
     try:
         _check_pynput_py313()
@@ -1725,6 +3025,14 @@ def main() -> int:
         help="Не показывать иконку в строке меню (нужен пакет rumps; см. README)",
     )
     p.add_argument(
+        "--listener-idle-recycle-sec",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Экспериментально: перезапускать pynput после N с без событий хоткея (0 = выключить). "
+        "По умолчанию выкл; на macOS может ломать сочетание — не используй без необходимости.",
+    )
+    p.add_argument(
         "--enroll-speaker",
         metavar="WAV",
         default=None,
@@ -1740,9 +3048,22 @@ def main() -> int:
         type=float,
         default=None,
         metavar="0.0-1.0",
-        help="Порог косинусного сходства (по умолчанию из WHISPER_SPEAKER_THRESHOLD или 0.72)",
+        help="Порог косинусного сходства (по умолчанию из WHISPER_SPEAKER_THRESHOLD или 0.70)",
     )
-    args = p.parse_args()
+    args, _unknown_argv = p.parse_known_args()
+    if _unknown_argv:
+        _mac_log(
+            "warning",
+            "лишние argv (часто от Finder/Cocoa), игнорируем: %r",
+            _unknown_argv,
+        )
+
+    if args.listener_idle_recycle_sec is not None:
+        v = float(args.listener_idle_recycle_sec)
+        if v <= 0:
+            os.environ["WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC"] = "0"
+        else:
+            os.environ["WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC"] = str(int(max(60.0, v)))
 
     if not args.enroll_speaker and not args.server:
         p.error("нужен --server (или только --enroll-speaker WAV для эталона голоса)")
@@ -1830,13 +3151,18 @@ def main() -> int:
                 % (os.getpid(), args.server, describe_hotkey(hotkey)),
             ],
             check=False,
+            capture_output=True,
+            timeout=3.0,
         )
         if not sys.stdin.isatty():
             hk = describe_hotkey(hotkey)
-            mac_banner_notification(
-                "Whisper Client",
-                f"Клиент в фоне. Удерживай {hk} — запись; отпусти все клавиши сочетания — распознавание.",
-            )
+            # Асинхронно — не блокируем старт приложения ожиданием whisper_notify/osascript
+            _notif_text = f"Клиент в фоне. Удерживай {hk} — запись; отпусти — распознавание."
+            threading.Thread(
+                target=lambda: mac_banner_notification("Whisper Client", _notif_text),
+                daemon=True,
+                name="whisper-startup-notif",
+            ).start()
 
     use_menu_bar = (
         sys.platform == "darwin"
@@ -1844,6 +3170,34 @@ def main() -> int:
         and not args.no_menu_bar
         and os.environ.get("WHISPER_MAC_NO_MENU") != "1"
     )
+    if use_menu_bar:
+        _pid = os.getpid()
+        _mac_log(
+            "info",
+            "menu_bar_quit_hint pid=%s — в «Завершении программ» не показывается; в Мониторинге ищи «Python» "
+            "с командной строкой whisper-client-mac.py или: pkill -f whisper-client-mac.py",
+            _pid,
+        )
+        print(
+            "[Client] Закрыть клиент: в Терминале  pkill -f whisper-client-mac.py  "
+            f"(pid {_pid}; в окне ⌥⌘⎋ его нет — это нормально для иконки только в меню-баре).",
+            flush=True,
+        )
+        print(
+            "[Client] Либо дважды кликни kill_whisper_client.command: в .app это "
+            "Contents/Resources/ (через «Показать содержимое пакета»), в репо — packaging/mac/.",
+            flush=True,
+        )
+        print(
+            "[Client] Две иконки 🎤 подряд = два запущенных клиента; второй лучше не запускать — "
+            "закрой лишний (pkill) или открой .app один раз.",
+            flush=True,
+        )
+        if os.environ.get("WHISPER_MAC_GUI_PYTHONAPP") == "1":
+            print(
+                "[Client] Запуск через Python.app (из .app) — так строка меню стабильно показывает иконку 🎤.",
+                flush=True,
+            )
     if (
         os.environ.get("WHISPER_FROM_APP_BUNDLE")
         and sys.platform == "darwin"
@@ -1879,6 +3233,11 @@ def main() -> int:
             and os.environ.get("WHISPER_MAC_NO_MENU") != "1"
         ),
     )
+    if os.environ.get("WHISPER_MAC_GUI_PYTHONAPP") == "1":
+        _mac_log(
+            "info",
+            "status_bar_launch_via_python_app=1 (run.sh подставил Python.app для иконки в меню-баре из Finder)",
+        )
 
     if os.environ.get("WHISPER_MAC_NO_SPEAKER_VERIFY", "").strip() == "1":
         spk = False
@@ -1886,6 +3245,50 @@ def main() -> int:
         spk = args.speaker_verify or (
             os.environ.get("WHISPER_SPEAKER_VERIFY", "").strip().lower() in ("1", "true", "yes")
         )
+
+    if use_menu_bar and os.environ.get("WHISPER_MAC_ALLOW_MULTIPLE", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        _ok_lock, _other_hint = _mac_menu_bar_singleton_acquire()
+        if not _ok_lock:
+            _hint_esc = str(_other_hint).replace('"', "'") if _other_hint else ""
+            _pid_apple = (
+                f' & return & return & "Уже работает процесс pid {_hint_esc}."' if _hint_esc else ""
+            )
+            # В AppleScript перенос строки — «return», не \\n внутри литерала.
+            _ascript = (
+                'display dialog "Клиент Whisper уже запущен." & return & return & '
+                '"Вторая копия даёт две иконки 🎤 и клик по меню часто ломается." & return & return & '
+                '"Сначала завершите первый экземпляр: в Терминале выполните" & return & '
+                '"pkill -f whisper-client-mac.py"'
+                f"{_pid_apple} "
+                'with title "Whisper Client" buttons {"OK"} default button 1'
+            )
+            try:
+                subprocess.run(
+                    ["osascript", "-e", _ascript],
+                    check=False,
+                    capture_output=True,
+                    timeout=8.0,
+                )
+            except subprocess.TimeoutExpired:
+                # Без Automation/доступа к «Управлению компьютером» диалог может не появиться — висит до timeout.
+                _mac_log(
+                    "warning",
+                    "menu_bar_singleton_osascript_timeout other_pid_hint=%r — pkill -f whisper-client-mac.py",
+                    _other_hint,
+                )
+                print(
+                    "[Client] Уже запущен другой Whisper (см. лог). Завершить: pkill -f whisper-client-mac.py",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            _mac_log("warning", "menu_bar_singleton_denied other_pid_hint=%r", _other_hint)
+            # exit 2 macOS показывает как «приложение неожиданно завершилось» — здесь это штатный отказ второй копии
+            return 0
+
     client = WhisperClientMac(
         server_url=args.server,
         language=args.language,
@@ -1894,6 +3297,7 @@ def main() -> int:
         speaker_verify=spk,
         speaker_threshold=args.speaker_threshold,
     )
+    _macos_touch_microphone_permission_if_bundle()
     try:
         client.run(menu_bar=use_menu_bar)
     except KeyboardInterrupt:

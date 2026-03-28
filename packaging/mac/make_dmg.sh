@@ -22,7 +22,7 @@ mkdir -p "$OUTDIR"
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/whisper-dmg.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 cp -R "$APP" "$STAGING/"
-ln -sf /Applications "$STAGING/Applications"
+# Ссылку на /Applications добавляет сам create-dmg (--app-drop-link); второй ln даёт «File exists».
 
 rm -f "$DMG"
 create-dmg \

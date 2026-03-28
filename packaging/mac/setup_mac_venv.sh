@@ -26,6 +26,9 @@ fi
 source "$ROOT/.venv/bin/activate"
 python -m pip install -U pip wheel
 pip install -r "$ROOT/packaging/requirements-mac-client.txt"
+# На Python 3.10+ пакет typing из PyPI ломает stdlib typing, если site-packages идёт первым в PYTHONPATH
+# (как при запуске .app через Python.app). Удаляем, если случайно подтянулся транзитивно.
+pip uninstall -y typing >/dev/null 2>&1 || true
 
 echo ""
 echo "Готово."

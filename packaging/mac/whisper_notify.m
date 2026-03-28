@@ -50,38 +50,50 @@ static void deliverDeprecatedBanner(NSString *title, NSString *body) {
 }
 
 /*
- * 0 = запрос уведомлений поставлен в очередь (или доставлен)
+ * 0 = уведомление поставлено в очередь
  * 1 = не удалось (Python вызовет osascript display notification)
+ *
+ * ВАЖНО: completionHandler у requestAuthorizationWithOptions: вызывается на main queue.
+ * Если заблокировать main thread через dispatch_semaphore_wait — DEADLOCK.
+ * Решение: крутим RunLoop руками (0.1 с итераций) до получения ответа или таймаута 5 с.
  */
 static int deliverUserNotifications(NSString *title, NSString *body) {
 	__block int result = 1;
-	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+	__block BOOL done = NO;
+
 	UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
 	[center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
-	                          completionHandler:^(BOOL granted, NSError *err) {
-		                          if (!granted) {
-			                          (void)err;
-			                          dispatch_semaphore_signal(sem);
-			                          return;
-		                          }
-		                          UNMutableNotificationContent *c = [[UNMutableNotificationContent alloc] init];
-		                          c.title = title;
-		                          c.body = body;
-		                          UNTimeIntervalNotificationTrigger *tr =
-		                              [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.02
-		                                                                                  repeats:NO];
-		                          NSString *nid = [[NSUUID UUID] UUIDString];
-		                          UNNotificationRequest *req =
-		                              [UNNotificationRequest requestWithIdentifier:nid content:c trigger:tr];
-		                          [center addNotificationRequest:req
-		                                   withCompletionHandler:^(NSError *e2) {
-			                                   if (e2 == nil) {
-				                                   result = 0;
-			                                   }
-			                                   dispatch_semaphore_signal(sem);
-		                                   }];
-	                          }];
-	dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+	                      completionHandler:^(BOOL granted, NSError *err) {
+		                      (void)err;
+		                      if (!granted) {
+			                      done = YES;
+			                      return;
+		                      }
+		                      UNMutableNotificationContent *c = [[UNMutableNotificationContent alloc] init];
+		                      c.title = title;
+		                      c.body = body;
+		                      UNTimeIntervalNotificationTrigger *tr =
+		                          [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.02
+		                                                                              repeats:NO];
+		                      NSString *nid = [[NSUUID UUID] UUIDString];
+		                      UNNotificationRequest *req =
+		                          [UNNotificationRequest requestWithIdentifier:nid content:c trigger:tr];
+		                      [center addNotificationRequest:req
+		                               withCompletionHandler:^(NSError *e2) {
+			                               if (e2 == nil)
+				                               result = 0;
+			                               done = YES;
+		                               }];
+	                      }];
+
+	/* Крутим RunLoop — даём completionHandler вернуться в main queue (≤ 5 с). */
+	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+	while (!done) {
+		if ([[NSDate date] compare:deadline] != NSOrderedAscending)
+			break;
+		[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+		                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+	}
 	return result;
 }
 
