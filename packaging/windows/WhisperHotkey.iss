@@ -3,7 +3,7 @@
 
 #define MyAppName "Whisper Hotkey"
 #ifndef MyAppVersion
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.2"
 #endif
 #define MyAppPublisher "Whisper"
 #define MyAppExeName "WhisperHotkey.exe"
