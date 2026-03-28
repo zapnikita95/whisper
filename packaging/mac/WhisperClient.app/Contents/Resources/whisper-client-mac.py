@@ -605,7 +605,11 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
     rel = fetch_latest_release()
     if rel is None:
         if notify_always:
-            mac_banner_notification("Whisper", "Не удалось связаться с GitHub (сеть или лимит API).")
+            mac_banner_notification(
+                "Whisper",
+                "GitHub недоступен (лимит ~60 запросов/ч или сеть). "
+                "Попробуй позже или задай WHISPER_GITHUB_TOKEN.",
+            )
         _mac_log("warning", "update_check_no_release_response")
         return
     tag = (rel.get("tag_name") or "").strip()
@@ -1130,9 +1134,22 @@ class _InProcessCGEventTap:
         return True
 
     def force_release_pressed(self) -> None:
-        """После Cmd+V / долгой обработки флаги модификаторов могут не дать UP — сбрасываем модель."""
+        """После Cmd+V / долгой обработки флаги модификаторов могут не дать UP — сбрасываем модель.
+
+        CGEventPost при вставке может отключить наш tap (kCGEventTapDisabledByUserInput).
+        Первое нажатие хоткея после вставки поглощается callback'ом повторного включения и не
+        вызывает on_down. Принудительно включаем tap здесь, пока поток transcribe ещё жив.
+        """
         with self._pressed_lock:
             self._pressed = False
+        t = self._tap
+        if t is not None:
+            try:
+                from Quartz import CGEventTapEnable  # type: ignore[import-untyped]
+                CGEventTapEnable(t, True)
+                _mac_log("debug", "in_process_tap_reenabled_post_transcribe")
+            except Exception:
+                pass
 
     def is_running(self) -> bool:
         return (
@@ -2023,6 +2040,26 @@ class WhisperClientMac:
     def _activate_process_by_unix_id(self, uid: int) -> bool:
         if uid <= 0 or uid == os.getpid():
             return False
+
+        # Метод 1: NSRunningApplication.activateWithOptions_ — надёжнее osascript,
+        # не требует Accessibility TCC, не блокируется tccd.
+        try:
+            from AppKit import (  # type: ignore[import-untyped]
+                NSRunningApplication,
+                NSApplicationActivateIgnoringOtherApps,
+            )
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(uid)
+            if app is not None:
+                ok = bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+                if ok:
+                    time.sleep(0.25)
+                    _mac_log("debug", "activate_pid=%s method=NSRunningApplication ok=True", uid)
+                    return True
+                _mac_log("debug", "activate_pid=%s NSRunningApplication ok=False (app hidden?)", uid)
+        except (ImportError, Exception) as _e:
+            _mac_log("debug", "activate_pid=%s NSRunningApplication error=%s", uid, _e)
+
+        # Метод 2: osascript fallback (работает при наличии Accessibility TCC)
         try:
             r = subprocess.run(
                 [
@@ -2037,7 +2074,7 @@ class WhisperClientMac:
             if r.returncode != 0:
                 _mac_log(
                     "warning",
-                    "activate_pid=%s failed code=%s err=%s",
+                    "activate_pid=%s osascript failed code=%s err=%s",
                     uid,
                     r.returncode,
                     (r.stderr or "").strip(),
@@ -2046,7 +2083,7 @@ class WhisperClientMac:
             time.sleep(0.35)
             return True
         except (subprocess.TimeoutExpired, OSError) as e:
-            _mac_log("warning", "activate_pid=%s exception=%s", uid, e)
+            _mac_log("warning", "activate_pid=%s osascript exception=%s", uid, e)
             return False
 
     def _mac_env_truthy(self, name: str) -> bool:
