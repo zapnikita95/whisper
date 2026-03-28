@@ -16,6 +16,7 @@
 osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вставка Cmd+V часто по таймауту.
 Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
 Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
+pynput: WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=1 — принудительный restart tap после каждой вставки (по умолчанию ВЫКЛ — иначе хоткей часто «умирает» после одной записи).
 Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
@@ -966,6 +967,7 @@ class _InProcessCGEventTap:
         self._target_flags = target_flags
         self._reject_flags = reject_flags
         self._pressed = False
+        self._pressed_lock = threading.Lock()
         self._stop = threading.Event()
         self._tap = None          # CGEventTapRef (CFMachPortRef)
         self._runloop = None      # CFRunLoopRef текущего tap-потока
@@ -1048,14 +1050,20 @@ class _InProcessCGEventTap:
                         and (flags & reject) == 0
                     )
 
-                    if combo and not self._pressed:
-                        self._pressed = True
+                    down = up = False
+                    with self._pressed_lock:
+                        if combo and not self._pressed:
+                            self._pressed = True
+                            down = True
+                        elif not combo and self._pressed:
+                            self._pressed = False
+                            up = True
+                    if down:
                         try:
                             self._on_down()
                         except Exception:
                             _MAC_LOGGER.exception("in_process_tap_on_down")
-                    elif not combo and self._pressed:
-                        self._pressed = False
+                    elif up:
                         try:
                             self._on_up()
                         except Exception:
@@ -1120,6 +1128,11 @@ class _InProcessCGEventTap:
         )
         return True
 
+    def force_release_pressed(self) -> None:
+        """После Cmd+V / долгой обработки флаги модификаторов могут не дать UP — сбрасываем модель."""
+        with self._pressed_lock:
+            self._pressed = False
+
     def is_running(self) -> bool:
         return (
             self._thread is not None
@@ -1129,7 +1142,8 @@ class _InProcessCGEventTap:
 
     def stop(self) -> None:
         self._stop.set()
-        self._pressed = False
+        with self._pressed_lock:
+            self._pressed = False
         rl = self._runloop
         if rl is not None:
             try:
@@ -1175,6 +1189,10 @@ class _HotkeyDaemon:
         self._reader_t: threading.Thread | None = None
         self._stop = threading.Event()
         self._binary: Path | None = None
+
+    def force_release_pressed(self) -> None:
+        """Совместимость с _InProcessCGEventTap; состояние в отдельном процессе."""
+        return
 
     # ── Поиск бинаря ──────────────────────────────────────────────────────────
     @classmethod
@@ -1703,6 +1721,16 @@ class WhisperClientMac:
             self._hk_pressed.clear()
             self._hk_combo_active = False
 
+    def _reset_native_hotkey_tap_state(self) -> None:
+        """In-process CGEventTap: иначе _pressed залипает True после одной сессии — второй хоткей молчит."""
+        d = self._hotkey_daemon
+        if d is None:
+            return
+        try:
+            d.force_release_pressed()
+        except Exception:
+            _MAC_LOGGER.debug("reset_native_hotkey_tap_state", exc_info=True)
+
     def _kick_listener_restart(self, *, force: bool = False) -> None:
         """Останавливает текущий Listener; поток _listener_loop поднимет новый tap."""
         if not force and self._run_stop:
@@ -2020,11 +2048,24 @@ class WhisperClientMac:
             _mac_log("warning", "activate_pid=%s exception=%s", uid, e)
             return False
 
-    def _paste_via_system_events(self) -> bool:
-        """Cmd+V через key code 9 (клавиша V), без keystroke — стабильнее при разных раскладках."""
+    def _paste_via_system_events(self, target_unix_pid: int | None = None) -> bool:
+        """Cmd+V: key code 9. С явным unix id процесса — фокус и вставка в нужное приложение (надёжнее глобального tap)."""
         timeout = _mac_osascript_timeout_sec(fallback=18.0)
-        # delay внутри osascript иногда «висит» вместе с tell — делаем паузу в Python.
-        key_script = 'tell application "System Events" to key code 9 using command down'
+        pid = target_unix_pid
+        if pid is not None and (pid <= 0 or pid == os.getpid()):
+            pid = None
+        if pid is not None:
+            key_script = (
+                'tell application "System Events"\n'
+                f"    tell (first process whose unix id is {int(pid)})\n"
+                "        set frontmost to true\n"
+                "        delay 0.18\n"
+                "        key code 9 using command down\n"
+                "    end tell\n"
+                "end tell"
+            )
+        else:
+            key_script = 'tell application "System Events" to key code 9 using command down'
         for attempt in range(1, 4):
             time.sleep(0.18)
             try:
@@ -2103,10 +2144,8 @@ class WhisperClientMac:
         self._record_thread.start()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
 
-        def _snapshot_bg() -> None:
-            self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
-
-        threading.Thread(target=_snapshot_bg, name="whisper-paste-target", daemon=True).start()
+        # Снимок сразу (без фонового потока): иначе к моменту снимка frontmost уже Python/меню.
+        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
 
         def _beep_async() -> None:
             try:
@@ -2169,10 +2208,12 @@ class WhisperClientMac:
                     _work_body(paste_target_pid)
                 finally:
                     self._reset_hotkey_tracker()
+                    self._reset_native_hotkey_tap_state()
                     with self._lock:
                         self._busy = False
-                    # Рестарт tap нужен только при pynput (daemon живёт своей жизнью).
-                    if not self._using_daemon:
+                    # По умолчанию не кикаем pynput после каждой вставки — часто «убивает» хоткей после одной записи.
+                    _kick = (os.environ.get("WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK") or "").strip().lower()
+                    if not self._using_daemon and _kick in ("1", "true", "yes", "on"):
                         self._schedule_listener_kick()
 
         def _work_body(paste_pid: int | None) -> None:
@@ -2351,7 +2392,7 @@ class WhisperClientMac:
                                     self._clipboard_preview(100),
                                 )
                             time.sleep(0.12)
-                            ok = self._paste_via_system_events()
+                            ok = self._paste_via_system_events(paste_pid)
                             paste_ok = bool(ok)
                             if ok:
                                 print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
@@ -2374,6 +2415,7 @@ class WhisperClientMac:
                             _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
                         finally:
                             self._reset_hotkey_tracker()
+                            self._reset_native_hotkey_tap_state()
                         if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
                             prev = text[:130] + ("…" if len(text) > 130 else "")
                             if paste_ok:
