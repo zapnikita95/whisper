@@ -9,3 +9,5 @@ pyperclip>=1.8.2
 rumps>=0.4.0
 # UNUserNotificationCenter из меню-бара (запрос разрешений); иначе «No module named UserNotifications»
 pyobjc-framework-UserNotifications>=10.0
+# Cmd+V fallback через CGEventPost, если osascript не вставляет (без pynput из фонового потока)
+pyobjc-framework-Quartz>=10.0
