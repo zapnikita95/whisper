@@ -8,8 +8,8 @@ APP="$MAC/WhisperClient.app"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 # Универсальный бинарь: коллеги на Intel; при ошибке x86_64 — собери на машине с полным SDK или убери -arch x86_64.
 AH_ARCH_FLAGS="-arch arm64 -arch x86_64"
-# Загрузчик WhisperClient: по умолчанию только arm64 — у части систем fat-binary + adhoc давали сбои TCC при Automation.
-WHISPER_STUB_ARCH_FLAGS="${WHISPER_STUB_ARCH_FLAGS:--arch arm64}"
+# Загрузчик .app: по умолчанию тот же universal, что и раньше. Только Apple Silicon: WHISPER_STUB_ARCH_FLAGS='-arch arm64'
+WHISPER_STUB_ARCH_FLAGS="${WHISPER_STUB_ARCH_FLAGS:-$AH_ARCH_FLAGS}"
 
 echo "Сборка $APP … (MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -30,7 +30,7 @@ chmod +x "$APP/Contents/MacOS/run.sh"
 
 if ! xcrun clang -O2 -Wall -Wextra $WHISPER_STUB_ARCH_FLAGS -o "$APP/Contents/MacOS/WhisperClient" "$MAC/whisper_stub.c"; then
 	echo "Ошибка: нужен Xcode Command Line Tools (clang) для Mach-O загрузчика .app"
-	echo "Intel Mac: export WHISPER_STUB_ARCH_FLAGS='-arch x86_64' или '-arch arm64 -arch x86_64'"
+	echo "Только arm64: export WHISPER_STUB_ARCH_FLAGS='-arch arm64'"
 	exit 1
 fi
 

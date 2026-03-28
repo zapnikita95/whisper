@@ -16,8 +16,8 @@
 osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вставка Cmd+V часто по таймауту.
 Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
 Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
-pynput: WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=1 — принудительный restart tap после каждой вставки (по умолчанию ВЫКЛ — иначе хоткей часто «умирает» после одной записи).
-Вставка: сначала цепочка osascript (key code / keystroke, с PID и без), при провале — Quartz CGEventPost (без pynput из whisper-transcribe — иначе SIGTRAP). WHISPER_MAC_PASTE_QUARTZ_FIRST=1 — сначала только Quartz.
+pynput: по умолчанию после каждого цикла распознавания — отложенный restart tap (иначе после CGEventPost вставки слушатель часто «молчит»). WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=0 — выключить.
+Вставка: по умолчанию сначала Quartz CGEventPost (обходит ошибку 1002 «нажатия для osascript не разрешены»), затем при провале — osascript. WHISPER_MAC_PASTE_OSASCRIPT_FIRST=1 — сначала AppleScript. WHISPER_MAC_PASTE_QUARTZ_ONLY=1 — не вызывать osascript для Cmd+V.
 Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
@@ -2108,10 +2108,19 @@ class WhisperClientMac:
         return False
 
     def _paste_via_system_events(self, target_unix_pid: int | None = None) -> bool:
-        """Цепочка Cmd+V: опционально сначала Quartz, иначе osascript (несколько вариантов), в конце снова Quartz."""
+        """Cmd+V: по умолчанию Quartz (стабильно при запрете keystroke для osascript), иначе цепочка osascript, затем снова Quartz."""
+        osa_first = self._mac_env_truthy("WHISPER_MAC_PASTE_OSASCRIPT_FIRST")
+        quartz_only = self._mac_env_truthy("WHISPER_MAC_PASTE_QUARTZ_ONLY")
+        # Совместимость со старым флагом
         if self._mac_env_truthy("WHISPER_MAC_PASTE_QUARTZ_FIRST"):
+            osa_first = False
+
+        if not osa_first:
             if self._paste_via_quartz_cmd_v():
+                _mac_log("info", "paste_cmd_v_ok method=quartz_first")
                 return True
+            if quartz_only:
+                return False
 
         timeout = _mac_osascript_timeout_sec(fallback=18.0)
         pid = target_unix_pid
@@ -2177,7 +2186,7 @@ class WhisperClientMac:
             if attempt < 3:
                 time.sleep(0.4)
 
-        if not self._mac_env_truthy("WHISPER_MAC_PASTE_QUARTZ_FIRST") and self._paste_via_quartz_cmd_v():
+        if not quartz_only and self._paste_via_quartz_cmd_v():
             _mac_log("info", "paste_cmd_v_ok method=quartz_after_osascript")
             return True
         return False
@@ -2292,9 +2301,9 @@ class WhisperClientMac:
                     self._reset_native_hotkey_tap_state()
                     with self._lock:
                         self._busy = False
-                    # По умолчанию не кикаем pynput после каждой вставки — часто «убивает» хоткей после одной записи.
-                    _kick = (os.environ.get("WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK") or "").strip().lower()
-                    if not self._using_daemon and _kick in ("1", "true", "yes", "on"):
+                    # После Quartz/paste из whisper-transcribe pynput-CGEventTap часто перестаёт ловить хоткей — перезапуск по умолчанию.
+                    _kick_off = (os.environ.get("WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK") or "").strip().lower()
+                    if not self._using_daemon and _kick_off not in ("0", "false", "no", "off"):
                         self._schedule_listener_kick()
 
         def _work_body(paste_pid: int | None) -> None:
