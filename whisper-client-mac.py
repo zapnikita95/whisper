@@ -17,6 +17,7 @@ osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вс
 Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
 Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
 pynput: WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=1 — принудительный restart tap после каждой вставки (по умолчанию ВЫКЛ — иначе хоткей часто «умирает» после одной записи).
+Вставка: сначала цепочка osascript (key code / keystroke, с PID и без), при провале — Quartz CGEventPost (без pynput из whisper-transcribe — иначе SIGTRAP). WHISPER_MAC_PASTE_QUARTZ_FIRST=1 — сначала только Quartz.
 Хоткей по умолчанию без ⌘ (рядом с Portal).
 """
 from __future__ import annotations
@@ -2048,57 +2049,137 @@ class WhisperClientMac:
             _mac_log("warning", "activate_pid=%s exception=%s", uid, e)
             return False
 
+    def _mac_env_truthy(self, name: str) -> bool:
+        return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def _osascript_run(self, script: str, *, timeout: float | None = None) -> tuple[int, str]:
+        to = timeout if timeout is not None else _mac_osascript_timeout_sec(fallback=18.0)
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=to,
+            )
+            err = ((r.stderr or r.stdout or "") or "").strip()
+            return r.returncode, err
+        except subprocess.TimeoutExpired:
+            return -1, "timeout"
+        except OSError as e:
+            return -1, str(e)
+
+    def _paste_via_quartz_cmd_v(self) -> bool:
+        """Cmd+V через CGEventPost — можно из потока transcribe (не трогает TSM/pynput)."""
+        if sys.platform != "darwin":
+            return False
+        try:
+            from Quartz import (  # type: ignore[import-untyped]
+                CGEventCreateKeyboardEvent,
+                CGEventPost,
+                CGEventSetFlags,
+                kCGAnnotatedSessionEventTap,
+                kCGEventFlagMaskCommand,
+                kCGHIDEventTap,
+                kCGSessionEventTap,
+            )
+        except ImportError:
+            _mac_log("debug", "paste_quartz_skip no Quartz / pyobjc-framework-Quartz")
+            return False
+        taps = (
+            kCGAnnotatedSessionEventTap,
+            kCGSessionEventTap,
+            kCGHIDEventTap,
+        )
+        key = 9  # физическая V, не зависит от раскладки
+        for tap in taps:
+            try:
+                for down in (True, False):
+                    ev = CGEventCreateKeyboardEvent(None, key, down)
+                    if ev is None:
+                        raise RuntimeError("CGEventCreateKeyboardEvent returned None")
+                    CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+                    CGEventPost(tap, ev)
+                time.sleep(0.06)
+                _mac_log("info", "paste_quartz_sent tap=%r key=%s", tap, key)
+                return True
+            except Exception:
+                _MAC_LOGGER.debug("paste_quartz_tap_fail", exc_info=True)
+                continue
+        return False
+
     def _paste_via_system_events(self, target_unix_pid: int | None = None) -> bool:
-        """Cmd+V: key code 9. С явным unix id процесса — фокус и вставка в нужное приложение (надёжнее глобального tap)."""
+        """Цепочка Cmd+V: опционально сначала Quartz, иначе osascript (несколько вариантов), в конце снова Quartz."""
+        if self._mac_env_truthy("WHISPER_MAC_PASTE_QUARTZ_FIRST"):
+            if self._paste_via_quartz_cmd_v():
+                return True
+
         timeout = _mac_osascript_timeout_sec(fallback=18.0)
         pid = target_unix_pid
         if pid is not None and (pid <= 0 or pid == os.getpid()):
             pid = None
+
+        scripts: list[tuple[str, str]] = []
         if pid is not None:
-            key_script = (
-                'tell application "System Events"\n'
-                f"    tell (first process whose unix id is {int(pid)})\n"
-                "        set frontmost to true\n"
-                "        delay 0.18\n"
-                "        key code 9 using command down\n"
-                "    end tell\n"
-                "end tell"
-            )
-        else:
-            key_script = 'tell application "System Events" to key code 9 using command down'
-        for attempt in range(1, 4):
-            time.sleep(0.18)
-            try:
-                r = subprocess.run(
-                    ["osascript", "-e", key_script],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
+            p = int(pid)
+            scripts.append(
+                (
+                    "pid_keycode",
+                    (
+                        'tell application "System Events"\n'
+                        f"    tell (first process whose unix id is {p})\n"
+                        "        set frontmost to true\n"
+                        "        delay 0.22\n"
+                        "        key code 9 using command down\n"
+                        "    end tell\n"
+                        "end tell"
+                    ),
                 )
-            except subprocess.TimeoutExpired:
+            )
+            scripts.append(
+                (
+                    "pid_keystroke",
+                    (
+                        'tell application "System Events"\n'
+                        f"    tell (first process whose unix id is {p})\n"
+                        "        set frontmost to true\n"
+                        "        delay 0.22\n"
+                        '        keystroke "v" using command down\n'
+                        "    end tell\n"
+                        "end tell"
+                    ),
+                )
+            )
+        scripts.extend(
+            [
+                ("global_keycode", 'tell application "System Events" to key code 9 using command down'),
+                (
+                    "global_keystroke",
+                    'tell application "System Events" to keystroke "v" using command down',
+                ),
+            ]
+        )
+
+        for attempt in range(1, 4):
+            time.sleep(0.14 if attempt == 1 else 0.22)
+            for method, sc in scripts:
+                code, err = self._osascript_run(sc, timeout=timeout)
+                if code == 0:
+                    _mac_log("info", "paste_cmd_v_ok method=%s attempt=%s", method, attempt)
+                    return True
                 _mac_log(
                     "warning",
-                    "paste_osascript_timeout attempt=%s/%s timeout=%ss (System Events занят или нет доступа Automation)",
+                    "paste_cmd_v_fail method=%s attempt=%s code=%s err=%s",
+                    method,
                     attempt,
-                    3,
-                    timeout,
+                    code,
+                    err[:280] if err else "",
                 )
-                if attempt < 3:
-                    time.sleep(0.45)
-                continue
-            if r.returncode == 0:
-                if attempt > 1:
-                    _mac_log("info", "paste_keycode_ok_after_retry attempt=%s", attempt)
-                return True
-            _mac_log(
-                "warning",
-                "paste_keycode_failed attempt=%s code=%s err=%s",
-                attempt,
-                r.returncode,
-                (r.stderr or "").strip(),
-            )
             if attempt < 3:
-                time.sleep(0.35)
+                time.sleep(0.4)
+
+        if not self._mac_env_truthy("WHISPER_MAC_PASTE_QUARTZ_FIRST") and self._paste_via_quartz_cmd_v():
+            _mac_log("info", "paste_cmd_v_ok method=quartz_after_osascript")
+            return True
         return False
 
     def _record_worker(self, max_duration: float = 120.0) -> None:
@@ -2135,6 +2216,9 @@ class WhisperClientMac:
         self._stop_record.clear()
         self._audio_chunks.clear()
         self._paste_target_unix_id = None
+        # Кто frontmost — до потока записи и микрофона (иначе снимок часто ловит не то окно).
+        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
+
         # Микрофон сразу — до любых afplay/osascript (иначе съедается первое слово).
         self._record_thread = threading.Thread(
             target=self._record_worker,
@@ -2143,9 +2227,6 @@ class WhisperClientMac:
         )
         self._record_thread.start()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
-
-        # Снимок сразу (без фонового потока): иначе к моменту снимка frontmost уже Python/меню.
-        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
 
         def _beep_async() -> None:
             try:
