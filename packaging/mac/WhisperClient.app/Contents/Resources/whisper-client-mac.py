@@ -602,13 +602,14 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
         return
 
     cur = get_version()
-    rel = fetch_latest_release()
+    # notify_always=True → ручная проверка из меню → пропускаем кэш (force=True)
+    rel = fetch_latest_release(force=notify_always)
     if rel is None:
         if notify_always:
             mac_banner_notification(
                 "Whisper",
                 "GitHub недоступен (лимит ~60 запросов/ч или сеть). "
-                "Попробуй позже или задай WHISPER_GITHUB_TOKEN.",
+                "Попробуй позже или задай WHISPER_GITHUB_TOKEN=<token>.",
             )
         _mac_log("warning", "update_check_no_release_response")
         return
@@ -2105,8 +2106,13 @@ class WhisperClientMac:
         except OSError as e:
             return -1, str(e)
 
-    def _paste_via_quartz_cmd_v(self) -> bool:
-        """Cmd+V через CGEventPost — можно из потока transcribe (не трогает TSM/pynput)."""
+    def _paste_via_quartz_cmd_v(self, reactivate_pid: int | None = None) -> bool:
+        """Cmd+V через CGEventPost — можно из потока transcribe (не трогает TSM/pynput).
+
+        reactivate_pid: PID целевого приложения; если задан — перед отправкой кратко
+        переактивируем его, чтобы clipboard+фокус попали туда правильно даже если
+        между первым activate и paste что-то сдвинуло фокус (pbcopy/pbpaste subprocess).
+        """
         if sys.platform != "darwin":
             return False
         try:
@@ -2122,20 +2128,44 @@ class WhisperClientMac:
         except ImportError:
             _mac_log("debug", "paste_quartz_skip no Quartz / pyobjc-framework-Quartz")
             return False
+
+        # Повторная лёгкая активация — pbcopy/pbpaste subprocess-ы могут сбить фокус.
+        if reactivate_pid and reactivate_pid > 0 and reactivate_pid != os.getpid():
+            try:
+                from AppKit import (  # type: ignore[import-untyped]
+                    NSRunningApplication,
+                    NSApplicationActivateIgnoringOtherApps,
+                )
+                app = NSRunningApplication.runningApplicationWithProcessIdentifier_(reactivate_pid)
+                if app is not None:
+                    app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+                    time.sleep(0.15)
+                    _mac_log("debug", "paste_quartz_reactivate pid=%s", reactivate_pid)
+            except Exception:
+                pass
+
+        # kCGHIDEventTap (0) — аппаратный уровень, единственный надёжный для инъекции.
+        # kCGAnnotatedSessionEventTap (2) — предназначен для чтения, а не записи;
+        # CGEventPost туда молча «проваливается» когда нет Input Monitoring.
         taps = (
-            kCGAnnotatedSessionEventTap,
-            kCGSessionEventTap,
-            kCGHIDEventTap,
+            kCGHIDEventTap,              # 0 — аппаратная инъекция
+            kCGSessionEventTap,          # 1 — сессионный уровень
+            kCGAnnotatedSessionEventTap, # 2 — fallback
         )
         key = 9  # физическая V, не зависит от раскладки
         for tap in taps:
             try:
-                for down in (True, False):
-                    ev = CGEventCreateKeyboardEvent(None, key, down)
-                    if ev is None:
-                        raise RuntimeError("CGEventCreateKeyboardEvent returned None")
-                    CGEventSetFlags(ev, kCGEventFlagMaskCommand)
-                    CGEventPost(tap, ev)
+                ev_down = CGEventCreateKeyboardEvent(None, key, True)
+                if ev_down is None:
+                    raise RuntimeError("CGEventCreateKeyboardEvent returned None")
+                CGEventSetFlags(ev_down, kCGEventFlagMaskCommand)
+                CGEventPost(tap, ev_down)
+                time.sleep(0.02)  # пауза между down и up (имитация реального нажатия)
+                ev_up = CGEventCreateKeyboardEvent(None, key, False)
+                if ev_up is None:
+                    raise RuntimeError("CGEventCreateKeyboardEvent(up) returned None")
+                CGEventSetFlags(ev_up, kCGEventFlagMaskCommand)
+                CGEventPost(tap, ev_up)
                 time.sleep(0.06)
                 _mac_log("info", "paste_quartz_sent tap=%r key=%s", tap, key)
                 return True
@@ -2153,7 +2183,7 @@ class WhisperClientMac:
             osa_first = False
 
         if not osa_first:
-            if self._paste_via_quartz_cmd_v():
+            if self._paste_via_quartz_cmd_v(reactivate_pid=target_unix_pid):
                 _mac_log("info", "paste_cmd_v_ok method=quartz_first")
                 return True
             if quartz_only:
@@ -2223,7 +2253,7 @@ class WhisperClientMac:
             if attempt < 3:
                 time.sleep(0.4)
 
-        if not quartz_only and self._paste_via_quartz_cmd_v():
+        if not quartz_only and self._paste_via_quartz_cmd_v(reactivate_pid=target_unix_pid):
             _mac_log("info", "paste_cmd_v_ok method=quartz_after_osascript")
             return True
         return False
