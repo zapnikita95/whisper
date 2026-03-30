@@ -19,6 +19,9 @@ osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вс
 pynput: по умолчанию после каждого цикла распознавания — отложенный restart tap (иначе после CGEventPost вставки слушатель часто «молчит»). WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=0 — выключить.
 Вставка: по умолчанию сначала Quartz CGEventPost (обходит ошибку 1002 «нажатия для osascript не разрешены»), затем при провале — osascript. WHISPER_MAC_PASTE_OSASCRIPT_FIRST=1 — сначала AppleScript. WHISPER_MAC_PASTE_QUARTZ_ONLY=1 — не вызывать osascript для Cmd+V.
 Хоткей по умолчанию без ⌘ (рядом с Portal).
+Проверка обновлений GitHub: при старте читается .env из каталога скрипта (в .app — Contents/Resources) и из
+~/Library/Application Support/WhisperClient/.env (второй перекрывает первый). Задай GITHUB_TOKEN или WHISPER_GITHUB_TOKEN.
+Установка из DMG: права Privacy привязаны к пути к .app — отдельно от копии в packaging/mac (см. комментарии в packaging/mac/run.sh).
 """
 from __future__ import annotations
 
@@ -42,6 +45,39 @@ from pathlib import Path
 _rp = Path(__file__).resolve().parent
 if str(_rp) not in sys.path:
     sys.path.insert(0, str(_rp))
+
+
+def _load_whisper_mac_env_files() -> None:
+    """Читает KEY=VALUE из .env без зависимостей (GITHUB_TOKEN, WHISPER_GITHUB_TOKEN, …).
+
+    Порядок (последний перекрывает): рядом со скриптом (в .app это Contents/Resources),
+    затем ~/Library/Application Support/WhisperClient/.env — удобно для копии из DMG в /Applications,
+    когда в бандл не кладут секреты.
+    """
+    paths: list[Path] = [
+        _rp / ".env",
+        Path.home() / "Library" / "Application Support" / "WhisperClient" / ".env",
+    ]
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            if k:
+                os.environ[k] = v
 
 # macOS: TSM/HIToolbox (раскладка) нельзя дёргать из фонового потока — иначе SIGTRAP в dispatch_assert_queue.
 # Сброс модификаторов через pynput уходит в CGEvent/TSM; выполняем с main thread (rumps) или с потока listener.
@@ -3140,9 +3176,12 @@ else:
 
 
 def main() -> int:
+    _load_whisper_mac_env_files()
     log_path = configure_whisper_mac_logging()
     ingest_macos_python_crash_reports_into_log()
     _mac_log("info", "=== старт whisper-client-mac ===")
+    if (os.environ.get("WHISPER_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip():
+        _mac_log("info", "github_token_loaded_for_updates=yes")
     try:
         _check_pynput_py313()
     except SystemExit as e:

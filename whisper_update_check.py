@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+_LOG = logging.getLogger("whisper_update_check")
 
 # TTL кэша: 1 час для автоматических проверок, 5 мин для ручных
 _CACHE_TTL_AUTO = 3600.0
@@ -100,12 +103,25 @@ def fetch_latest_release(*, force: bool = False) -> dict[str, Any] | None:
             _write_cache(release)
             return release
     except urllib.error.HTTPError as e:
+        has_token = bool(
+            (os.environ.get("WHISPER_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+        )
         if e.code == 403:
+            _LOG.warning(
+                "github_releases_http_403 (rate limit или нет прав; токен в env: %s)",
+                "да" if has_token else "нет — задай GITHUB_TOKEN в .env или Application Support",
+            )
             # Rate limit — отдаём кэш если есть
             cached = _read_cache()
             if cached and isinstance(cached, dict) and cached.get("release"):
                 return cached["release"]
-        # 404 = нет релизов или приватный репо без токена
+        elif e.code == 404:
+            _LOG.warning(
+                "github_releases_http_404 (нет latest или приватный репо без токена; токен: %s)",
+                "да" if has_token else "нет",
+            )
+        else:
+            _LOG.warning("github_releases_http_%s", e.code)
         return None
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
         # Сеть недоступна — отдаём кэш

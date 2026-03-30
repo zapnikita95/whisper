@@ -43,6 +43,16 @@ R="$(cd "$MACOS_DIR/../Resources" 2>/dev/null && pwd)" || R=""
 R="${R//$'\r'/}"
 [ -n "$R" ] || _ah_die_resources "FAIL cd Resources MACOS_DIR=$MACOS_DIR"
 [ -f "$R/whisper-client-mac.py" ] || _ah_die_resources "FAIL missing $R/whisper-client-mac.py"
+
+# DMG vs локальная сборка (почему «из packaging/mac работает, из /Applications — нет»):
+# macOS Privacy (TCC) привязан к *пути к .app* и к подписи бинарника. Копия из Desktop и копия
+# из DMG в /Applications — для системы разные приложения: разрешения нужно выдать каждой копии.
+# После установки из DMG: Системные настройки → Конфиденциальность → Микрофон / Ввод с клавиатуры /
+# Универсальный доступ — добавь именно WhisperClient из Программ (или сброс: packaging/mac/reset_whisper_client_privacy.command).
+#
+# GITHUB_TOKEN для проверки обновлений: положи файл .env в одно из мест (Python подхватит при старте):
+#   "$R/.env"  (рядом с whisper-client-mac.py внутри .app), или
+#   "$HOME/Library/Application Support/WhisperClient/.env"  (предпочтительно для DMG — не трогает бандл).
 # Репо: WhisperClient.app в packaging/mac/ → от Contents/MacOS пять уровней вверх = корень (там .venv/bin/python3)
 if [ -z "${WHISPER_PYTHON3:-}" ]; then
 	_REPO_ROOT=""
