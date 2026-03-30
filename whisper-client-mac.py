@@ -47,24 +47,49 @@ if str(_rp) not in sys.path:
     sys.path.insert(0, str(_rp))
 
 
-def _load_whisper_mac_env_files() -> None:
+def _load_whisper_mac_env_files() -> list[Path]:
     """Читает KEY=VALUE из .env без зависимостей (GITHUB_TOKEN, WHISPER_GITHUB_TOKEN, …).
 
-    Порядок (последний перекрывает): рядом со скриптом (в .app это Contents/Resources),
-    затем ~/Library/Application Support/WhisperClient/.env — удобно для копии из DMG в /Applications,
-    когда в бандл не кладут секреты.
+    Порядок (каждый следующий файл перекрывает ключи предыдущего):
+    1) Contents/Resources/.env (внутри .app)
+    2) .env в родителях каталога Resources (до 16 уровней) — так подхватывается
+       …/whisper/.env при запуске packaging/mac/WhisperClient.app из репозитория
+    3) ~/Library/Application Support/WhisperClient/.env (удобно для копии из DMG в /Applications)
+
+    Возвращает список реально прочитанных файлов (для лога).
     """
-    paths: list[Path] = [
-        _rp / ".env",
-        Path.home() / "Library" / "Application Support" / "WhisperClient" / ".env",
-    ]
-    for p in paths:
+    seen_resolved: set[Path] = set()
+    to_read: list[Path] = []
+
+    def _queue(p: Path) -> None:
         if not p.is_file():
-            continue
+            return
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen_resolved:
+            return
+        seen_resolved.add(key)
+        to_read.append(p)
+
+    _queue(_rp / ".env")
+    cur = _rp
+    for _ in range(16):
+        cur = cur.parent
+        if cur == cur.parent:
+            break
+        _queue(cur / ".env")
+
+    _queue(Path.home() / "Library" / "Application Support" / "WhisperClient" / ".env")
+
+    loaded: list[Path] = []
+    for p in to_read:
         try:
             raw = p.read_text(encoding="utf-8")
         except OSError:
             continue
+        loaded.append(p)
         for line in raw.splitlines():
             s = line.strip()
             if not s or s.startswith("#"):
@@ -78,6 +103,7 @@ def _load_whisper_mac_env_files() -> None:
                 v = v[1:-1]
             if k:
                 os.environ[k] = v
+    return loaded
 
 # macOS: TSM/HIToolbox (раскладка) нельзя дёргать из фонового потока — иначе SIGTRAP в dispatch_assert_queue.
 # Сброс модификаторов через pynput уходит в CGEvent/TSM; выполняем с main thread (rumps) или с потока listener.
@@ -245,11 +271,18 @@ def configure_whisper_mac_logging() -> Path:
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
     _MAC_LOGGER.addHandler(fh)
+    # Модуль whisper_update_check логирует сюда же (иначе WARNING про GitHub API не попадали в файл)
+    _upd = logging.getLogger("whisper_update_check")
+    _upd.handlers.clear()
+    _upd.setLevel(logging.DEBUG)
+    _upd.addHandler(fh)
+    _upd.propagate = False
     if sys.stdout.isatty():
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
         sh.setLevel(logging.INFO)
         _MAC_LOGGER.addHandler(sh)
+        _upd.addHandler(sh)
 
     _LOG_PATH = log_path if fh is not None and isinstance(fh, _FlushingFileHandler) else None
 
@@ -3176,12 +3209,16 @@ else:
 
 
 def main() -> int:
-    _load_whisper_mac_env_files()
+    _dotenv_loaded = _load_whisper_mac_env_files()
     log_path = configure_whisper_mac_logging()
     ingest_macos_python_crash_reports_into_log()
     _mac_log("info", "=== старт whisper-client-mac ===")
+    if _dotenv_loaded:
+        _mac_log("info", "dotenv_files_loaded count=%s paths=%s", len(_dotenv_loaded), [str(p) for p in _dotenv_loaded])
     if (os.environ.get("WHISPER_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip():
-        _mac_log("info", "github_token_loaded_for_updates=yes")
+        _mac_log("info", "github_token_present_for_updates=yes")
+    else:
+        _mac_log("warning", "github_token_present_for_updates=no — проверка релизов без токена (лимит API)")
     try:
         _check_pynput_py313()
     except SystemExit as e:

@@ -109,6 +109,8 @@ jobs:
         run: ./packaging/build_mac_app.sh
 
       - name: DMG
+        env:
+          WHISPER_DMG_SKIP_APP_BUILD: "1"
         run: |
           brew install create-dmg
           ./packaging/mac/make_dmg.sh "$VERSION"
