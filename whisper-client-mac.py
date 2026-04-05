@@ -16,6 +16,9 @@
 osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вставка Cmd+V часто по таймауту.
 Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
 Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
+Там же: режим текста (вставка / только буфер / только история), лимит длины записи, пропуск GET /, история расшифровок (~/.whisper/mac_transcription_history.json).
+Транскрипция: меню «Транскрипция» или transcribe_backend в ~/.whisper/mac_client_prefs.json — только сервер, только Groq, или фоллбэк. Ключ Groq: меню «Groq API ключ…» (сохраняется в mac_client_prefs.json) или GROQ_API_KEY / WHISPER_GROQ_API_KEY в .env (env имеет приоритет). Модель: GROQ_TRANSCRIPTION_MODEL; при 403 — автоповтор whisper-large-v3-turbo. Цепочка: WHISPER_MAC_TRANSCRIBE_BACKEND или WHISPER_TRANSCRIBE_BACKEND.
+Снимок frontmost для Cmd+V: сначала NSWorkspace (быстро), без блокирующего osascript до старта микрофона.
 pynput: по умолчанию после каждого цикла распознавания — отложенный restart tap (иначе после CGEventPost вставки слушатель часто «молчит»). WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=0 — выключить.
 Вставка: по умолчанию сначала Quartz CGEventPost (обходит ошибку 1002 «нажатия для osascript не разрешены»), затем при провале — osascript. WHISPER_MAC_PASTE_OSASCRIPT_FIRST=1 — сначала AppleScript. WHISPER_MAC_PASTE_QUARTZ_ONLY=1 — не вызывать osascript для Cmd+V.
 Хоткей по умолчанию без ⌘ (рядом с Portal).
@@ -41,6 +44,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _rp = Path(__file__).resolve().parent
 if str(_rp) not in sys.path:
@@ -55,6 +59,8 @@ def _load_whisper_mac_env_files() -> list[Path]:
     2) .env в родителях каталога Resources (до 16 уровней) — так подхватывается
        …/whisper/.env при запуске packaging/mac/WhisperClient.app из репозитория
     3) ~/Library/Application Support/WhisperClient/.env (удобно для копии из DMG в /Applications)
+
+    Пустое значение KEY= в более позднем файле не затирает уже заданный KEY из более раннего (важно для GROQ_API_KEY).
 
     Возвращает список реально прочитанных файлов (для лога).
     """
@@ -100,8 +106,9 @@ def _load_whisper_mac_env_files() -> list[Path]:
             k = k.strip()
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                v = v[1:-1]
-            if k:
+                v = v[1:-1].strip()
+            # Пустое значение не затирает ключ из предыдущего файла (частый кейс: пустой GROQ_API_KEY= в Application Support/.env).
+            if k and v:
                 os.environ[k] = v
     return loaded
 
@@ -131,6 +138,12 @@ except ImportError:
     rumps = None  # type: ignore[misc, assignment]
 
 try:
+    from whisper_groq import (
+        post_groq_audio_transcription,
+        resolve_groq_api_key,
+        resolve_transcribe_backend_mode,
+        transcribe_backend_order,
+    )
     import requests
     import sounddevice as sd
     import numpy as np
@@ -606,16 +619,31 @@ def _mac_notify_progress(body: str) -> None:
     mac_banner_notification("Whisper", body)
 
 
-_MAC_CLIENT_PREF_KEYS = frozenset(
-    {"health_timeout", "transcribe_timeout", "transcribe_connect_timeout", "speaker_threshold"}
+_MAC_CLIENT_PREF_FLOAT_KEYS = frozenset(
+    {
+        "health_timeout",
+        "transcribe_timeout",
+        "transcribe_connect_timeout",
+        "speaker_threshold",
+        "max_record_seconds",
+    }
 )
+_MAC_CLIENT_PREF_STR_KEYS = frozenset({"paste_mode", "transcribe_backend", "groq_api_key"})
+_MAC_CLIENT_PREF_BOOL_KEYS = frozenset({"skip_health_check"})
+_MAC_CLIENT_PREF_KEYS = _MAC_CLIENT_PREF_FLOAT_KEYS | _MAC_CLIENT_PREF_STR_KEYS | _MAC_CLIENT_PREF_BOOL_KEYS
+
+_MAC_HISTORY_LOCK = threading.Lock()
 
 
 def _mac_client_prefs_path() -> Path:
     return Path.home() / ".whisper" / "mac_client_prefs.json"
 
 
-def load_mac_client_prefs() -> dict[str, float]:
+def _mac_transcription_history_path() -> Path:
+    return Path.home() / ".whisper" / "mac_transcription_history.json"
+
+
+def load_mac_client_prefs() -> dict[str, Any]:
     path = _mac_client_prefs_path()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -623,20 +651,32 @@ def load_mac_client_prefs() -> dict[str, float]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, float] = {}
+    out: dict[str, Any] = {}
     for k in _MAC_CLIENT_PREF_KEYS:
         if k not in raw:
             continue
-        try:
-            out[k] = float(raw[k])
-        except (TypeError, ValueError):
-            continue
+        v = raw[k]
+        if k in _MAC_CLIENT_PREF_FLOAT_KEYS:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+        elif k in _MAC_CLIENT_PREF_STR_KEYS:
+            if isinstance(v, str):
+                out[k] = v.strip()
+        elif k in _MAC_CLIENT_PREF_BOOL_KEYS:
+            if isinstance(v, bool):
+                out[k] = v
+            elif isinstance(v, (int, float)):
+                out[k] = bool(v)
+            elif isinstance(v, str):
+                out[k] = v.strip().lower() in ("1", "true", "yes", "on")
     return out
 
 
-def merge_mac_client_prefs(updates: dict[str, float | None]) -> None:
+def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
     path = _mac_client_prefs_path()
-    cur: dict[str, object] = {}
+    cur: dict[str, Any] = {}
     try:
         if path.is_file():
             cur = json.loads(path.read_text(encoding="utf-8"))
@@ -649,13 +689,234 @@ def merge_mac_client_prefs(updates: dict[str, float | None]) -> None:
             continue
         if v is None:
             cur.pop(k, None)
-        else:
+        elif k in _MAC_CLIENT_PREF_FLOAT_KEYS:
             try:
                 cur[k] = float(v)
             except (TypeError, ValueError):
                 continue
+        elif k in _MAC_CLIENT_PREF_STR_KEYS:
+            s = str(v).strip()
+            if k == "paste_mode" and s not in ("auto", "clipboard", "history_only"):
+                continue
+            if k == "transcribe_backend" and s not in (
+                "server",
+                "groq",
+                "server_then_groq",
+                "groq_then_server",
+            ):
+                continue
+            if k == "groq_api_key":
+                if not s:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = s
+                continue
+            cur[k] = s
+        elif k in _MAC_CLIENT_PREF_BOOL_KEYS:
+            if isinstance(v, bool):
+                cur[k] = v
+            else:
+                cur[k] = str(v).strip().lower() in ("1", "true", "yes", "on")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
+    """Без утечки groq_api_key в лог."""
+    out = dict(prefs)
+    if "groq_api_key" in out and out["groq_api_key"]:
+        out["groq_api_key"] = "(задан)"
+    return out
+
+
+def _mac_osascript_prompt_groq_key() -> str | None:
+    """Диалог ввода ключа Groq; None = отмена; пустая строка = очистить не вызывается здесь."""
+    import subprocess
+
+    script = r'''
+try
+    set r to text returned of (display dialog "Вставь API-ключ Groq (gsk_…). Ок — сохранить в настройках клиента (файл ~/.whisper/mac_client_prefs.json)." default answer "" with title "Whisper — Groq" buttons {"Отмена", "Сохранить"} default button "Сохранить")
+    return r
+on error number -128
+    return "__CANCEL__"
+end try
+'''
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _mac_log("warning", "groq_key_dialog_failed err=%s", e)
+        return None
+    if proc.returncode != 0:
+        _mac_log("warning", "groq_key_dialog code=%s err=%r", proc.returncode, (proc.stderr or "")[:200])
+        return None
+    t = (proc.stdout or "").strip()
+    if t == "__CANCEL__":
+        return None
+    return t
+
+
+def _history_preview_title(text: str, max_len: int = 56) -> str:
+    one = " ".join(text.replace("\r\n", "\n").replace("\r", "\n").split())
+    if not one:
+        return "(пусто)"
+    if len(one) > max_len:
+        return one[: max_len - 1] + "…"
+    return one
+
+
+def load_mac_transcription_history(limit: int = 200) -> list[dict[str, Any]]:
+    path = _mac_transcription_history_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict) and isinstance(raw.get("items"), list):
+        items = raw["items"]
+    else:
+        return []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = it.get("text")
+        if not isinstance(t, str) or not t.strip():
+            continue
+        ts = it.get("ts")
+        try:
+            ts_f = float(ts) if ts is not None else 0.0
+        except (TypeError, ValueError):
+            ts_f = 0.0
+        out.append({"ts": ts_f, "text": t})
+    out.sort(key=lambda x: float(x.get("ts") or 0.0), reverse=True)
+    return out[:limit]
+
+
+def append_mac_transcription_history(text: str) -> None:
+    if not text.strip():
+        return
+    path = _mac_transcription_history_path()
+    with _MAC_HISTORY_LOCK:
+        cur = load_mac_transcription_history(limit=500)
+        cur.insert(0, {"ts": time.time(), "text": text})
+        cur = cur[:200]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"items": cur}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _download_release_dmg(url: str, dest: Path) -> None:
+    """Скачивание DMG: requests (нормальные CA на Mac), иначе urllib."""
+    try:
+        import requests
+
+        with requests.get(
+            url,
+            headers={"User-Agent": "WhisperMacClient/1.0"},
+            timeout=(60, 600),
+            stream=True,
+        ) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as out:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        out.write(chunk)
+        return
+    except ImportError:
+        pass
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "WhisperMacClient/1.0"})
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        dest.write_bytes(resp.read())
+
+
+_WHISPER_UN_DELEGATE_HOLDER: list[Any] = []
+
+
+def _ensure_whisper_un_for_updates() -> None:
+    """Один раз: delegate + категория с кнопкой «Скачать DMG» для уведомлений об обновлении."""
+    if sys.platform != "darwin" or _WHISPER_UN_DELEGATE_HOLDER:
+        return
+    try:
+        from Foundation import NSObject, NSSet  # type: ignore[import-untyped]
+        import UserNotifications as UN  # type: ignore[import]
+
+        class _WhisperUpdateUNDelegate(NSObject):  # type: ignore[misc, valid-type]
+            def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(
+                self, center, response, handler
+            ) -> None:
+                try:
+                    aid = str(response.actionIdentifier())
+                    default_id = str(UN.UNNotificationDefaultActionIdentifier)
+                    if aid == "WHISPER_DL_DMG" or aid == default_id:
+                        threading.Thread(
+                            target=lambda: run_mac_update_flow(notify_always=True),
+                            name="whisper-update-dmg",
+                            daemon=True,
+                        ).start()
+                finally:
+                    if handler:
+                        handler()
+
+        center = UN.UNUserNotificationCenter.currentNotificationCenter()
+        act = UN.UNNotificationAction.actionWithIdentifier_title_options_(
+            "WHISPER_DL_DMG",
+            "Скачать DMG",
+            0,
+        )
+        cat = UN.UNNotificationCategory.categoryWithIdentifier_actionsIntentIdentifiers_options_(
+            "WHISPER_UPDATE_CAT",
+            [act],
+            [],
+            0,
+        )
+        center.setNotificationCategories_(NSSet.setWithArray_([cat]))
+        del_obj = _WhisperUpdateUNDelegate.alloc().init()
+        center.setDelegate_(del_obj)
+        _WHISPER_UN_DELEGATE_HOLDER.append(del_obj)
+        _mac_log("info", "whisper_un_update_category_registered")
+    except Exception as e:
+        _mac_log("debug", "whisper_un_delegate_skip err=%s", e)
+
+
+def _post_update_available_notification(tag: str, rel: dict[str, Any]) -> None:
+    """Пуш о новом релизе с действием «Скачать DMG» (UserNotifications); иначе обычный баннер."""
+    body_plain = f"Доступна версия {tag}. Меню → Проверить обновления…"
+    if sys.platform != "darwin":
+        mac_banner_notification("Whisper", body_plain)
+        return
+    _ensure_whisper_un_for_updates()
+    try:
+        import UserNotifications as UN  # type: ignore[import]
+
+        center = UN.UNUserNotificationCenter.currentNotificationCenter()
+        content = UN.UNMutableNotificationContent.alloc().init()
+        content.title = "Whisper — новая версия"
+        content.body = f"Вышла {tag}. Нажми «Скачать DMG»."
+        content.categoryIdentifier = "WHISPER_UPDATE_CAT"
+        content.sound = UN.UNNotificationSound.defaultSound()
+        trig = UN.UNTimeIntervalNotificationTrigger.triggerWithTimeInterval_repeats_(0.05, False)
+        nid = f"whisper-update-{tag}-{time.time():.0f}"
+        req = UN.UNNotificationRequest.requestWithIdentifier_content_trigger_(nid, content, trig)
+
+        def _added(_e: object) -> None:
+            if _e is not None:
+                _mac_log("warning", "whisper_un_add_notification_err %s", _e)
+
+        center.addNotificationRequest_withCompletionHandler_(req, _added)
+        _mac_log("info", "whisper_un_update_posted tag=%s", tag)
+    except Exception as e:
+        _mac_log("debug", "whisper_un_post_fallback err=%s", e)
+        mac_banner_notification("Whisper", body_plain)
 
 
 def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool = False) -> None:
@@ -664,7 +925,7 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
     import webbrowser
 
     try:
-        from whisper_update_check import fetch_latest_release, is_remote_newer, pick_asset_url
+        from whisper_update_check import fetch_latest_release, is_remote_newer, pick_asset_url, releases_repo
         from whisper_version import get_version
     except ImportError:
         mac_banner_notification("Whisper", "Обнови WhisperClient.app (нет модулей версии/обновлений).")
@@ -675,10 +936,14 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
     rel = fetch_latest_release(force=notify_always)
     if rel is None:
         if notify_always:
+            try:
+                webbrowser.open(f"https://github.com/{releases_repo()}/releases/latest")
+            except Exception:
+                pass
             mac_banner_notification(
                 "Whisper",
-                "GitHub недоступен (лимит ~60 запросов/ч или сеть). "
-                "Попробуй позже или задай WHISPER_GITHUB_TOKEN=<token>.",
+                "Не удалось проверить релиз автоматически — открыта страница релизов в браузере. "
+                "Скачай DMG вручную (или поставь requests: pip install requests).",
             )
         _mac_log("warning", "update_check_no_release_response")
         return
@@ -688,10 +953,7 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
             mac_banner_notification("Whisper", f"Установлена актуальная версия ({cur}).")
         return
     if notify_newer_only and not notify_always:
-        mac_banner_notification(
-            "Whisper",
-            f"Доступна версия {tag}. Меню → Проверить обновления…",
-        )
+        _post_update_available_notification(tag, rel)
         return
     picked = pick_asset_url(rel, suffix=".dmg", contains="whisperclient")
     html = (rel.get("html_url") or "").strip() or "https://github.com/zapnikita95/whisper/releases"
@@ -713,9 +975,7 @@ def run_mac_update_flow(*, notify_always: bool = False, notify_newer_only: bool 
     name, url = picked
     dest = Path.home() / "Downloads" / name
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "WhisperMacClient/1.0"})
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            dest.write_bytes(resp.read())
+        _download_release_dmg(url, dest)
         mac_banner_notification(
             "Whisper",
             f"Скачано {dest.name} — открой DMG и перетащи Whisper Client в Программы.",
@@ -741,9 +1001,10 @@ def tray_icon_path() -> str | None:
         p = here / name
         if p.is_file():
             return str(p)
-    assets = here.parent / "assets" / "AppIcon.icns"
-    if assets.is_file():
-        return str(assets)
+    for name in ("AppIcon.icns", "AppIcon.png"):
+        p = here.parent / "assets" / name
+        if p.is_file():
+            return str(p)
     return None
 
 
@@ -1574,6 +1835,12 @@ class WhisperClientMac:
         self._pref_transcribe_timeout: float | None = None
         self._pref_transcribe_connect_timeout: float | None = None
         self._pref_speaker_threshold: float | None = None
+        self._pref_paste_mode: str | None = None
+        self._pref_max_record_seconds: float | None = None
+        self._pref_skip_health_check: bool | None = None
+        self._pref_transcribe_backend: str | None = None
+        self._pref_groq_api_key: str | None = None
+        self._menu_bar_ref: Any = None
         self._reload_mac_prefs_from_disk()
 
     def _reload_mac_prefs_from_disk(self) -> None:
@@ -1582,11 +1849,26 @@ class WhisperClientMac:
         self._pref_transcribe_timeout = p.get("transcribe_timeout")
         self._pref_transcribe_connect_timeout = p.get("transcribe_connect_timeout")
         self._pref_speaker_threshold = p.get("speaker_threshold")
+        pm = p.get("paste_mode")
+        self._pref_paste_mode = pm.strip() if isinstance(pm, str) and pm.strip() else None
+        self._pref_max_record_seconds = None
+        if "max_record_seconds" in p:
+            try:
+                self._pref_max_record_seconds = float(p["max_record_seconds"])
+            except (TypeError, ValueError):
+                self._pref_max_record_seconds = None
+        self._pref_skip_health_check = None
+        if "skip_health_check" in p:
+            self._pref_skip_health_check = bool(p["skip_health_check"])
+        tb = p.get("transcribe_backend")
+        self._pref_transcribe_backend = tb.strip() if isinstance(tb, str) and tb.strip() else None
+        gk = p.get("groq_api_key")
+        self._pref_groq_api_key = gk.strip() if isinstance(gk, str) and gk.strip() else None
 
-    def _merge_save_mac_prefs(self, **kwargs: float | None) -> None:
+    def _merge_save_mac_prefs(self, **kwargs: Any) -> None:
         merge_mac_client_prefs(dict(kwargs))
         self._reload_mac_prefs_from_disk()
-        _mac_log("info", "mac_client_prefs_saved %s", load_mac_client_prefs())
+        _mac_log("info", "mac_client_prefs_saved %s", _mac_prefs_for_log(load_mac_client_prefs()))
 
     def _effective_health_timeout_sec(self) -> float:
         if self._pref_health_timeout is not None:
@@ -1625,6 +1907,186 @@ class WhisperClientMac:
         if self._pref_speaker_threshold is not None:
             return float(self._pref_speaker_threshold)
         return self._speaker_threshold
+
+    def _effective_paste_mode(self) -> str:
+        """auto: буфер + Cmd+V; clipboard: только буфер; history_only: только история (без буфера и вставки)."""
+        if self._pref_paste_mode in ("auto", "clipboard", "history_only"):
+            return self._pref_paste_mode
+        env = (os.environ.get("WHISPER_MAC_PASTE_MODE") or "").strip().lower()
+        if env in ("auto", "clipboard", "history_only"):
+            return env
+        return "auto"
+
+    def _effective_max_record_seconds(self) -> float:
+        """0 или отрицательное в prefs/env — без лимита по времени (пока зажат хоткей)."""
+        if self._pref_max_record_seconds is not None:
+            return float(self._pref_max_record_seconds)
+        try:
+            v = (os.environ.get("WHISPER_MAC_MAX_RECORD_SEC") or "").strip()
+            if not v:
+                return 120.0
+            return float(v)
+        except ValueError:
+            return 120.0
+
+    def _effective_skip_health_check(self) -> bool:
+        if self._pref_skip_health_check is not None:
+            return bool(self._pref_skip_health_check)
+        return (os.environ.get("WHISPER_MAC_SKIP_HEALTH_CHECK") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _effective_groq_api_key(self) -> str | None:
+        return resolve_groq_api_key(self._pref_groq_api_key)
+
+    def _effective_transcribe_backend_mode(self) -> str:
+        return resolve_transcribe_backend_mode(
+            self._pref_transcribe_backend,
+            "WHISPER_MAC_TRANSCRIBE_BACKEND",
+            "WHISPER_TRANSCRIBE_BACKEND",
+        )
+
+    def _effective_transcribe_backend_order(self) -> list[str]:
+        return transcribe_backend_order(self._effective_transcribe_backend_mode())
+
+    def _server_health_check_or_raise(self) -> None:
+        if self._effective_skip_health_check():
+            _mac_log("info", "health_check_skipped")
+            return
+        _hc_to = self._effective_health_timeout_sec()
+        try:
+            health_check = requests.get(f"{self.server_url}/", timeout=_hc_to)
+        except requests.exceptions.RequestException as e:
+            _mac_log("error", "health_check_request_error %s url=%s", e, self.server_url)
+            raise ConnectionError(str(e)) from e
+        if health_check.status_code != 200:
+            _mac_log(
+                "error",
+                "health_check status=%s url=%s",
+                health_check.status_code,
+                self.server_url,
+            )
+            raise ConnectionError(f"Сервер недоступен (код {health_check.status_code})")
+
+    def _transcribe_post_server(self, tmp_path: str) -> dict[str, Any]:
+        """POST на свой Whisper-сервер; ретраи только на сетевые ошибки."""
+        max_retries = 3
+        response: requests.Response | None = None
+        _tx_conn, _tx_read = self._effective_transcribe_timeouts()
+        _post_timeout: float | tuple[float, float] = (_tx_conn, _tx_read)
+        for attempt in range(max_retries):
+            try:
+                with open(tmp_path, "rb") as f:
+                    files = {"audio": ("audio.wav", f, "audio/wav")}
+                    params: dict[str, str] = {}
+                    if self.language:
+                        params["language"] = self.language
+                    params["spoken_punctuation"] = str(self.spoken_punctuation).lower()
+                    response = requests.post(
+                        f"{self.server_url}/transcribe",
+                        files=files,
+                        params=params,
+                        headers={"X-Whisper-Client": "mac"},
+                        timeout=_post_timeout,
+                    )
+                if response.status_code >= 400:
+                    detail = _fastapi_error_detail(response)
+                    _mac_log(
+                        "error",
+                        "transcribe_http status=%s detail=%r",
+                        response.status_code,
+                        detail,
+                    )
+                    err = RuntimeError(f"server_http_{response.status_code}:{detail[:300]}")
+                    setattr(err, "whisper_http_status", response.status_code)
+                    setattr(err, "whisper_detail", detail)
+                    raise err
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(
+                        f"[Client] Ошибка соединения (попытка {attempt + 1}/{max_retries}), повтор через {wait_time} сек…",
+                        flush=True,
+                    )
+                    time.sleep(wait_time)
+                else:
+                    raise ConnectionError(str(e)) from e
+        if response is None:
+            raise ConnectionError("Нет ответа от сервера")
+        try:
+            return response.json()
+        except ValueError:
+            body = (response.text or "")[:400]
+            _mac_log("error", "transcribe_bad_json body_prefix=%r", body)
+            raise ValueError("Ответ сервера не JSON") from None
+
+    def _transcribe_post_groq(self, tmp_path: str) -> dict[str, Any]:
+        """Groq OpenAI-совместимый /audio/transcriptions (см. whisper_groq)."""
+        if not self._effective_groq_api_key():
+            raise ValueError(
+                "Нет ключа Groq: меню «Groq API ключ…» или GROQ_API_KEY / WHISPER_GROQ_API_KEY в .env.",
+            )
+        _tx_conn, _tx_read = self._effective_transcribe_timeouts()
+        return post_groq_audio_transcription(
+            tmp_path,
+            language=self.language,
+            timeout=(_tx_conn, min(_tx_read, 600.0)),
+            log_error=lambda msg, *args: _mac_log("error", msg, *args),
+            pref_api_key=self._pref_groq_api_key,
+        )
+
+    def _transcribe_audio_file(self, tmp_path: str) -> dict[str, Any]:
+        """Цепочка бэкендов по настройке; возвращает dict с ключом text (как у своего сервера)."""
+        order = self._effective_transcribe_backend_order()
+        last_exc: BaseException | None = None
+        for idx, backend in enumerate(order):
+            try:
+                if backend == "server":
+                    print("[Client] Транскрипция: свой сервер…", flush=True)
+                    _mac_notify_progress("Отправка на сервер…")
+                    self._server_health_check_or_raise()
+                    result = self._transcribe_post_server(tmp_path)
+                else:
+                    print("[Client] Транскрипция: Groq whisper-large-v3…", flush=True)
+                    _mac_notify_progress("Отправка в Groq…")
+                    result = self._transcribe_post_groq(tmp_path)
+                text = (result.get("text") or "").strip()
+                if text:
+                    _mac_log(
+                        "info",
+                        "transcribe_ok backend=%s chars=%d language=%r",
+                        backend,
+                        len(text),
+                        result.get("language"),
+                    )
+                    return result
+                _mac_log("info", "transcribe_empty backend=%s", backend)
+                if idx + 1 < len(order):
+                    _mac_log("info", "transcribe_try_fallback next=%s", order[idx + 1])
+                    continue
+                return result
+            except Exception as e:
+                last_exc = e
+                _mac_log("warning", "transcribe_backend_failed backend=%s err=%s", backend, e)
+                if idx + 1 < len(order):
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("transcribe_no_backend")
+
+    def _notify_menu_history_refresh(self) -> None:
+        app = getattr(self, "_menu_bar_ref", None)
+        if app is None:
+            return
+        try:
+            app._history_menu_dirty = True
+        except Exception:
+            _MAC_LOGGER.debug("menu_history_refresh", exc_info=True)
 
     def request_shutdown(self) -> None:
         """Остановка клиента (меню «Выход», SIGINT)."""
@@ -2072,7 +2534,30 @@ class WhisperClientMac:
             return False
 
     def _snapshot_frontmost_unix_pid(self) -> int | None:
-        """Кто был активным при зажатии хоткея — туда же шлём Cmd+V после распознавания."""
+        """Кто был активным при зажатии хоткея — туда же шлём Cmd+V после распознавания.
+
+        Сначала NSWorkspace (мгновенно, без osascript) — основная задержка «до микрофона» была здесь.
+        """
+        mine = os.getpid()
+        if sys.platform == "darwin":
+            try:
+                from AppKit import NSWorkspace  # type: ignore[import-untyped]
+
+                app = NSWorkspace.sharedWorkspace().frontmostApplication()
+                if app is not None:
+                    pid = int(app.processIdentifier())
+                    if pid == mine:
+                        _mac_log(
+                            "warning",
+                            "frontmost_pid=%s совпадает с клиентом (NSWorkspace) — кликни в поле ввода",
+                            pid,
+                        )
+                        return None
+                    _mac_log("info", "paste_target_captured unix_pid=%s method=NSWorkspace", pid)
+                    return pid
+            except Exception as e:
+                _mac_log("debug", "snapshot_frontmost_nsw err=%s — fallback osascript", e)
+
         try:
             r = subprocess.run(
                 [
@@ -2096,7 +2581,6 @@ class WhisperClientMac:
         except (ValueError, subprocess.TimeoutExpired, OSError) as e:
             _mac_log("warning", "snapshot_frontmost_parse_error %s", e)
             return None
-        mine = os.getpid()
         if pid == mine:
             _mac_log(
                 "warning",
@@ -2104,7 +2588,7 @@ class WhisperClientMac:
                 pid,
             )
             return None
-        _mac_log("info", "paste_target_captured unix_pid=%s", pid)
+        _mac_log("info", "paste_target_captured unix_pid=%s method=osascript", pid)
         return pid
 
     def _activate_process_by_unix_id(self, uid: int) -> bool:
@@ -2327,9 +2811,13 @@ class WhisperClientMac:
             return True
         return False
 
-    def _record_worker(self, max_duration: float = 120.0) -> None:
+    def _record_worker(self) -> None:
         chunks = []
-        max_chunks = int(self.sample_rate / 1024 * max_duration) + 1
+        max_d = self._effective_max_record_seconds()
+        if max_d <= 0:
+            max_chunks = 10**12
+        else:
+            max_chunks = int(self.sample_rate / 1024 * max_d) + 1
         n = 0
         try:
             with sd.InputStream(
@@ -2361,16 +2849,15 @@ class WhisperClientMac:
         self._stop_record.clear()
         self._audio_chunks.clear()
         self._paste_target_unix_id = None
-        # Кто frontmost — до потока записи и микрофона (иначе снимок часто ловит не то окно).
-        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
 
-        # Микрофон сразу — до любых afplay/osascript (иначе съедается первое слово).
+        # Микрофон первым — osascript в снимке PID больше не блокирует открытие входа (NSWorkspace — мгновенно).
         self._record_thread = threading.Thread(
             target=self._record_worker,
             name="whisper-record",
             daemon=True,
         )
         self._record_thread.start()
+        self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
 
         def _beep_async() -> None:
@@ -2485,169 +2972,125 @@ class WhisperClientMac:
                                         e,
                                     )
 
-                    # Проверяем доступность сервера перед отправкой (меню / ~/.whisper/mac_client_prefs.json / env).
-                    try:
-                        _hc_to = self._effective_health_timeout_sec()
-                        health_check = requests.get(f"{self.server_url}/", timeout=_hc_to)
-                        if health_check.status_code != 200:
-                            print(f"[Client] Сервер недоступен (код {health_check.status_code})", flush=True)
-                            _mac_log(
-                                "error",
-                                "health_check status=%s url=%s",
-                                health_check.status_code,
-                                self.server_url,
-                            )
-                            raise ConnectionError("Сервер недоступен")
-                    except requests.exceptions.RequestException as e:
-                        print(f"[Client] Не удаётся подключиться к серверу: {e}", flush=True)
-                        print(f"[Client] Проверь, что сервер запущен на {self.server_url}", flush=True)
-                        _mac_log("error", "health_check_request_error %s url=%s", e, self.server_url)
-                        raise
-
-                    # Отправляем на сервер с повторными попытками
-                    print("[Client] Отправка на сервер…", flush=True)
-                    _mac_notify_progress("Отправка на сервер, жди ответ…")
-                    _mac_log("info", "transcribe_upload_start url=%s paste_target_pid=%s", self.server_url, paste_pid)
-                    max_retries = 3
-                    response = None
-                    _tx_conn, _tx_read = self._effective_transcribe_timeouts()
-                    _post_timeout: float | tuple[float, float] = (_tx_conn, _tx_read)
-
-                    for attempt in range(max_retries):
-                        try:
-                            with open(tmp_path, "rb") as f:
-                                files = {"audio": ("audio.wav", f, "audio/wav")}
-                                params = {}
-                                if self.language:
-                                    params["language"] = self.language
-                                params["spoken_punctuation"] = str(self.spoken_punctuation).lower()
-
-                                response = requests.post(
-                                    f"{self.server_url}/transcribe",
-                                    files=files,
-                                    params=params,
-                                    headers={"X-Whisper-Client": "mac"},
-                                    timeout=_post_timeout,
-                                )
-                                if response.status_code >= 400:
-                                    detail = _fastapi_error_detail(response)
-                                    _mac_log(
-                                        "error",
-                                        "transcribe_http status=%s detail=%r",
-                                        response.status_code,
-                                        detail,
-                                    )
-                                    if response.status_code == 403:
-                                        mac_banner_notification("Whisper — отклонено", detail[:220])
-                                    else:
-                                        mac_banner_notification(
-                                            "Whisper — ошибка сервера",
-                                            f"{response.status_code}: {detail}"[:220],
-                                        )
-                                    return
-                                break  # успешно, выходим из цикла
-                        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                            if attempt < max_retries - 1:
-                                wait_time = (attempt + 1) * 2
-                                print(
-                                    f"[Client] Ошибка соединения (попытка {attempt + 1}/{max_retries}), повтор через {wait_time} сек…",
-                                    flush=True,
-                                )
-                                time.sleep(wait_time)
-                            else:
-                                print(f"[Client] Не удалось подключиться после {max_retries} попыток", flush=True)
-                                raise
-
-                    if response is None:
-                        raise ConnectionError("Не удалось получить ответ от сервера")
-
-                    try:
-                        result = response.json()
-                    except ValueError:
-                        body = (response.text or "")[:400]
-                        _mac_log("error", "transcribe_bad_json status=%s body_prefix=%r", response.status_code, body)
-                        print("[Client] Ответ сервера не JSON — см. ~/Library/Logs/WhisperMacClient.log", flush=True)
-                        mac_banner_notification("Whisper — ошибка", "Некорректный ответ сервера (не JSON).")
-                        raise
-                    text = result.get("text", "").strip()
                     _mac_log(
                         "info",
-                        "transcribe_ok chars=%d preview=%r language=%r",
-                        len(text),
-                        text[:160],
-                        result.get("language"),
+                        "transcribe_start paste_target_pid=%s route=%s",
+                        paste_pid,
+                        self._effective_transcribe_backend_order(),
                     )
+                    result = self._transcribe_audio_file(tmp_path)
+                    text = result.get("text", "").strip()
                     if os.environ.get("WHISPER_MAC_DEBUG"):
                         _mac_log("debug", "transcribe_full_text=%r", text)
 
                     if text:
-                        # Не даём synthetic release от Controller/osascript попасть в pressed — иначе hotkey ломается.
+                        append_mac_transcription_history(text)
+                        self._notify_menu_history_refresh()
+                        mode = self._effective_paste_mode()
                         paste_ok = False
-                        with self._hk_lock:
-                            self._hk_suppress = True
-                        try:
-                            # В режиме daemon ключи уже физически отпущены до UP → synthetic release не нужен
-                            # (и может вызвать ложный DOWN у daemon через CGEventPost).
-                            if not self._using_daemon:
-                                self._release_sticky_modifiers_safe()
-                            time.sleep(0.15)
-                            if paste_pid is not None:
-                                activated = self._activate_process_by_unix_id(paste_pid)
-                                _mac_log(
-                                    "info",
-                                    "restore_focus pid=%s ok=%s",
-                                    paste_pid,
-                                    activated,
-                                )
-                            else:
-                                _mac_log(
-                                    "warning",
-                                    "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно "
-                                    "(кликни в поле ввода до хоткея; если Terminal/Python был активен — снимок PID отброшен)",
-                                )
-                            time.sleep(0.08)
-                            self._copy_to_clipboard_mac(text)
-                            time.sleep(0.06)
-                            if self._clipboard_matches_expected(text):
-                                _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(text))
-                            else:
-                                _mac_log(
-                                    "warning",
-                                    "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
-                                    text[:80],
-                                    self._clipboard_preview(100),
-                                )
-                            time.sleep(0.12)
-                            ok = self._paste_via_system_events(paste_pid)
-                            paste_ok = bool(ok)
-                            if ok:
-                                print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
-                                _mac_log("info", "paste_cmd_v_ok")
-                            else:
-                                pyperclip.copy(text)
-                                print(
-                                    f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {text[:60]}…",
-                                    flush=True,
-                                )
-                                print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
-                                _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
-                        except Exception as e:
+
+                        if mode == "history_only":
+                            # Только запись в ~/.whisper/mac_transcription_history.json — без буфера и Cmd+V.
+                            with self._hk_lock:
+                                self._hk_suppress = True
                             try:
-                                pyperclip.copy(text)
-                            except Exception:
-                                pass
-                            print(f"[Client] Вставка не удалась ({e}), текст в буфере: {text[:60]}…", flush=True)
-                            print("[Client] Нажми Cmd+V для вставки.", flush=True)
-                            _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
-                        finally:
-                            self._reset_hotkey_tracker()
-                            self._reset_native_hotkey_tap_state()
-                        if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                            prev = text[:130] + ("…" if len(text) > 130 else "")
-                            if paste_ok:
-                                mac_banner_notification("Whisper — готово", prev)
-                            else:
-                                mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
+                                if not self._using_daemon:
+                                    self._release_sticky_modifiers_safe()
+                            finally:
+                                self._reset_hotkey_tracker()
+                                self._reset_native_hotkey_tap_state()
+                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                mac_banner_notification("Whisper — в истории", prev)
+                            _mac_log("info", "paste_mode=history_only")
+                        elif mode == "clipboard":
+                            with self._hk_lock:
+                                self._hk_suppress = True
+                            try:
+                                if not self._using_daemon:
+                                    self._release_sticky_modifiers_safe()
+                                time.sleep(0.12)
+                                self._copy_to_clipboard_mac(text)
+                            except Exception as e:
+                                try:
+                                    pyperclip.copy(text)
+                                except Exception:
+                                    pass
+                                print(f"[Client] Буфер: {e}", flush=True)
+                                _MAC_LOGGER.error("clipboard_mode_copy_error", exc_info=True)
+                            finally:
+                                self._reset_hotkey_tracker()
+                                self._reset_native_hotkey_tap_state()
+                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                mac_banner_notification("Whisper — в буфере", prev)
+                            _mac_log("info", "paste_mode=clipboard_only")
+                        else:
+                            # auto: буфер + вставка в поле (как раньше).
+                            # Не даём synthetic release от Controller/osascript попасть в pressed — иначе hotkey ломается.
+                            with self._hk_lock:
+                                self._hk_suppress = True
+                            try:
+                                if not self._using_daemon:
+                                    self._release_sticky_modifiers_safe()
+                                time.sleep(0.15)
+                                if paste_pid is not None:
+                                    activated = self._activate_process_by_unix_id(paste_pid)
+                                    _mac_log(
+                                        "info",
+                                        "restore_focus pid=%s ok=%s",
+                                        paste_pid,
+                                        activated,
+                                    )
+                                else:
+                                    _mac_log(
+                                        "warning",
+                                        "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно "
+                                        "(кликни в поле ввода до хоткея; если Terminal/Python был активен — снимок PID отброшен)",
+                                    )
+                                time.sleep(0.08)
+                                self._copy_to_clipboard_mac(text)
+                                time.sleep(0.06)
+                                if self._clipboard_matches_expected(text):
+                                    _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(text))
+                                else:
+                                    _mac_log(
+                                        "warning",
+                                        "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
+                                        text[:80],
+                                        self._clipboard_preview(100),
+                                    )
+                                time.sleep(0.12)
+                                ok = self._paste_via_system_events(paste_pid)
+                                paste_ok = bool(ok)
+                                if ok:
+                                    print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
+                                    _mac_log("info", "paste_cmd_v_ok")
+                                else:
+                                    pyperclip.copy(text)
+                                    print(
+                                        f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {text[:60]}…",
+                                        flush=True,
+                                    )
+                                    print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
+                                    _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
+                            except Exception as e:
+                                try:
+                                    pyperclip.copy(text)
+                                except Exception:
+                                    pass
+                                print(f"[Client] Вставка не удалась ({e}), текст в буфере: {text[:60]}…", flush=True)
+                                print("[Client] Нажми Cmd+V для вставки.", flush=True)
+                                _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
+                            finally:
+                                self._reset_hotkey_tracker()
+                                self._reset_native_hotkey_tap_state()
+                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                if paste_ok:
+                                    mac_banner_notification("Whisper — готово", prev)
+                                else:
+                                    mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
                     else:
                         print("[Client] Текст не распознан.", flush=True)
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
@@ -2790,7 +3233,32 @@ if rumps is not None:
                 _mac_log("warning", "tray_icon_missing — emoji fallback (icon файл не найден)")
 
             self.client = client
+            self.client._menu_bar_ref = self
+            self._history_menu_dirty = False
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
+            self.menu = self._compose_menu()
+            # После initializeStatusBar() в rumps.App.run(), иначе клики по иконке часто «мёртвые».
+            rumps.events.before_start.register(_rumps_apply_accessory_activation_policy)
+            # Запрашиваем разрешение на уведомления из контекста работающего NSApp.
+            # Таймер 3 с: к тому времени RunLoop уже запущен → completionHandler доставляется корректно.
+            threading.Timer(3.0, self._request_notifications_permission).start()
+            _ensure_whisper_un_for_updates()
+            _ir = _listener_idle_recycle_sec()
+            if _ir > 0:
+                _mac_log(
+                    "warning",
+                    "listener_idle_recycle_on interval=%.0fs — на macOS периодический restart pynput часто роняет ⌃⌥⇧; "
+                    "для стабильной работы убери WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC и не передавай --listener-idle-recycle-sec",
+                    _ir,
+                )
+
+        def _server_title(self) -> str:
+            u = self.client.server_url
+            return u if len(u) <= 56 else u[:53] + "…"
+
+        def _compose_menu(self) -> list:
+            self.client._reload_mac_prefs_from_disk()
+            self._mi_server.title = self._server_title()
             _menu_timeouts = [
                 rumps.MenuItem(
                     "По умолчанию (сброс файла настроек)",
@@ -2822,12 +3290,20 @@ if rumps is not None:
                 rumps.MenuItem("Порог 0.75", callback=self._speaker_threshold_set_factory(0.75)),
                 rumps.MenuItem("Своё число…", callback=self._speaker_threshold_custom),
             ]
-            self.menu = [
+            return [
                 rumps.MenuItem(f"Версия {self._app_version}", callback=None),
                 self._mi_server,
                 rumps.separator,
                 ("Таймауты сервера", _menu_timeouts),
                 ("Порог эталона голоса", _menu_speaker),
+                # rumps: подменю только через кортеж (title, [items]) — keyword submenu= не везде есть.
+                ("История расшифровок", self._history_submenu_items()),
+                ("Транскрипция", self._transcribe_backend_submenu_items()),
+                rumps.MenuItem("Groq API ключ…", callback=self._groq_key_enter_menu),
+                rumps.MenuItem("Сбросить ключ Groq", callback=self._groq_key_clear_menu),
+                ("Режим текста", self._paste_mode_submenu_items()),
+                ("Макс. длина записи", self._max_record_submenu_items()),
+                rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),
                 rumps.separator,
                 rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
                 rumps.MenuItem("Записать эталон голоса (45 с)…", callback=self._enroll_speaker_menu),
@@ -2836,24 +3312,137 @@ if rumps is not None:
                 rumps.MenuItem("Показать лог…", callback=self._open_log),
                 rumps.MenuItem("Выход", callback=self._quit),
             ]
-            # После initializeStatusBar() в rumps.App.run(), иначе клики по иконке часто «мёртвые».
-            rumps.events.before_start.register(_rumps_apply_accessory_activation_policy)
-            # Запрашиваем разрешение на уведомления из контекста работающего NSApp.
-            # Таймер 3 с: к тому времени RunLoop уже запущен → completionHandler доставляется корректно.
-            threading.Timer(3.0, self._request_notifications_permission).start()
-            threading.Timer(12.0, self._startup_update_check_once).start()
-            _ir = _listener_idle_recycle_sec()
-            if _ir > 0:
-                _mac_log(
-                    "warning",
-                    "listener_idle_recycle_on interval=%.0fs — на macOS периодический restart pynput часто роняет ⌃⌥⇧; "
-                    "для стабильной работы убери WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC и не передавай --listener-idle-recycle-sec",
-                    _ir,
-                )
 
-        def _server_title(self) -> str:
-            u = self.client.server_url
-            return u if len(u) <= 56 else u[:53] + "…"
+        def _history_submenu_items(self) -> list:
+            items: list = []
+            for entry in load_mac_transcription_history(limit=10):
+                t = entry.get("text")
+                if not isinstance(t, str) or not t.strip():
+                    continue
+                title = _history_preview_title(t)
+                items.append(rumps.MenuItem(title, callback=self._make_copy_callback(t)))
+            if not items:
+                items.append(rumps.MenuItem("(пусто)", callback=None))
+            items.append(rumps.separator)
+            items.append(rumps.MenuItem("Посмотреть все…", callback=self._open_full_history))
+            return items
+
+        def _make_copy_callback(self, text: str):
+            def _cb(_sender) -> None:
+                self.client._copy_to_clipboard_mac(text)
+                mac_banner_notification("Whisper", "Скопировано в буфер")
+
+            return _cb
+
+        def _open_full_history(self, _sender) -> None:
+            p = _mac_transcription_history_path()
+            if not p.is_file():
+                rumps.alert("История", "Пока пусто.")
+                return
+            subprocess.run(["open", "-e", str(p)], check=False)
+
+        def _paste_mode_submenu_items(self) -> list:
+            cur = self.client._effective_paste_mode()
+            specs = [
+                ("auto", "В поле + буфер"),
+                ("clipboard", "Только буфер"),
+                ("history_only", "Только история"),
+            ]
+            out: list = []
+            for mode, label in specs:
+                mark = "✓ " if cur == mode else "   "
+                out.append(rumps.MenuItem(mark + label, callback=self._paste_mode_set_factory(mode)))
+            return out
+
+        def _paste_mode_set_factory(self, mode: str):
+            def _cb(_sender) -> None:
+                self.client._merge_save_mac_prefs(paste_mode=mode)
+                self.menu = self._compose_menu()
+
+            return _cb
+
+        def _transcribe_backend_submenu_items(self) -> list:
+            cur = self.client._effective_transcribe_backend_mode()
+            specs = [
+                ("server", "Только мой сервер"),
+                ("groq", "Только Groq (large v3)"),
+                ("server_then_groq", "Сервер → Groq"),
+                ("groq_then_server", "Groq → сервер"),
+            ]
+            out: list = []
+            for mode, label in specs:
+                mark = "✓ " if cur == mode else "   "
+                out.append(
+                    rumps.MenuItem(mark + label, callback=self._transcribe_backend_set_factory(mode))
+                )
+            return out
+
+        def _transcribe_backend_set_factory(self, mode: str):
+            def _cb(_sender) -> None:
+                self.client._merge_save_mac_prefs(transcribe_backend=mode)
+                self.menu = self._compose_menu()
+
+            return _cb
+
+        def _groq_key_enter_menu(self, _sender) -> None:
+            raw = _mac_osascript_prompt_groq_key()
+            if raw is None:
+                return
+            s = raw.strip()
+            self.client._merge_save_mac_prefs(groq_api_key=s if s else "")
+            self.menu = self._compose_menu()
+            if s:
+                mac_banner_notification(
+                    "Whisper",
+                    "Ключ Groq сохранён в настройках. Если задан GROQ_API_KEY в .env — он важнее.",
+                )
+            else:
+                mac_banner_notification("Whisper", "Ключ Groq в настройках очищен.")
+
+        def _groq_key_clear_menu(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(groq_api_key=None)
+            self.menu = self._compose_menu()
+            mac_banner_notification("Whisper", "Ключ Groq удалён из настроек клиента.")
+
+        def _max_record_label_match(self, cur: float, val: float) -> bool:
+            if val <= 0.0:
+                return cur <= 0.0
+            return cur > 0.0 and abs(cur - val) < 2.0
+
+        def _max_record_submenu_items(self) -> list:
+            cur = self.client._effective_max_record_seconds()
+            presets: list[tuple[float, str]] = [
+                (30.0, "30 сек"),
+                (60.0, "1 мин"),
+                (90.0, "1.5 мин"),
+                (120.0, "2 мин"),
+                (180.0, "3 мин"),
+                (0.0, "Без лимита"),
+            ]
+            out: list = []
+            for val, label in presets:
+                mark = "✓ " if self._max_record_label_match(cur, val) else "   "
+                out.append(
+                    rumps.MenuItem(mark + label, callback=self._max_record_set_factory(val)),
+                )
+            return out
+
+        def _max_record_set_factory(self, val: float):
+            def _cb(_sender) -> None:
+                self.client._merge_save_mac_prefs(max_record_seconds=val)
+                self.menu = self._compose_menu()
+
+            return _cb
+
+        def _skip_health_menu_title(self) -> str:
+            if self.client._effective_skip_health_check():
+                return "✓ Без проверки GET / (быстрее)"
+            return "○ Проверять сервер перед отправкой"
+
+        def _toggle_skip_health(self, _sender) -> None:
+            nxt = not self.client._effective_skip_health_check()
+            self.client._merge_save_mac_prefs(skip_health_check=nxt)
+            self.menu = self._compose_menu()
 
         def _apply_status_bar_menu_fix(self) -> None:
             """macOS 11+: повесить NSMenu на NSStatusBarButton — иначе клик по иконке часто молчит."""
@@ -2881,6 +3470,66 @@ if rumps is not None:
                 _mac_log("debug", "status_bar_menu_fix_applied")
             except Exception as _e:
                 _mac_log("debug", "status_bar_menu_fix_skip err=%s", _e)
+
+        def _round_tray_icon_if_needed(self) -> None:
+            """Иконка из AppIcon (Resources/assets), ~18pt, скругление. Без template — иначе цветная icns превращается в белый квадрат."""
+            if self._emoji_mode or getattr(self, "_status_bar_tray_icon_done", False):
+                return
+            try:
+                from AppKit import (  # type: ignore[import-untyped]
+                    NSCompositingOperationSourceOver,
+                    NSImage,
+                    NSBezierPath,
+                )
+                from Foundation import NSMakeRect, NSSize  # type: ignore[import-untyped]
+
+                ip = tray_icon_path()
+                if not ip:
+                    return
+                src = NSImage.alloc().initWithContentsOfFile_(ip)
+                if src is None:
+                    return
+                intr = src.size()
+                w0 = float(intr.width)
+                h0 = float(intr.height)
+                if w0 < 1.0 or h0 < 1.0:
+                    return
+                target = 18.0
+                scale = min(target / w0, target / h0)
+                w, h = w0 * scale, h0 * scale
+                rad = min(w, h) * 0.22
+                out = NSImage.alloc().initWithSize_(NSSize(w, h))
+                out.lockFocus()
+                try:
+                    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        NSMakeRect(0.0, 0.0, w, h),
+                        rad,
+                        rad,
+                    ).addClip()
+                    src.drawInRect_fromRect_operation_fraction_(
+                        NSMakeRect(0.0, 0.0, w, h),
+                        NSMakeRect(0.0, 0.0, w0, h0),
+                        NSCompositingOperationSourceOver,
+                        1.0,
+                    )
+                finally:
+                    out.unlockFocus()
+                out.setTemplate_(False)
+
+                inst = getattr(rumps.App, "*app_instance", None)
+                if inst is None or not hasattr(inst, "_nsapp"):
+                    return
+                item = inst._nsapp.nsstatusitem
+                if item is None:
+                    return
+                btn = item.button()
+                if btn is None:
+                    return
+                btn.setImage_(out)
+                self._status_bar_tray_icon_done = True
+                _mac_log("debug", "status_bar_tray_icon_applied path=%r", ip)
+            except Exception as _e:
+                _mac_log("debug", "status_bar_tray_icon_skip err=%s", _e)
 
         def _request_notifications_permission(self) -> None:
             """Запрашивает разрешение на уведомления из контекста работающего NSApp.
@@ -2928,6 +3577,7 @@ if rumps is not None:
                 transcribe_timeout=None,
                 transcribe_connect_timeout=None,
             )
+            self.menu = self._compose_menu()
             rumps.alert(
                 "Таймауты",
                 "Сброшены. Снова действуют значения по умолчанию и переменные окружения.",
@@ -2939,6 +3589,7 @@ if rumps is not None:
                 transcribe_connect_timeout=30.0,
                 transcribe_timeout=480.0,
             )
+            self.menu = self._compose_menu()
             rumps.alert("Таймауты", "Сохранено: быстрый профиль (ответ до 8 мин).")
 
         def _timeouts_preset_normal(self, _sender) -> None:
@@ -2947,6 +3598,7 @@ if rumps is not None:
                 transcribe_connect_timeout=60.0,
                 transcribe_timeout=900.0,
             )
+            self.menu = self._compose_menu()
             rumps.alert("Таймауты", "Сохранено: нормальный профиль (ответ до 15 мин).")
 
         def _timeouts_preset_long(self, _sender) -> None:
@@ -2955,6 +3607,7 @@ if rumps is not None:
                 transcribe_connect_timeout=90.0,
                 transcribe_timeout=1800.0,
             )
+            self.menu = self._compose_menu()
             rumps.alert("Таймауты", "Сохранено: долгий профиль (ответ до 30 мин).")
 
         def _timeouts_custom(self, _sender) -> None:
@@ -2984,10 +3637,12 @@ if rumps is not None:
                 transcribe_connect_timeout=cv,
                 transcribe_timeout=rv,
             )
+            self.menu = self._compose_menu()
             rumps.alert("Таймауты", f"Сохранено: {hv:.0f} / {cv:.0f} / {rv:.0f} с")
 
         def _speaker_threshold_reset(self, _sender) -> None:
             self.client._merge_save_mac_prefs(speaker_threshold=None)
+            self.menu = self._compose_menu()
             rumps.alert(
                 "Порог эталона",
                 "Сброшен — используется порог при запуске и WHISPER_SPEAKER_THRESHOLD.",
@@ -2996,6 +3651,7 @@ if rumps is not None:
         def _speaker_threshold_set_factory(self, val: float):
             def _cb(_s) -> None:
                 self.client._merge_save_mac_prefs(speaker_threshold=val)
+                self.menu = self._compose_menu()
                 rumps.alert(
                     "Порог эталона",
                     f"Сохранено {val:.2f} (~/.whisper/mac_client_prefs.json).",
@@ -3030,6 +3686,7 @@ if rumps is not None:
                 rumps.alert("Ошибка", "Ожидается число от 0.45 до 0.99.")
                 return
             self.client._merge_save_mac_prefs(speaker_threshold=v)
+            self.menu = self._compose_menu()
             rumps.alert("Порог эталона", f"Сохранено {v:.3f}")
 
         def _startup_update_check_once(self) -> None:
@@ -3129,10 +3786,29 @@ if rumps is not None:
             if not getattr(self, "_statusbar_menu_fix_done", False):
                 self._statusbar_menu_fix_done = True
                 self._apply_status_bar_menu_fix()
+                self._round_tray_icon_if_needed()
+
+        @rumps.timer(12.0)
+        def _startup_update_check_delayed(self, sender) -> None:
+            """Проверка обновлений на главном потоке RunLoop (UN-пуш с кнопкой)."""
+            try:
+                sender.stop()
+            except Exception:
+                pass
+            self._startup_update_check_once()
 
         @rumps.timer(0.05)
         def _drain_main_thread_jobs_tick(self, _sender) -> None:
             self.client._drain_main_thread_jobs()
+
+        @rumps.timer(12.0)
+        def _startup_update_check_delayed(self, sender) -> None:
+            """Проверка обновлений на главном RunLoop (UN-уведомления с кнопкой — только с main)."""
+            try:
+                sender.stop()
+            except Exception:
+                pass
+            self._startup_update_check_once()
 
         @rumps.timer(0.5)
         def _tick(self, _sender) -> None:
@@ -3140,6 +3816,9 @@ if rumps is not None:
                 rumps.quit_application()
                 return
             self._mi_server.title = self._server_title()
+            if getattr(self, "_history_menu_dirty", False):
+                self._history_menu_dirty = False
+                self.menu = self._compose_menu()
             if not self._emoji_mode:
                 return
             rec = busy = False

@@ -1,7 +1,12 @@
 .DS_Store
-# Секреты (GITHUB_TOKEN и т.д.) — не коммитить
+# Секреты (GITHUB_TOKEN, GROQ_API_KEY и т.д.) — не коммитить и не пушить
 .env
+.env.*
 **/.env
+**/.env.*
+*.env
+!.env.example
+.envrc
 # Случайные выгрузки / сохранённые страницы — не в репозиторий
 assets/волга_files/
 assets/search.json

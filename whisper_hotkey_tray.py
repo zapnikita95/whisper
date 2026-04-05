@@ -2,6 +2,7 @@
 """
 Whisper Hotkey в фоне: иконка в трее, уведомления (запуск / запись / результат / ошибки).
 Лог: whisper_hotkey.log рядом с exe. Отключить уведомления: трей «Уведомления» или WHISPER_HOTKEY_NO_NOTIFICATIONS=1.
+Groq: GROQ_API_KEY в .env или ключ в меню «Groq API ключ…» (whisper_hotkey_prefs.json); env важнее. «Транскрипция» — как на Mac (server = локальный GPU). WHISPER_TRANSCRIBE_BACKEND / WHISPER_MAC_TRANSCRIBE_BACKEND.
 Голос (как на Mac): эталон в ~/.whisper/speaker_embedding.npy, меню «Записать эталон…», «Проверка голоса» или WHISPER_SPEAKER_VERIFY=1 (нужен pip install -r requirements-speaker.txt при сборке exe).
 Без стартового тоста: WHISPER_HOTKEY_SILENT_START=1. Повторы одного и того же текста и частые тосты режутся (антиспам).
 
@@ -33,6 +34,13 @@ ROOT = _project_root()
 os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+try:
+    from whisper_groq import load_whisper_dotenv_files
+
+    load_whisper_dotenv_files()
+except ImportError:
+    pass
 
 PREFS_PATH = ROOT / "whisper_hotkey_prefs.json"
 OLD_PREFS = ROOT / "whisper_hotkey_gui_prefs.json"
@@ -305,6 +313,19 @@ def main() -> int:
         _notify("Модель", "Перезапусти Whisper Hotkey, чтобы применить модель.", False, force=True)
         icon.update_menu()
 
+    def set_transcribe_backend(icon: pystray.Icon, mode: str) -> None:
+        p = _load_prefs()
+        p["transcribe_backend"] = mode
+        _save_prefs(p)
+        log.info("В prefs transcribe_backend=%s (нужен перезапуск, если не переопределяет env)", mode)
+        _notify(
+            "Транскрипция",
+            "Перезапусти Whisper Hotkey, чтобы применить цепочку (если не задан WHISPER_TRANSCRIBE_BACKEND в среде).",
+            False,
+            force=True,
+        )
+        icon.update_menu()
+
     def toggle_notifications(icon: pystray.Icon, item: object) -> None:
         p = _load_prefs()
         p["notifications"] = not bool(p.get("notifications", True))
@@ -369,6 +390,91 @@ def main() -> int:
             items.append(Item(f"{key}: {short}", make_pick(key)))
         return pystray.Menu(*items)
 
+    def groq_key_status_label(item: object) -> str:
+        from whisper_groq import groq_api_key_from_env, read_hotkey_groq_api_key_pref
+
+        if groq_api_key_from_env():
+            return "Groq ключ: из среды / .env"
+        if read_hotkey_groq_api_key_pref():
+            return "Groq ключ: в настройках (prefs) ✓"
+        return "Groq ключ: не задан"
+
+    def edit_groq_key(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception as e:
+            log.warning("tkinter недоступен: %s", e)
+            _notify(
+                "Groq",
+                "Добавь groq_api_key в whisper_hotkey_prefs.json рядом с exe или GROQ_API_KEY в .env.",
+                True,
+                force=True,
+            )
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Whisper — Groq API",
+                "Ключ gsk_…\nПусто + OK — удалить из prefs.\nGROQ_API_KEY в среде важнее prefs.",
+                show="*",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        if not ans.strip():
+            p.pop("groq_api_key", None)
+        else:
+            p["groq_api_key"] = ans.strip()
+        _save_prefs(p)
+        log.info("groq_api_key обновлён в prefs")
+        _notify("Groq", "Сохранено в whisper_hotkey_prefs.json.", False, force=True)
+        icon.update_menu()
+
+    def clear_groq_key(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p.pop("groq_api_key", None)
+        _save_prefs(p)
+        log.info("groq_api_key удалён из prefs")
+        _notify("Groq", "Ключ удалён из настроек (env не трогаем).", False, force=True)
+        icon.update_menu()
+
+    def transcribe_backend_submenu():
+        from whisper_groq import read_hotkey_transcribe_backend_pref, resolve_transcribe_backend_mode
+
+        cur = resolve_transcribe_backend_mode(
+            read_hotkey_transcribe_backend_pref(),
+            "WHISPER_TRANSCRIBE_BACKEND",
+            "WHISPER_MAC_TRANSCRIBE_BACKEND",
+        )
+        specs = [
+            ("server", "Только локальный GPU"),
+            ("groq", "Только Groq (large v3)"),
+            ("server_then_groq", "GPU → Groq"),
+            ("groq_then_server", "Groq → GPU"),
+        ]
+        items = []
+        for mode, label in specs:
+            mark = "✓ " if cur == mode else ""
+            short = label if len(label) <= 48 else label[:45] + "…"
+
+            def make_pick(m: str):
+                def pick(icon: pystray.Icon, item: object) -> None:
+                    set_transcribe_backend(icon, m)
+
+                return pick
+
+            items.append(Item(f"{mark}{short}", make_pick(mode)))
+        return pystray.Menu(*items)
+
     def notif_label(item: object) -> str:
         env_off = os.environ.get("WHISPER_HOTKEY_NO_NOTIFICATIONS", "").strip().lower() in ("1", "true", "yes")
         if env_off:
@@ -386,6 +492,10 @@ def main() -> int:
         Item(spk_label, toggle_speaker_verify),
         Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item("Модель → (перезапуск)", model_submenu()),
+        Item("Транскрипция → (перезапуск)", transcribe_backend_submenu()),
+        Item(groq_key_status_label, None, enabled=False),
+        Item("Groq API ключ…", edit_groq_key),
+        Item("Сбросить ключ Groq (prefs)", clear_groq_key),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),

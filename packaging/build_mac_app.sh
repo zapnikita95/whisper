@@ -15,6 +15,7 @@ echo "Сборка $APP … (MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET)
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp -f "$MAC/Info.plist.template" "$APP/Contents/Info.plist"
 cp -f "$ROOT/whisper-client-mac.py" "$APP/Contents/Resources/"
+cp -f "$ROOT/whisper_groq.py" "$APP/Contents/Resources/"
 cp -f "$ROOT/whisper_version.py" "$APP/Contents/Resources/"
 cp -f "$ROOT/whisper_update_check.py" "$APP/Contents/Resources/"
 cp -f "$ROOT/speaker_verify.py" "$APP/Contents/Resources/"

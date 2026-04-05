@@ -505,6 +505,20 @@ class WhisperHotkey:
 
 
 
+    def _local_gpu_transcribe_for_chain(self, audio: np.ndarray) -> str:
+
+        """Локальный Whisper без тостов — для цепочки с Groq."""
+
+        if self._cancel_processing.is_set():
+
+            return ""
+
+        self._load_model_impl()
+
+        return self._transcribe_audio(audio) or ""
+
+
+
     def _record_worker(self) -> None:
 
         if not _USE_PYAUDIO:
@@ -831,41 +845,153 @@ class WhisperHotkey:
 
                 tmo = self._transcribe_timeout_sec
 
-                fut = self._gpu_pool_get().submit(self._gpu_transcribe_job, audio)
+                from whisper_groq import hotkey_transcribe_backend_order
 
-                try:
+                order = hotkey_transcribe_backend_order()
 
-                    text = fut.result(timeout=tmo)
+                log.info("transcribe route=%s", order)
 
-                except concurrent.futures.TimeoutError:
+                for idx, backend in enumerate(order):
 
-                    print(f"[Whisper] Таймаут GPU ({tmo:.0f} с) — задача ещё в очереди/на видеокарте.", flush=True)
+                    if self._cancel_processing.is_set():
 
-                    log.warning("Таймаут future.result %.0f с (один GPU-поток)", tmo)
+                        return
 
-                    self._emit_toast(
+                    try:
 
-                        "Таймаут",
+                        if backend == "server":
 
-                        f"GPU не ответил за {tmo:.0f} с (WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT). Это не длина записи; после обновления hotkey короткая речь не должна упираться в минуту.",
+                            fut = self._gpu_pool_get().submit(
 
-                        True,
+                                self._local_gpu_transcribe_for_chain, audio
 
-                    )
+                            )
 
-                    self._cancel_processing.set()
+                            try:
 
-                    text = None
+                                raw = fut.result(timeout=tmo)
 
-                except Exception as e:
+                            except concurrent.futures.TimeoutError:
 
-                    print(f"[Ошибка распознавания] {e}", file=sys.stderr, flush=True)
+                                print(
 
-                    log.exception("future.result распознавания")
+                                    f"[Whisper] Таймаут GPU ({tmo:.0f} с) — задача ещё в очереди/на видеокарте.",
 
-                    self._emit_toast("Распознавание", str(e)[:200], True)
+                                    flush=True,
 
-                    text = None
+                                )
+
+                                log.warning(
+
+                                    "Таймаут future.result %.0f с (один GPU-поток)",
+
+                                    tmo,
+
+                                )
+
+                                if idx + 1 < len(order):
+
+                                    continue
+
+                                self._emit_toast(
+
+                                    "Таймаут",
+
+                                    f"GPU не ответил за {tmo:.0f} с (WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT). Это не длина записи; после обновления hotkey короткая речь не должна упираться в минуту.",
+
+                                    True,
+
+                                )
+
+                                self._cancel_processing.set()
+
+                                text = None
+
+                                break
+
+                            text = (raw or "").strip() or None
+
+                        else:
+
+                            from whisper_groq import (
+
+                                groq_http_timeout_tuple,
+
+                                post_groq_audio_transcription,
+
+                                read_hotkey_groq_api_key_pref,
+
+                            )
+
+                            import soundfile as sf
+
+                            self._emit_status("Распознавание (Groq)…")
+
+                            tmp_groq: str | None = None
+
+                            try:
+
+                                fd, tmp_groq = tempfile.mkstemp(suffix=".wav")
+
+                                os.close(fd)
+
+                                sf.write(tmp_groq, audio, self.sample_rate)
+
+                                conn, read = groq_http_timeout_tuple(read_cap=600.0)
+
+                                out = post_groq_audio_transcription(
+
+                                    tmp_groq,
+
+                                    language=self.language,
+
+                                    timeout=(conn, read),
+
+                                    log_error=log.error,
+
+                                    pref_api_key=read_hotkey_groq_api_key_pref(),
+
+                                )
+
+                                text = (out.get("text") or "").strip() or None
+
+                            finally:
+
+                                if tmp_groq:
+
+                                    try:
+
+                                        os.unlink(tmp_groq)
+
+                                    except OSError:
+
+                                        pass
+
+                        if text:
+
+                            break
+
+                        if idx + 1 < len(order):
+
+                            log.info("transcribe_empty backend=%s try_fallback", backend)
+
+                            continue
+
+                    except Exception as e:
+
+                        print(f"[Ошибка распознавания] {e}", file=sys.stderr, flush=True)
+
+                        log.exception("transcribe backend=%s", backend)
+
+                        if idx + 1 < len(order):
+
+                            continue
+
+                        self._emit_toast("Распознавание", str(e)[:200], True)
+
+                        text = None
+
+                        break
 
                 # Проверяем отмену перед дальнейшей обработкой
 
@@ -1104,6 +1230,20 @@ def main() -> int:
     from whisper_models import resolve_model
 
     configure("whisper.hotkey", "whisper_hotkey.log")
+
+
+
+    if sys.platform == "win32":
+
+        try:
+
+            from whisper_groq import load_whisper_dotenv_files
+
+            load_whisper_dotenv_files()
+
+        except ImportError:
+
+            pass
 
 
 
