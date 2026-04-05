@@ -1,12 +1,19 @@
 # Groq proxy (Railway / VPS)
 
-Если с твоей сети **api.groq.com** не открывается (например, без VPN), подними этот сервис там, где Groq доступен (Railway EU/US и т.д.), и укажи клиентам:
+Если с твоей сети **api.groq.com** не открывается (например, без VPN), подними этот сервис там, где Groq доступен (Railway EU/US и т.д.), и укажи клиентам.
+
+## Текущий деплой (команда)
+
+Публичный URL: **https://whisper-groq-proxy-production.up.railway.app**  
+Проект в Railway: `whisper-groq-proxy` (деплой из каталога `groq_proxy`: `railway up`).
 
 ```env
-WHISPER_GROQ_PROXY_URL=https://твой-сервис.up.railway.app
-# опционально, если задал PROXY_SHARED_SECRET на сервере:
-WHISPER_GROQ_PROXY_SECRET=тот_же_секрет
+WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy-production.up.railway.app
+# обязателен, если на прокси задан PROXY_SHARED_SECRET (рекомендуется):
+WHISPER_GROQ_PROXY_SECRET=<тот же секрет, что в Variables на Railway>
 ```
+
+См. также **`.env.example`** в корне репозитория whisper.
 
 На Railway в Variables:
 
