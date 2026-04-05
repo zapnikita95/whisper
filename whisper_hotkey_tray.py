@@ -391,8 +391,15 @@ def main() -> int:
         return pystray.Menu(*items)
 
     def groq_key_status_label(item: object) -> str:
-        from whisper_groq import groq_api_key_from_env, read_hotkey_groq_api_key_pref
+        from whisper_groq import (
+            groq_api_key_from_env,
+            read_hotkey_groq_api_key_pref,
+            read_hotkey_groq_proxy_url_pref,
+            resolve_groq_proxy_url,
+        )
 
+        if resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()):
+            return "Groq: прокси (Railway) ✓"
         if groq_api_key_from_env():
             return "Groq ключ: из среды / .env"
         if read_hotkey_groq_api_key_pref():
@@ -447,6 +454,81 @@ def main() -> int:
         _notify("Groq", "Ключ удалён из настроек (env не трогаем).", False, force=True)
         icon.update_menu()
 
+    def edit_groq_proxy_url(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception as e:
+            log.warning("tkinter: %s", e)
+            _notify("Прокси", "Добавь groq_proxy_url в whisper_hotkey_prefs.json или WHISPER_GROQ_PROXY_URL в .env.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Groq прокси",
+                "Базовый URL Railway без / в конце.\nПусто + OK — убрать из prefs.",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        s = (ans or "").strip().rstrip("/")
+        if not s:
+            p.pop("groq_proxy_url", None)
+        else:
+            p["groq_proxy_url"] = s
+        _save_prefs(p)
+        _notify("Groq прокси", "URL сохранён. Ключ на Railway — см. groq_proxy/README.md.", False, force=True)
+        icon.update_menu()
+
+    def edit_groq_proxy_secret(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Прокси", "groq_proxy_secret в prefs или WHISPER_GROQ_PROXY_SECRET в .env.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Секрет прокси",
+                "Как PROXY_SHARED_SECRET на Railway. Пусто + OK — убрать.",
+                show="*",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        if not (ans or "").strip():
+            p.pop("groq_proxy_secret", None)
+        else:
+            p["groq_proxy_secret"] = ans.strip()
+        _save_prefs(p)
+        _notify("Groq прокси", "Секрет сохранён.", False, force=True)
+        icon.update_menu()
+
+    def clear_groq_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p.pop("groq_proxy_url", None)
+        p.pop("groq_proxy_secret", None)
+        _save_prefs(p)
+        _notify("Groq прокси", "URL и секрет сброшены в prefs.", False, force=True)
+        icon.update_menu()
+
     def transcribe_backend_submenu():
         from whisper_groq import read_hotkey_transcribe_backend_pref, resolve_transcribe_backend_mode
 
@@ -496,6 +578,9 @@ def main() -> int:
         Item(groq_key_status_label, None, enabled=False),
         Item("Groq API ключ…", edit_groq_key),
         Item("Сбросить ключ Groq (prefs)", clear_groq_key),
+        Item("Groq прокси URL (Railway)…", edit_groq_proxy_url),
+        Item("Groq прокси секрет…", edit_groq_proxy_secret),
+        Item("Сбросить Groq прокси", clear_groq_proxy),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),

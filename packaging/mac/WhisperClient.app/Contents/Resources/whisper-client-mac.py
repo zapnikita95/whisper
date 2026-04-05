@@ -17,7 +17,7 @@ osascript/System Events: WHISPER_MAC_OSASCRIPT_TIMEOUT=25 (сек) если вс
 Сервер: WHISPER_MAC_HEALTH_TIMEOUT=30 (сек) для GET / перед отправкой; WHISPER_MAC_TRANSCRIBE_TIMEOUT=900 (сек) ожидание ответа POST /transcribe; WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT=60 (сек) установка TCP (Tailscale).
 Таймауты и порог эталона можно задать из меню 🎤 (или ~/.whisper/mac_client_prefs.json) — перекрывают env до сброса.
 Там же: режим текста (вставка / только буфер / только история), лимит длины записи, пропуск GET /, история расшифровок (~/.whisper/mac_transcription_history.json).
-Транскрипция: меню «Транскрипция» или transcribe_backend в ~/.whisper/mac_client_prefs.json — только сервер, только Groq, или фоллбэк. Ключ Groq: меню «Groq API ключ…» (сохраняется в mac_client_prefs.json) или GROQ_API_KEY / WHISPER_GROQ_API_KEY в .env (env имеет приоритет). Модель: GROQ_TRANSCRIPTION_MODEL; при 403 — автоповтор whisper-large-v3-turbo. Цепочка: WHISPER_MAC_TRANSCRIBE_BACKEND или WHISPER_TRANSCRIBE_BACKEND.
+Транскрипция: меню «Транскрипция» или transcribe_backend в ~/.whisper/mac_client_prefs.json — только сервер, только Groq, или фоллбэк. Ключ Groq: меню «Groq API ключ…» или .env (env важнее prefs). Если api.groq.com без VPN недоступен: WHISPER_GROQ_PROXY_URL + опционально WHISPER_GROQ_PROXY_SECRET — см. groq_proxy/README.md (Railway). Модель: GROQ_TRANSCRIPTION_MODEL. Цепочка: WHISPER_MAC_TRANSCRIBE_BACKEND или WHISPER_TRANSCRIBE_BACKEND.
 Снимок frontmost для Cmd+V: сначала NSWorkspace (быстро), без блокирующего osascript до старта микрофона.
 pynput: по умолчанию после каждого цикла распознавания — отложенный restart tap (иначе после CGEventPost вставки слушатель часто «молчит»). WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=0 — выключить.
 Вставка: по умолчанию сначала Quartz CGEventPost (обходит ошибку 1002 «нажатия для osascript не разрешены»), затем при провале — osascript. WHISPER_MAC_PASTE_OSASCRIPT_FIRST=1 — сначала AppleScript. WHISPER_MAC_PASTE_QUARTZ_ONLY=1 — не вызывать osascript для Cmd+V.
@@ -628,7 +628,9 @@ _MAC_CLIENT_PREF_FLOAT_KEYS = frozenset(
         "max_record_seconds",
     }
 )
-_MAC_CLIENT_PREF_STR_KEYS = frozenset({"paste_mode", "transcribe_backend", "groq_api_key"})
+_MAC_CLIENT_PREF_STR_KEYS = frozenset(
+    {"paste_mode", "transcribe_backend", "groq_api_key", "groq_proxy_url", "groq_proxy_secret"}
+)
 _MAC_CLIENT_PREF_BOOL_KEYS = frozenset({"skip_health_check"})
 _MAC_CLIENT_PREF_KEYS = _MAC_CLIENT_PREF_FLOAT_KEYS | _MAC_CLIENT_PREF_STR_KEYS | _MAC_CLIENT_PREF_BOOL_KEYS
 
@@ -711,6 +713,12 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 else:
                     cur[k] = s
                 continue
+            if k in ("groq_proxy_url", "groq_proxy_secret"):
+                if not s:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = s
+                continue
             cur[k] = s
         elif k in _MAC_CLIENT_PREF_BOOL_KEYS:
             if isinstance(v, bool):
@@ -722,10 +730,12 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
 
 
 def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
-    """Без утечки groq_api_key в лог."""
+    """Без утечки секретов в лог."""
     out = dict(prefs)
     if "groq_api_key" in out and out["groq_api_key"]:
         out["groq_api_key"] = "(задан)"
+    if "groq_proxy_secret" in out and out["groq_proxy_secret"]:
+        out["groq_proxy_secret"] = "(задан)"
     return out
 
 
@@ -758,6 +768,43 @@ end try
     if t == "__CANCEL__":
         return None
     return t
+
+
+def _mac_ascript_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _mac_osascript_prompt_line(*, title: str, message: str, ok_button: str = "Сохранить") -> str | None:
+    """Однострочный ввод; None = отмена."""
+    import subprocess
+
+    t = _mac_ascript_escape(title)
+    m = _mac_ascript_escape(message)
+    ob = _mac_ascript_escape(ok_button)
+    script = f'''
+try
+    set r to text returned of (display dialog "{m}" default answer "" with title "{t}" buttons {{"Отмена", "{ob}"}} default button "{ob}")
+    return r
+on error number -128
+    return "__CANCEL__"
+end try
+'''
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _mac_log("warning", "osascript_prompt_line err=%s", e)
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if out == "__CANCEL__":
+        return None
+    return out
 
 
 def _history_preview_title(text: str, max_len: int = 56) -> str:
@@ -1840,6 +1887,8 @@ class WhisperClientMac:
         self._pref_skip_health_check: bool | None = None
         self._pref_transcribe_backend: str | None = None
         self._pref_groq_api_key: str | None = None
+        self._pref_groq_proxy_url: str | None = None
+        self._pref_groq_proxy_secret: str | None = None
         self._menu_bar_ref: Any = None
         self._reload_mac_prefs_from_disk()
 
@@ -1864,6 +1913,12 @@ class WhisperClientMac:
         self._pref_transcribe_backend = tb.strip() if isinstance(tb, str) and tb.strip() else None
         gk = p.get("groq_api_key")
         self._pref_groq_api_key = gk.strip() if isinstance(gk, str) and gk.strip() else None
+        gu = p.get("groq_proxy_url")
+        self._pref_groq_proxy_url = (
+            gu.strip().rstrip("/") if isinstance(gu, str) and gu.strip() else None
+        )
+        gs = p.get("groq_proxy_secret")
+        self._pref_groq_proxy_secret = gs.strip() if isinstance(gs, str) and gs.strip() else None
 
     def _merge_save_mac_prefs(self, **kwargs: Any) -> None:
         merge_mac_client_prefs(dict(kwargs))
@@ -2026,9 +2081,12 @@ class WhisperClientMac:
 
     def _transcribe_post_groq(self, tmp_path: str) -> dict[str, Any]:
         """Groq OpenAI-совместимый /audio/transcriptions (см. whisper_groq)."""
-        if not self._effective_groq_api_key():
+        from whisper_groq import resolve_groq_proxy_url
+
+        proxy_on = bool(resolve_groq_proxy_url(self._pref_groq_proxy_url))
+        if not proxy_on and not self._effective_groq_api_key():
             raise ValueError(
-                "Нет ключа Groq: меню «Groq API ключ…» или GROQ_API_KEY / WHISPER_GROQ_API_KEY в .env.",
+                "Нет ключа Groq или прокси: меню «Groq API ключ…», .env, либо «Groq прокси URL» (Railway).",
             )
         _tx_conn, _tx_read = self._effective_transcribe_timeouts()
         return post_groq_audio_transcription(
@@ -2037,6 +2095,8 @@ class WhisperClientMac:
             timeout=(_tx_conn, min(_tx_read, 600.0)),
             log_error=lambda msg, *args: _mac_log("error", msg, *args),
             pref_api_key=self._pref_groq_api_key,
+            pref_proxy_url=self._pref_groq_proxy_url,
+            pref_proxy_secret=self._pref_groq_proxy_secret,
         )
 
     def _transcribe_audio_file(self, tmp_path: str) -> dict[str, Any]:
@@ -3301,6 +3361,9 @@ if rumps is not None:
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
                 rumps.MenuItem("Groq API ключ…", callback=self._groq_key_enter_menu),
                 rumps.MenuItem("Сбросить ключ Groq", callback=self._groq_key_clear_menu),
+                rumps.MenuItem("Groq прокси URL (Railway)…", callback=self._groq_proxy_url_menu),
+                rumps.MenuItem("Groq прокси секрет…", callback=self._groq_proxy_secret_menu),
+                rumps.MenuItem("Сбросить Groq прокси", callback=self._groq_proxy_clear_menu),
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
                 rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),
@@ -3403,6 +3466,38 @@ if rumps is not None:
             self.client._merge_save_mac_prefs(groq_api_key=None)
             self.menu = self._compose_menu()
             mac_banner_notification("Whisper", "Ключ Groq удалён из настроек клиента.")
+
+        def _groq_proxy_url_menu(self, _sender) -> None:
+            raw = _mac_osascript_prompt_line(
+                title="Whisper — Groq прокси",
+                message="Базовый URL без слэша в конце (Railway), напр. https://xxx.up.railway.app. Пусто + Сохранить — очистить.",
+            )
+            if raw is None:
+                return
+            s = raw.strip().rstrip("/")
+            self.client._merge_save_mac_prefs(groq_proxy_url=s if s else "")
+            self.menu = self._compose_menu()
+            mac_banner_notification(
+                "Whisper",
+                "Groq прокси URL сохранён (или очищен). Ключ на стороне прокси — см. groq_proxy/README.md.",
+            )
+
+        def _groq_proxy_secret_menu(self, _sender) -> None:
+            raw = _mac_osascript_prompt_line(
+                title="Whisper — секрет прокси",
+                message="X-Whisper-Groq-Proxy-Secret (как PROXY_SHARED_SECRET на Railway). Пусто — убрать.",
+            )
+            if raw is None:
+                return
+            s = raw.strip()
+            self.client._merge_save_mac_prefs(groq_proxy_secret=s if s else "")
+            self.menu = self._compose_menu()
+            mac_banner_notification("Whisper", "Секрет прокси сохранён (или очищен).")
+
+        def _groq_proxy_clear_menu(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(groq_proxy_url=None, groq_proxy_secret=None)
+            self.menu = self._compose_menu()
+            mac_banner_notification("Whisper", "URL и секрет Groq-прокси сброшены.")
 
         def _max_record_label_match(self, cur: float, val: float) -> bool:
             if val <= 0.0:

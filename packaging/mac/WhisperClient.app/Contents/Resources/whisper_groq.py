@@ -13,6 +13,10 @@ GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_GROQ_MODEL = "whisper-large-v3"
 FALLBACK_GROQ_MODEL = "whisper-large-v3-turbo"
 
+# Прокси (Railway/VPS), если api.groq.com с клиентской сети недоступен:
+# WHISPER_GROQ_PROXY_URL=https://xxx.up.railway.app
+# WHISPER_GROQ_PROXY_SECRET=… (если на прокси задан PROXY_SHARED_SECRET)
+
 ALLOWED_TRANSCRIBE_MODES = frozenset({"server", "groq", "server_then_groq", "groq_then_server"})
 
 
@@ -30,6 +34,28 @@ def groq_api_key_from_env() -> str | None:
     return _clean_groq_key(
         os.environ.get("GROQ_API_KEY") or os.environ.get("WHISPER_GROQ_API_KEY") or "",
     )
+
+
+def resolve_groq_proxy_url(pref_stored: str | None = None) -> str:
+    for candidate in (
+        os.environ.get("WHISPER_GROQ_PROXY_URL"),
+        os.environ.get("GROQ_PROXY_URL"),
+        pref_stored,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().rstrip("/")
+    return ""
+
+
+def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
+    for candidate in (
+        os.environ.get("WHISPER_GROQ_PROXY_SECRET"),
+        os.environ.get("GROQ_PROXY_SECRET"),
+        pref_stored,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
 
 
 def resolve_groq_api_key(pref_stored: str | None = None) -> str | None:
@@ -123,6 +149,34 @@ def hotkey_prefs_path() -> Path:
     return Path(__file__).resolve().parent / "whisper_hotkey_prefs.json"
 
 
+def read_hotkey_groq_proxy_url_pref() -> str | None:
+    p = hotkey_prefs_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    v = data.get("groq_proxy_url")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
+
+
+def read_hotkey_groq_proxy_secret_pref() -> str | None:
+    p = hotkey_prefs_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    v = data.get("groq_proxy_secret")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
+
+
 def read_hotkey_groq_api_key_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
@@ -188,19 +242,37 @@ def post_groq_audio_transcription(
     timeout: tuple[float, float],
     log_error: Callable[..., None] | None = None,
     pref_api_key: str | None = None,
+    pref_proxy_url: str | None = None,
+    pref_proxy_secret: str | None = None,
 ) -> dict[str, Any]:
+    proxy_base = resolve_groq_proxy_url(pref_proxy_url)
+    url = (
+        f"{proxy_base}/openai/v1/audio/transcriptions"
+        if proxy_base
+        else GROQ_TRANSCRIPTIONS_URL
+    )
+    use_proxy = bool(proxy_base)
+    proxy_secret = resolve_groq_proxy_secret(pref_proxy_secret)
     key = resolve_groq_api_key(pref_api_key)
-    if not key:
+
+    if not use_proxy and not key:
         raise ValueError(
             "Нет ключа Groq: GROQ_API_KEY в .env или ключ в настройках приложения "
-            "(Mac: меню 🎤; Windows: трей → Groq API ключ).",
+            "(Mac: меню 🎤; Windows: трей → Groq API ключ). "
+            "Либо задай WHISPER_GROQ_PROXY_URL на Railway-прокси (см. groq_proxy/README.md).",
         )
+
     primary = groq_transcription_model_primary()
-    headers = {
-        "Authorization": f"Bearer {key}",
+    headers: dict[str, str] = {
         "Accept": "application/json",
         "User-Agent": "WhisperClient/1.0 (Whisper Mac & Windows hotkey)",
     }
+    if proxy_secret:
+        headers["X-Whisper-Groq-Proxy-Secret"] = proxy_secret
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    elif not use_proxy:
+        raise ValueError("Внутренняя ошибка: нет ключа для прямого запроса к Groq.")
 
     def _post(model: str) -> requests.Response:
         data: list[tuple[str, str]] = [
@@ -212,7 +284,7 @@ def post_groq_audio_transcription(
         with open(wav_path, "rb") as wav:
             files = {"file": ("audio.wav", wav, "audio/wav")}
             return requests.post(
-                GROQ_TRANSCRIPTIONS_URL,
+                url,
                 headers=headers,
                 data=dict(data),
                 files=files,
@@ -231,8 +303,7 @@ def post_groq_audio_transcription(
         hint = ""
         if resp.status_code == 403:
             hint = (
-                " Новый ключ: console.groq.com; на Mac последним читается "
-                "~/Library/Application Support/WhisperClient/.env — не оставляй там пустой GROQ_API_KEY=. "
+                " Новый ключ: console.groq.com; из РФ часто нужен прокси: WHISPER_GROQ_PROXY_URL (groq_proxy на Railway). "
                 "Модель: GROQ_TRANSCRIPTION_MODEL=whisper-large-v3-turbo."
             )
         raise RuntimeError(f"groq_http_{resp.status_code}:{detail}{hint}")

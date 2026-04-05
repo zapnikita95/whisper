@@ -921,6 +921,10 @@ class WhisperHotkey:
 
                                 read_hotkey_groq_api_key_pref,
 
+                                read_hotkey_groq_proxy_secret_pref,
+
+                                read_hotkey_groq_proxy_url_pref,
+
                             )
 
                             import soundfile as sf
@@ -950,6 +954,10 @@ class WhisperHotkey:
                                     log_error=log.error,
 
                                     pref_api_key=read_hotkey_groq_api_key_pref(),
+
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+
+                                    pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
 
                                 )
 
