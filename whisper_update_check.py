@@ -37,7 +37,11 @@ def skip_update_check() -> bool:
 
 
 def _cache_path() -> str:
-    base = os.path.expanduser("~/Library/Caches/WhisperClient")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+        base = os.path.join(base, "WhisperClient", "Cache")
+    else:
+        base = os.path.expanduser("~/Library/Caches/WhisperClient")
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, "update_check_cache.json")
 
@@ -96,17 +100,27 @@ def _http_fetch(url: str, *, timeout: float = 25) -> tuple[str, bytes]:
 
 
 def _synthetic_release_from_tag_url(tag: str, final_url_hint: str) -> dict[str, Any]:
+    """Синтетический release-объект из URL тега. Включаем все артефакты, которые CI кладёт в
+    Releases (.dmg для Mac, .exe для Windows-сервера и Windows-хоткей) — имена стабильные,
+    без API-запроса мы не знаем, какие реально есть, но pick_asset_url корректно выберет нужный."""
     repo = releases_repo()
     tag = tag.strip()
     ver = tag[1:] if tag.lower().startswith("v") and len(tag) > 1 else tag
-    dmg_name = f"WhisperClient-{ver}.dmg"
-    dl = f"https://github.com/{repo}/releases/download/{tag}/{dmg_name}"
+    dl_base = f"https://github.com/{repo}/releases/download/{tag}"
+    asset_names = [
+        f"WhisperClient-{ver}.dmg",
+        f"WhisperSetup-{ver}.exe",
+        f"WhisperHotkeySetup-{ver}.exe",
+    ]
     return {
         "tag_name": tag,
         "html_url": final_url_hint
         if "/releases/tag/" in final_url_hint
         else f"https://github.com/{repo}/releases/tag/{tag}",
-        "assets": [{"name": dmg_name, "browser_download_url": dl}],
+        "assets": [
+            {"name": name, "browser_download_url": f"{dl_base}/{name}"}
+            for name in asset_names
+        ],
         "_whisper_synthetic": True,
     }
 

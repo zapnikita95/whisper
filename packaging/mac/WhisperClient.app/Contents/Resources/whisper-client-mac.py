@@ -144,6 +144,12 @@ try:
         resolve_transcribe_backend_mode,
         transcribe_backend_order,
     )
+    from whisper_vocab import (
+        apply_replacements as vocab_apply_replacements,
+        build_initial_prompt as vocab_build_initial_prompt,
+        ensure_vocab_file as vocab_ensure_file,
+        vocab_file_path,
+    )
     import requests
     import sounddevice as sd
     import numpy as np
@@ -613,10 +619,35 @@ def _mac_osascript_timeout_sec(*, fallback: float) -> float:
 
 
 def _mac_notify_progress(body: str) -> None:
-    """«Отправка на сервер» — по умолчанию только при запуске из .app (меньше шума в терминале)."""
+    """Алиас: прогресс через быстрый osascript (см. _mac_notify_progress_fast)."""
+    _mac_notify_progress_fast(body)
+
+
+def _mac_notify_progress_fast(body: str) -> None:
+    """То же по смыслу, но без whisper_notify (часто падает с rc=1) — только osascript и без ожидания процесса."""
     if os.environ.get("WHISPER_MAC_NOTIFY_PROGRESS", "1" if os.environ.get("WHISPER_FROM_APP_BUNDLE") else "0") != "1":
         return
-    mac_banner_notification("Whisper", body)
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("WHISPER_MAC_NO_NOTIFICATIONS") == "1":
+        return
+    if os.environ.get("WHISPER_MAC_NO_OSASCRIPT_NOTIFY", "").strip().lower() in ("1", "true", "yes"):
+        return
+    b = (body or "").strip()[:650]
+    esc_b = b.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        subprocess.Popen(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{esc_b}" with title "Whisper"',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        _MAC_LOGGER.debug("notify_progress_fast_failed", exc_info=True)
 
 
 _MAC_CLIENT_PREF_FLOAT_KEYS = frozenset(
@@ -631,7 +662,7 @@ _MAC_CLIENT_PREF_FLOAT_KEYS = frozenset(
 _MAC_CLIENT_PREF_STR_KEYS = frozenset(
     {"paste_mode", "transcribe_backend", "groq_api_key", "groq_proxy_url", "groq_proxy_secret"}
 )
-_MAC_CLIENT_PREF_BOOL_KEYS = frozenset({"skip_health_check"})
+_MAC_CLIENT_PREF_BOOL_KEYS = frozenset({"skip_health_check", "groq_proxy_enabled"})
 _MAC_CLIENT_PREF_KEYS = _MAC_CLIENT_PREF_FLOAT_KEYS | _MAC_CLIENT_PREF_STR_KEYS | _MAC_CLIENT_PREF_BOOL_KEYS
 
 _MAC_HISTORY_LOCK = threading.Lock()
@@ -1889,6 +1920,7 @@ class WhisperClientMac:
         self._pref_groq_api_key: str | None = None
         self._pref_groq_proxy_url: str | None = None
         self._pref_groq_proxy_secret: str | None = None
+        self._pref_groq_proxy_enabled: bool | None = None
         self._menu_bar_ref: Any = None
         self._reload_mac_prefs_from_disk()
 
@@ -1919,6 +1951,9 @@ class WhisperClientMac:
         )
         gs = p.get("groq_proxy_secret")
         self._pref_groq_proxy_secret = gs.strip() if isinstance(gs, str) and gs.strip() else None
+        self._pref_groq_proxy_enabled = None
+        if "groq_proxy_enabled" in p:
+            self._pref_groq_proxy_enabled = bool(p["groq_proxy_enabled"])
 
     def _merge_save_mac_prefs(self, **kwargs: Any) -> None:
         merge_mac_client_prefs(dict(kwargs))
@@ -1997,6 +2032,11 @@ class WhisperClientMac:
     def _effective_groq_api_key(self) -> str | None:
         return resolve_groq_api_key(self._pref_groq_api_key)
 
+    def _effective_groq_proxy_enabled(self) -> bool:
+        if self._pref_groq_proxy_enabled is None:
+            return True
+        return bool(self._pref_groq_proxy_enabled)
+
     def _effective_transcribe_backend_mode(self) -> str:
         return resolve_transcribe_backend_mode(
             self._pref_transcribe_backend,
@@ -2026,12 +2066,15 @@ class WhisperClientMac:
             )
             raise ConnectionError(f"Сервер недоступен (код {health_check.status_code})")
 
-    def _transcribe_post_server(self, tmp_path: str) -> dict[str, Any]:
+    def _transcribe_post_server(
+        self, tmp_path: str, *, initial_prompt: str | None = None
+    ) -> dict[str, Any]:
         """POST на свой Whisper-сервер; ретраи только на сетевые ошибки."""
         max_retries = 3
         response: requests.Response | None = None
         _tx_conn, _tx_read = self._effective_transcribe_timeouts()
         _post_timeout: float | tuple[float, float] = (_tx_conn, _tx_read)
+        ip = (initial_prompt or "").strip()
         for attempt in range(max_retries):
             try:
                 with open(tmp_path, "rb") as f:
@@ -2040,10 +2083,12 @@ class WhisperClientMac:
                     if self.language:
                         params["language"] = self.language
                     params["spoken_punctuation"] = str(self.spoken_punctuation).lower()
+                    data = {"initial_prompt": ip} if ip else None
                     response = requests.post(
                         f"{self.server_url}/transcribe",
                         files=files,
                         params=params,
+                        data=data,
                         headers={"X-Whisper-Client": "mac"},
                         timeout=_post_timeout,
                     )
@@ -2079,11 +2124,14 @@ class WhisperClientMac:
             _mac_log("error", "transcribe_bad_json body_prefix=%r", body)
             raise ValueError("Ответ сервера не JSON") from None
 
-    def _transcribe_post_groq(self, tmp_path: str) -> dict[str, Any]:
+    def _transcribe_post_groq(
+        self, tmp_path: str, *, prompt: str | None = None
+    ) -> dict[str, Any]:
         """Groq OpenAI-совместимый /audio/transcriptions (см. whisper_groq)."""
         from whisper_groq import resolve_groq_proxy_url
 
-        proxy_on = bool(resolve_groq_proxy_url(self._pref_groq_proxy_url))
+        proxy_enabled = self._effective_groq_proxy_enabled()
+        proxy_on = proxy_enabled and bool(resolve_groq_proxy_url(self._pref_groq_proxy_url))
         if not proxy_on and not self._effective_groq_api_key():
             raise ValueError(
                 "Нет ключа Groq или прокси: меню «Groq API ключ…», .env, либо «Groq прокси URL» (Railway).",
@@ -2097,23 +2145,44 @@ class WhisperClientMac:
             pref_api_key=self._pref_groq_api_key,
             pref_proxy_url=self._pref_groq_proxy_url,
             pref_proxy_secret=self._pref_groq_proxy_secret,
+            pref_proxy_enabled=proxy_enabled,
+            prompt=prompt,
         )
 
-    def _transcribe_audio_file(self, tmp_path: str) -> dict[str, Any]:
+    def _transcribe_audio_file(
+        self,
+        tmp_path: str,
+        *,
+        skip_progress_for_first_backend: str | None = None,
+    ) -> dict[str, Any]:
         """Цепочка бэкендов по настройке; возвращает dict с ключом text (как у своего сервера)."""
         order = self._effective_transcribe_backend_order()
         last_exc: BaseException | None = None
+        vocab_prompt, vocab_app = self._build_vocab_prompt()
         for idx, backend in enumerate(order):
             try:
+                skip_pv = idx == 0 and skip_progress_for_first_backend == backend
                 if backend == "server":
                     print("[Client] Транскрипция: свой сервер…", flush=True)
-                    _mac_notify_progress("Отправка на сервер…")
+                    if not skip_pv:
+                        _mac_notify_progress_fast("Отправка на сервер…")
                     self._server_health_check_or_raise()
-                    result = self._transcribe_post_server(tmp_path)
+                    result = self._transcribe_post_server(
+                        tmp_path, initial_prompt=vocab_prompt or None
+                    )
                 else:
                     print("[Client] Транскрипция: Groq whisper-large-v3…", flush=True)
-                    _mac_notify_progress("Отправка в Groq…")
-                    result = self._transcribe_post_groq(tmp_path)
+                    if not skip_pv:
+                        _mac_notify_progress_fast("Отправка в Groq…")
+                    result = self._transcribe_post_groq(
+                        tmp_path, prompt=vocab_prompt or None
+                    )
+                raw_text = (result.get("text") or "").strip()
+                if raw_text:
+                    replaced = self._apply_vocab_replacements(raw_text, vocab_app)
+                    if replaced != raw_text:
+                        result = dict(result)
+                        result["text"] = replaced
                 text = (result.get("text") or "").strip()
                 if text:
                     _mac_log(
@@ -2593,6 +2662,59 @@ class WhisperClientMac:
         except Exception:
             return False
 
+    def _current_app_name(self) -> str | None:
+        """Имя активного приложения (Slack/Cursor/Gmail/…) для per-app vocab-профиля."""
+        if sys.platform != "darwin":
+            return None
+        try:
+            from AppKit import NSWorkspace  # type: ignore[import-untyped]
+
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app is None:
+                return None
+            name = str(app.localizedName() or "").strip()
+            if not name:
+                try:
+                    bid = str(app.bundleIdentifier() or "").strip()
+                    if bid:
+                        name = bid.rsplit(".", 1)[-1]
+                except Exception:
+                    return None
+            if name.lower().startswith("python"):
+                return None
+            return name or None
+        except Exception as e:
+            _mac_log("debug", "current_app_name_err err=%s", e)
+            return None
+
+    def _build_vocab_prompt(self) -> tuple[str, str | None]:
+        """Возвращает (initial_prompt, app_name). Пустая строка = не слать prompt."""
+        try:
+            app_name = self._current_app_name()
+            prompt = vocab_build_initial_prompt(app_name)
+            return prompt, app_name
+        except Exception as e:
+            _mac_log("debug", "vocab_build_prompt_err err=%s", e)
+            return "", None
+
+    def _apply_vocab_replacements(self, text: str, app_name: str | None) -> str:
+        if not text:
+            return text
+        try:
+            replaced = vocab_apply_replacements(text, app_name)
+            if replaced != text:
+                _mac_log(
+                    "info",
+                    "vocab_replacements_applied app=%r before_len=%d after_len=%d",
+                    app_name,
+                    len(text),
+                    len(replaced),
+                )
+            return replaced
+        except Exception as e:
+            _mac_log("debug", "vocab_apply_err err=%s", e)
+            return text
+
     def _snapshot_frontmost_unix_pid(self) -> int | None:
         """Кто был активным при зажатии хоткея — туда же шлём Cmd+V после распознавания.
 
@@ -2969,8 +3091,16 @@ class WhisperClientMac:
                 self._busy = False
             return
 
-        # Снимок до фонового потока — пока не началась следующая запись, PID цели стабилен для этой сессии.
-        paste_target_pid = self._paste_target_unix_id
+        # Цель вставки: frontmost в момент отпускания хоткея (после долгой записи/Groq актуальнее, чем только на старте).
+        paste_stop = self._snapshot_frontmost_unix_pid()
+        paste_target_pid = paste_stop if paste_stop is not None else self._paste_target_unix_id
+        _mac_log(
+            "info",
+            "paste_target effective_pid=%s stop_snapshot=%s start_snapshot=%s",
+            paste_target_pid,
+            paste_stop,
+            self._paste_target_unix_id,
+        )
 
         def work() -> None:
             # Один поток обработки за раз — иначе два kick подряд убивают свежий Listener.
@@ -2995,6 +3125,14 @@ class WhisperClientMac:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
                     sf.write(tmp_path, audio_data, self.sample_rate)
+
+                order_pre = self._effective_transcribe_backend_order()
+                if order_pre:
+                    first_b = order_pre[0]
+                    if first_b == "groq":
+                        _mac_notify_progress_fast("Отправка в Groq…")
+                    elif first_b == "server":
+                        _mac_notify_progress_fast("Отправка на сервер…")
 
                 try:
                     if self._speaker_verify:
@@ -3038,7 +3176,10 @@ class WhisperClientMac:
                         paste_pid,
                         self._effective_transcribe_backend_order(),
                     )
-                    result = self._transcribe_audio_file(tmp_path)
+                    result = self._transcribe_audio_file(
+                        tmp_path,
+                        skip_progress_for_first_backend=order_pre[0] if order_pre else None,
+                    )
                     text = result.get("text", "").strip()
                     if os.environ.get("WHISPER_MAC_DEBUG"):
                         _mac_log("debug", "transcribe_full_text=%r", text)
@@ -3295,6 +3436,7 @@ if rumps is not None:
             self.client = client
             self.client._menu_bar_ref = self
             self._history_menu_dirty = False
+            self._mi_version = rumps.MenuItem(f"Версия {self._app_version}", callback=None)
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
             self.menu = self._compose_menu()
             # После initializeStatusBar() в rumps.App.run(), иначе клики по иконке часто «мёртвые».
@@ -3318,6 +3460,7 @@ if rumps is not None:
 
         def _compose_menu(self) -> list:
             self.client._reload_mac_prefs_from_disk()
+            self._mi_version.title = f"Версия {self._app_version}"
             self._mi_server.title = self._server_title()
             _menu_timeouts = [
                 rumps.MenuItem(
@@ -3351,7 +3494,7 @@ if rumps is not None:
                 rumps.MenuItem("Своё число…", callback=self._speaker_threshold_custom),
             ]
             return [
-                rumps.MenuItem(f"Версия {self._app_version}", callback=None),
+                self._mi_version,
                 self._mi_server,
                 rumps.separator,
                 ("Таймауты сервера", _menu_timeouts),
@@ -3359,11 +3502,8 @@ if rumps is not None:
                 # rumps: подменю только через кортеж (title, [items]) — keyword submenu= не везде есть.
                 ("История расшифровок", self._history_submenu_items()),
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
-                rumps.MenuItem("Groq API ключ…", callback=self._groq_key_enter_menu),
-                rumps.MenuItem("Сбросить ключ Groq", callback=self._groq_key_clear_menu),
-                rumps.MenuItem("Groq прокси URL (Railway)…", callback=self._groq_proxy_url_menu),
-                rumps.MenuItem("Groq прокси секрет…", callback=self._groq_proxy_secret_menu),
-                rumps.MenuItem("Сбросить Groq прокси", callback=self._groq_proxy_clear_menu),
+                ("Словарь", self._vocab_submenu_items()),
+                ("Groq API", self._groq_api_submenu_items()),
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
                 rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),
@@ -3447,6 +3587,97 @@ if rumps is not None:
 
             return _cb
 
+        def _vocab_submenu_items(self) -> list:
+            return [
+                rumps.MenuItem("Открыть словарь…", callback=self._vocab_open_menu),
+                rumps.MenuItem("Добавить из буфера…", callback=self._vocab_add_from_clipboard_menu),
+                rumps.MenuItem("Добавить замену…", callback=self._vocab_add_replacement_menu),
+                rumps.MenuItem("Показать, как видит словарь", callback=self._vocab_show_prompt_menu),
+            ]
+
+        def _vocab_open_menu(self, _sender) -> None:
+            try:
+                path = vocab_ensure_file()
+                subprocess.run(["open", "-e", path], check=False)
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось открыть файл: {e}")
+
+        def _vocab_add_from_clipboard_menu(self, _sender) -> None:
+            try:
+                raw = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=2
+                ).stdout
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось прочитать буфер: {e}")
+                return
+            term = (raw or "").strip().split("\n", 1)[0].strip()
+            if not term:
+                rumps.alert("Словарь", "Буфер пуст.")
+                return
+            from whisper_vocab import add_term
+
+            try:
+                add_term(term)
+                mac_banner_notification("Whisper", f"Термин добавлен в словарь: {term}")
+                self.menu = self._compose_menu()
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось сохранить: {e}")
+
+        def _vocab_add_replacement_menu(self, _sender) -> None:
+            from_raw = _mac_osascript_prompt_line(
+                title="Whisper — словарь",
+                message="Что заменять (regex, напр. 'кубернетес|кубер нетес'):",
+            )
+            if not from_raw:
+                return
+            to_raw = _mac_osascript_prompt_line(
+                title="Whisper — словарь",
+                message=f"На что заменять («{from_raw.strip()}»):",
+            )
+            if not to_raw:
+                return
+            from whisper_vocab import add_replacement
+
+            try:
+                add_replacement(from_raw.strip(), to_raw.strip())
+                mac_banner_notification(
+                    "Whisper", f"Замена добавлена: {from_raw.strip()} → {to_raw.strip()}"
+                )
+                self.menu = self._compose_menu()
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось сохранить: {e}")
+
+        def _vocab_show_prompt_menu(self, _sender) -> None:
+            try:
+                app = self.client._current_app_name()
+                prompt = vocab_build_initial_prompt(app)
+            except Exception as e:
+                rumps.alert("Словарь", f"Ошибка: {e}")
+                return
+            msg = (
+                f"Активное приложение: {app or '—'}\n\n"
+                f"Подсказка, которая уходит в Whisper/Groq:\n\n{prompt or '(пусто)'}\n\n"
+                f"Файл словаря: {vocab_file_path()}"
+            )
+            rumps.alert("Словарь — текущая подсказка", msg)
+
+        def _groq_api_submenu_items(self) -> list:
+            proxy_enabled = self.client._effective_groq_proxy_enabled()
+            proxy_mark = "✓ " if proxy_enabled else "   "
+            return [
+                rumps.MenuItem("Groq API ключ…", callback=self._groq_key_enter_menu),
+                rumps.MenuItem("Сбросить ключ Groq", callback=self._groq_key_clear_menu),
+                rumps.MenuItem("Что нужно для своего прокси…", callback=self._groq_proxy_help_menu),
+                rumps.MenuItem(
+                    proxy_mark + "Использовать Groq прокси",
+                    callback=self._groq_proxy_toggle_menu,
+                ),
+                rumps.MenuItem("Использовать базовый прокси", callback=self._groq_proxy_use_default_menu),
+                rumps.MenuItem("Свой Groq прокси URL…", callback=self._groq_proxy_url_menu),
+                rumps.MenuItem("Свой Groq прокси секрет…", callback=self._groq_proxy_secret_menu),
+                rumps.MenuItem("Сбросить Groq прокси", callback=self._groq_proxy_clear_menu),
+            ]
+
         def _groq_key_enter_menu(self, _sender) -> None:
             raw = _mac_osascript_prompt_groq_key()
             if raw is None:
@@ -3470,7 +3701,7 @@ if rumps is not None:
         def _groq_proxy_url_menu(self, _sender) -> None:
             raw = _mac_osascript_prompt_line(
                 title="Whisper — Groq прокси",
-                message="Базовый URL без слэша в конце (Railway), напр. https://xxx.up.railway.app. Пусто + Сохранить — очистить.",
+                message="Базовый URL прокси без слэша в конце, напр. https://proxy.example.com. Пусто + Сохранить — очистить.",
             )
             if raw is None:
                 return
@@ -3479,7 +3710,40 @@ if rumps is not None:
             self.menu = self._compose_menu()
             mac_banner_notification(
                 "Whisper",
-                "Groq прокси URL сохранён (или очищен). Ключ на стороне прокси — см. groq_proxy/README.md.",
+                "Groq прокси URL сохранён (или очищен).",
+            )
+
+        def _groq_proxy_help_menu(self, _sender) -> None:
+            rumps.alert(
+                "Groq прокси — настройки",
+                (
+                    "Для своего прокси нужно:\n"
+                    "1) задать URL,\n"
+                    "2) задать секрет (если сервер требует),\n"
+                    "3) включить «Использовать Groq прокси».\n\n"
+                    "Можно выбрать «Использовать базовый прокси» и стартовать без ручного ввода."
+                ),
+            )
+
+        def _groq_proxy_toggle_menu(self, _sender) -> None:
+            enabled = not self.client._effective_groq_proxy_enabled()
+            self.client._merge_save_mac_prefs(groq_proxy_enabled=enabled)
+            self.menu = self._compose_menu()
+            if enabled:
+                mac_banner_notification("Whisper", "Groq прокси включен.")
+            else:
+                mac_banner_notification("Whisper", "Groq прокси выключен (используется прямой Groq).")
+
+        def _groq_proxy_use_default_menu(self, _sender) -> None:
+            self.client._merge_save_mac_prefs(
+                groq_proxy_enabled=True,
+                groq_proxy_url="https://whisper-groq-proxy-production.up.railway.app",
+                groq_proxy_secret=None,
+            )
+            self.menu = self._compose_menu()
+            mac_banner_notification(
+                "Whisper",
+                "Выбран базовый прокси. При необходимости добавь секрет прокси.",
             )
 
         def _groq_proxy_secret_menu(self, _sender) -> None:
@@ -3982,6 +4246,42 @@ else:
     WhisperMenuBarApp = None  # type: ignore[misc, assignment]
 
 
+def _pick_server_url_script_candidates() -> list[Path]:
+    """Рядом со скриптом (.app Resources) или в packaging/mac при запуске из репозитория."""
+    base = Path(__file__).resolve().parent
+    return [
+        base / "pick_server_url.py",
+        base / "packaging" / "mac" / "pick_server_url.py",
+    ]
+
+
+def _resolve_server_url(cli_server: str | None) -> str | None:
+    """--server, затем WHISPER_MAC_SERVER_URL / WHISPER_SERVER_URL, затем pick_server_url.py."""
+    if cli_server and str(cli_server).strip():
+        return str(cli_server).strip().rstrip("/")
+    for key in ("WHISPER_MAC_SERVER_URL", "WHISPER_SERVER_URL", "WHISPER_SERVER"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v.rstrip("/")
+    for pick in _pick_server_url_script_candidates():
+        if not pick.is_file():
+            continue
+        try:
+            out = subprocess.run(
+                [sys.executable, str(pick)],
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+            )
+            s = (out.stdout or "").strip().rstrip("/")
+            if s and out.returncode == 0:
+                return s
+        except Exception:
+            continue
+    return None
+
+
 def main() -> int:
     _dotenv_loaded = _load_whisper_mac_env_files()
     log_path = configure_whisper_mac_logging()
@@ -4037,7 +4337,7 @@ def main() -> int:
     p.add_argument(
         "--server",
         default=None,
-        help="URL сервера (например: http://192.168.1.100:8000); не нужен только с --enroll-speaker",
+        help="URL сервера; если не задан — WHISPER_MAC_SERVER_URL или pick_server_url.py (см. run.sh). Не нужен только с --enroll-speaker",
     )
     p.add_argument("--language", default=None, help="ru, en или авто")
     p.add_argument(
@@ -4114,8 +4414,12 @@ def main() -> int:
         else:
             os.environ["WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC"] = str(int(max(60.0, v)))
 
-    if not args.enroll_speaker and not args.server:
-        p.error("нужен --server (или только --enroll-speaker WAV для эталона голоса)")
+    resolved_server = _resolve_server_url(args.server)
+    if not args.enroll_speaker and not resolved_server:
+        p.error(
+            "нужен --server, или WHISPER_MAC_SERVER_URL / WHISPER_SERVER_URL в .env, "
+            "или доступный pick_server_url.py (см. run.sh); либо только --enroll-speaker WAV"
+        )
 
     if args.enroll_speaker:
         try:
@@ -4141,7 +4445,7 @@ def main() -> int:
     except ImportError:
         pass
 
-    _mac_log("info", "server=%s log_file=%s", args.server, log_path)
+    _mac_log("info", "server=%s log_file=%s", resolved_server, log_path)
     if not sys.stdout.isatty():
         print(f"[Client] Подробный лог: {log_path}", flush=True)
 
@@ -4197,7 +4501,7 @@ def main() -> int:
                 "-t",
                 "WhisperClient",
                 "Старт pid=%s server=%s hotkey=%s"
-                % (os.getpid(), args.server, describe_hotkey(hotkey)),
+                % (os.getpid(), resolved_server, describe_hotkey(hotkey)),
             ],
             check=False,
             capture_output=True,
@@ -4339,7 +4643,7 @@ def main() -> int:
             return 0
 
     client = WhisperClientMac(
-        server_url=args.server,
+        server_url=resolved_server,
         language=args.language,
         spoken_punctuation=not args.no_spoken_punctuation,
         hotkey=hotkey,

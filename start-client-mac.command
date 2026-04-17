@@ -69,14 +69,33 @@ else
 		fi
 	fi
 	if [ -z "$SERVER_URL" ]; then
-		echo "Поиск Whisper API на $H:8000–8010 (параллельно, ~2 c)…"
+		echo "Поиск Whisper API на $H:8000–8020 (параллельно)…"
 		if DETECTED="$("$PY" "$HERE/packaging/mac/pick_server_url.py" 2>/dev/null)" && [ -n "$DETECTED" ]; then
 			SERVER_URL="$DETECTED"
 			echo "✓ Сервер: $SERVER_URL"
 		else
-			SERVER_URL="http://${H}:8000"
-			echo "⚠ API не ответил — подставляю $SERVER_URL (клиент всё равно запустится)."
+			SERVER_URL=""
+			for port in ${WHISPER_MAC_SERVER_FALLBACK_PORTS:-8001 8000 8002 8003 8004 8005 8006 8007 8008 8009 8010 8011 8012 8013 8014 8015 8016 8017 8018 8019 8020}; do
+				if "$PY" -c "
+import json, sys, urllib.error, urllib.request
+h, port = sys.argv[1], int(sys.argv[2])
+try:
+    r = urllib.request.urlopen(f'http://{h}:{port}/', timeout=2.5)
+    d = json.loads(r.read().decode())
+    raise SystemExit(0 if d.get('status') == 'ok' and 'model' in d else 1)
+except Exception:
+    raise SystemExit(1)
+" "$H" "$port" 2>/dev/null; then
+					SERVER_URL="http://${H}:${port}"
+					break
+				fi
+			done
+			if [ -z "$SERVER_URL" ]; then
+				SERVER_URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8000}"
+			fi
+			echo "⚠ Авто-поиск не сработал — подставляю $SERVER_URL (клиент всё равно запустится)."
 			echo "  Укажи IP: export WHISPER_MAC_SERVER_HOST=твой_tailscale_ip"
+			echo "  Или порт: export WHISPER_MAC_SERVER_PORT=8001"
 			echo "  Или URL: ./start-client-mac.command 'http://IP:ПОРТ'"
 		fi
 	fi

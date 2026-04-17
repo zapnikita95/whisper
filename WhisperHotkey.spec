@@ -13,7 +13,7 @@ for _nv_sub in ("cublas", "cudnn", "cusparse", "cufft", "curand", "nvjitlink"):
     if _p.is_dir():
         datas.append((str(_p), f"nvidia/{_nv_sub}"))
 binaries = []
-hiddenimports = ['whisper_hotkey_core', 'whisper_hotkey_tray', 'whisper_groq', 'whisper_models', 'whisper_file_log', 'whisper_nvidia_path', 'speaker_verify', 'faster_whisper', 'whisper_version', 'keyboard', 'pyaudio', 'pyperclip', 'soundfile', 'numpy', 'plyer.platforms.win.notification', 'pystray', 'PIL', 'PIL.Image', 'requests', 'tkinter', 'tkinter.simpledialog']
+hiddenimports = ['whisper_hotkey_core', 'whisper_hotkey_tray', 'whisper_groq', 'whisper_vocab', 'whisper_models', 'whisper_file_log', 'whisper_nvidia_path', 'speaker_verify', 'faster_whisper', 'whisper_version', 'keyboard', 'pyaudio', 'pyperclip', 'soundfile', 'numpy', 'plyer.platforms.win.notification', 'pystray', 'PIL', 'PIL.Image', 'requests', 'tkinter', 'tkinter.simpledialog']
 tmp_ret = collect_all('torch')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('resemblyzer')

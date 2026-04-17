@@ -394,12 +394,16 @@ def main() -> int:
         from whisper_groq import (
             groq_api_key_from_env,
             read_hotkey_groq_api_key_pref,
+            read_hotkey_groq_proxy_enabled_pref,
             read_hotkey_groq_proxy_url_pref,
             resolve_groq_proxy_url,
         )
 
+        proxy_enabled = read_hotkey_groq_proxy_enabled_pref()
+        if proxy_enabled is False:
+            return "Groq: прокси выключен"
         if resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()):
-            return "Groq: прокси (Railway) ✓"
+            return "Groq: прокси ✓"
         if groq_api_key_from_env():
             return "Groq ключ: из среды / .env"
         if read_hotkey_groq_api_key_pref():
@@ -471,7 +475,7 @@ def main() -> int:
         try:
             ans = simpledialog.askstring(
                 "Groq прокси",
-                "Базовый URL Railway без / в конце.\nПусто + OK — убрать из prefs.",
+                "Базовый URL прокси без / в конце.\nПусто + OK — убрать из prefs.",
                 parent=root,
             )
         finally:
@@ -485,8 +489,55 @@ def main() -> int:
         else:
             p["groq_proxy_url"] = s
         _save_prefs(p)
-        _notify("Groq прокси", "URL сохранён. Ключ на Railway — см. groq_proxy/README.md.", False, force=True)
+        _notify("Groq прокси", "URL сохранён. Ключ на стороне прокси — см. groq_proxy/README.md.", False, force=True)
         icon.update_menu()
+
+    def toggle_groq_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        cur = p.get("groq_proxy_enabled")
+        if isinstance(cur, bool):
+            enabled = cur
+        elif isinstance(cur, (int, float)):
+            enabled = bool(cur)
+        elif isinstance(cur, str):
+            enabled = cur.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            enabled = True
+        p["groq_proxy_enabled"] = not enabled
+        _save_prefs(p)
+        _notify(
+            "Groq прокси",
+            "Прокси включен." if (not enabled) else "Прокси выключен (прямой Groq).",
+            False,
+            force=True,
+        )
+        icon.update_menu()
+
+    def use_default_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p["groq_proxy_enabled"] = True
+        p["groq_proxy_url"] = "https://whisper-groq-proxy-production.up.railway.app"
+        p.pop("groq_proxy_secret", None)
+        _save_prefs(p)
+        _notify(
+            "Groq прокси",
+            "Базовый прокси выбран. При необходимости добавь секрет прокси.",
+            False,
+            force=True,
+        )
+        icon.update_menu()
+
+    def show_proxy_help(icon: pystray.Icon, item: object) -> None:
+        _notify(
+            "Groq прокси — настройки",
+            (
+                "Для своего прокси укажи: 1) URL, 2) секрет (если сервер требует), "
+                "3) включи «Использовать Groq прокси». "
+                "Можно выбрать «Использовать базовый прокси» и работать сразу."
+            ),
+            False,
+            force=True,
+        )
 
     def edit_groq_proxy_secret(icon: pystray.Icon, item: object) -> None:
         try:
@@ -523,11 +574,113 @@ def main() -> int:
 
     def clear_groq_proxy(icon: pystray.Icon, item: object) -> None:
         p = _load_prefs()
+        p.pop("groq_proxy_enabled", None)
         p.pop("groq_proxy_url", None)
         p.pop("groq_proxy_secret", None)
         _save_prefs(p)
         _notify("Groq прокси", "URL и секрет сброшены в prefs.", False, force=True)
         icon.update_menu()
+
+    def groq_proxy_toggle_label(item: object) -> str:
+        p = _load_prefs()
+        cur = p.get("groq_proxy_enabled")
+        if isinstance(cur, bool):
+            on = cur
+        elif isinstance(cur, (int, float)):
+            on = bool(cur)
+        elif isinstance(cur, str):
+            on = cur.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            on = True
+        mark = "✓ " if on else ""
+        return f"{mark}Использовать Groq прокси"
+
+    def open_vocab_file(icon: pystray.Icon, item: object) -> None:
+        try:
+            from whisper_vocab import ensure_vocab_file
+
+            path = ensure_vocab_file()
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception as e:
+            _notify("Словарь", f"Не удалось открыть файл: {e}", True)
+
+    def vocab_add_from_clipboard(icon: pystray.Icon, item: object) -> None:
+        try:
+            import pyperclip
+
+            raw = pyperclip.paste() or ""
+        except Exception as e:
+            _notify("Словарь", f"Не удалось прочитать буфер: {e}", True)
+            return
+        term = (raw or "").strip().split("\n", 1)[0].strip()
+        if not term:
+            _notify("Словарь", "Буфер пуст.", True)
+            return
+        try:
+            from whisper_vocab import add_term
+
+            add_term(term)
+            _notify("Словарь", f"Термин добавлен: {term}", False, force=True)
+        except Exception as e:
+            _notify("Словарь", f"Не удалось сохранить: {e}", True)
+
+    def vocab_add_replacement(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Словарь", "Открой ~/.whisper/vocab.json вручную.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            frm = simpledialog.askstring(
+                "Словарь — замена",
+                "Что заменять (regex, напр. 'кубернетес|кубер нетес'):",
+                parent=root,
+            )
+            if not frm:
+                return
+            to = simpledialog.askstring(
+                "Словарь — замена",
+                f"На что заменять («{frm.strip()}»):",
+                parent=root,
+            )
+            if not to:
+                return
+        finally:
+            root.destroy()
+        try:
+            from whisper_vocab import add_replacement
+
+            add_replacement(frm.strip(), to.strip())
+            _notify("Словарь", f"Замена сохранена: {frm.strip()} → {to.strip()}", False, force=True)
+        except Exception as e:
+            _notify("Словарь", f"Не удалось сохранить: {e}", True)
+
+    def vocab_submenu():
+        return pystray.Menu(
+            Item("Открыть словарь…", open_vocab_file),
+            Item("Добавить из буфера…", vocab_add_from_clipboard),
+            Item("Добавить замену…", vocab_add_replacement),
+        )
+
+    def groq_api_submenu():
+        return pystray.Menu(
+            Item(groq_key_status_label, None, enabled=False),
+            Item("Groq API ключ…", edit_groq_key),
+            Item("Сбросить ключ Groq (prefs)", clear_groq_key),
+            Item("Что нужно для своего прокси…", show_proxy_help),
+            Item(groq_proxy_toggle_label, toggle_groq_proxy),
+            Item("Использовать базовый прокси", use_default_proxy),
+            Item("Свой Groq прокси URL…", edit_groq_proxy_url),
+            Item("Свой Groq прокси секрет…", edit_groq_proxy_secret),
+            Item("Сбросить Groq прокси", clear_groq_proxy),
+        )
 
     def transcribe_backend_submenu():
         from whisper_groq import read_hotkey_transcribe_backend_pref, resolve_transcribe_backend_mode
@@ -575,12 +728,8 @@ def main() -> int:
         Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item("Модель → (перезапуск)", model_submenu()),
         Item("Транскрипция → (перезапуск)", transcribe_backend_submenu()),
-        Item(groq_key_status_label, None, enabled=False),
-        Item("Groq API ключ…", edit_groq_key),
-        Item("Сбросить ключ Groq (prefs)", clear_groq_key),
-        Item("Groq прокси URL (Railway)…", edit_groq_proxy_url),
-        Item("Groq прокси секрет…", edit_groq_proxy_secret),
-        Item("Сбросить Groq прокси", clear_groq_proxy),
+        Item("Словарь →", vocab_submenu()),
+        Item("Groq API →", groq_api_submenu()),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),

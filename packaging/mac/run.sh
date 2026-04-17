@@ -139,8 +139,30 @@ export PYTHONDONTWRITEBYTECODE=1
 
 if URL="$("$PY" "$R/pick_server_url.py" 2>/dev/null)" && [ -n "$URL" ]; then
 	:
+elif [ -n "${WHISPER_MAC_SERVER_URL:-}${WHISPER_SERVER_URL:-}" ]; then
+	URL="${WHISPER_MAC_SERVER_URL:-${WHISPER_SERVER_URL:-}}"
+	URL="${URL%/}"
 else
-	URL="http://${WHISPER_MAC_SERVER_HOST:-100.115.68.2}:8000"
+	H="${WHISPER_MAC_SERVER_HOST:-100.115.68.2}"
+	URL=""
+	for port in ${WHISPER_MAC_SERVER_FALLBACK_PORTS:-8001 8000 8002 8003 8004 8005 8006 8007 8008 8009 8010 8011 8012 8013 8014 8015 8016 8017 8018 8019 8020}; do
+		if "$PY" -c "
+import json, sys, urllib.error, urllib.request
+h, port = sys.argv[1], int(sys.argv[2])
+try:
+    r = urllib.request.urlopen(f'http://{h}:{port}/', timeout=2.5)
+    d = json.loads(r.read().decode())
+    raise SystemExit(0 if d.get('status') == 'ok' and 'model' in d else 1)
+except Exception:
+    raise SystemExit(1)
+" "$H" "$port" 2>/dev/null; then
+			URL="http://${H}:${port}"
+			break
+		fi
+	done
+	if [ -z "$URL" ]; then
+		URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8000}"
+	fi
 fi
 
 # Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.

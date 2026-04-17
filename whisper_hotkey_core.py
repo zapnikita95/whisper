@@ -31,8 +31,13 @@ import time
 from pathlib import Path
 
 from collections.abc import Callable
+from typing import Any
 
 from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+from whisper_vocab import (
+    apply_replacements as vocab_apply_replacements,
+    build_initial_prompt as vocab_build_initial_prompt,
+)
 
 
 log = logging.getLogger("whisper.hotkey")
@@ -505,7 +510,60 @@ class WhisperHotkey:
 
 
 
-    def _local_gpu_transcribe_for_chain(self, audio: np.ndarray) -> str:
+    def _current_app_name(self) -> str | None:
+        """Имя активного приложения (для per-app профиля словаря). Только Windows."""
+        if sys.platform != "win32":
+            return None
+        try:
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            length = user32.GetWindowTextLengthW(hwnd) or 0
+            if length <= 0:
+                return None
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = (buf.value or "").strip()
+            if not title:
+                return None
+            for sep in (" — ", " - ", " – "):
+                if sep in title:
+                    title = title.split(sep)[-1].strip()
+                    break
+            return title or None
+        except Exception as e:
+            log.debug("current_app_name_err: %s", e)
+            return None
+
+    def _vocab_prompt_for_current_app(self) -> tuple[str, str | None]:
+        try:
+            app = self._current_app_name()
+            return vocab_build_initial_prompt(app), app
+        except Exception as e:
+            log.debug("vocab_build_prompt_err: %s", e)
+            return "", None
+
+    def _apply_vocab_replacements_local(self, text: str, app_name: str | None) -> str:
+        if not text:
+            return text
+        try:
+            replaced = vocab_apply_replacements(text, app_name)
+            if replaced != text:
+                log.info(
+                    "vocab_replacements_applied app=%r before=%d after=%d",
+                    app_name,
+                    len(text),
+                    len(replaced),
+                )
+            return replaced
+        except Exception as e:
+            log.debug("vocab_apply_err: %s", e)
+            return text
+
+    def _local_gpu_transcribe_for_chain(
+        self, audio: np.ndarray, *, initial_prompt: str | None = None
+    ) -> str:
 
         """Локальный Whisper без тостов — для цепочки с Groq."""
 
@@ -515,7 +573,7 @@ class WhisperHotkey:
 
         self._load_model_impl()
 
-        return self._transcribe_audio(audio) or ""
+        return self._transcribe_audio(audio, initial_prompt=initial_prompt) or ""
 
 
 
@@ -851,6 +909,8 @@ class WhisperHotkey:
 
                 log.info("transcribe route=%s", order)
 
+                vocab_prompt, vocab_app = self._vocab_prompt_for_current_app()
+
                 for idx, backend in enumerate(order):
 
                     if self._cancel_processing.is_set():
@@ -862,9 +922,9 @@ class WhisperHotkey:
                         if backend == "server":
 
                             fut = self._gpu_pool_get().submit(
-
-                                self._local_gpu_transcribe_for_chain, audio
-
+                                self._local_gpu_transcribe_for_chain,
+                                audio,
+                                initial_prompt=vocab_prompt or None,
                             )
 
                             try:
@@ -920,6 +980,7 @@ class WhisperHotkey:
                                 post_groq_audio_transcription,
 
                                 read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_enabled_pref,
 
                                 read_hotkey_groq_proxy_secret_pref,
 
@@ -958,6 +1019,9 @@ class WhisperHotkey:
                                     pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
 
                                     pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                                    pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+
+                                    prompt=vocab_prompt or None,
 
                                 )
 
@@ -1014,6 +1078,8 @@ class WhisperHotkey:
                     if self.spoken_punctuation:
 
                         text = apply_spoken_punctuation(text)
+
+                    text = self._apply_vocab_replacements_local(text, vocab_app)
 
                     if text and not self._cancel_processing.is_set():
 
@@ -1087,7 +1153,9 @@ class WhisperHotkey:
 
 
 
-    def _transcribe_audio(self, audio: np.ndarray) -> str:
+    def _transcribe_audio(
+        self, audio: np.ndarray, *, initial_prompt: str | None = None
+    ) -> str:
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
 
@@ -1100,16 +1168,14 @@ class WhisperHotkey:
             sf.write(tmp_path, audio, self.sample_rate)
 
             try:
-
-                segments, info = self.model.transcribe(
-
-                    tmp_path,
-
-                    language=self.language,
-
-                    beam_size=5,
-
-                )
+                _kwargs: dict[str, Any] = {
+                    "language": self.language,
+                    "beam_size": 5,
+                }
+                ip = (initial_prompt or "").strip()
+                if ip:
+                    _kwargs["initial_prompt"] = ip
+                segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
                 # Собираем ВСЕ сегменты (генератор нужно полностью прочитать)
                 text_parts = []

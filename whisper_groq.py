@@ -58,6 +58,18 @@ def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
     return ""
 
 
+def resolve_groq_proxy_enabled(pref_stored: bool | None = None) -> bool:
+    for name in ("WHISPER_GROQ_PROXY_ENABLED", "GROQ_PROXY_ENABLED"):
+        raw = (os.environ.get(name) or "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    if pref_stored is None:
+        return True
+    return bool(pref_stored)
+
+
 def resolve_groq_api_key(pref_stored: str | None = None) -> str | None:
     """Сначала переменные окружения, иначе ключ из настроек (JSON prefs)."""
     k = groq_api_key_from_env()
@@ -177,6 +189,28 @@ def read_hotkey_groq_proxy_secret_pref() -> str | None:
     return None
 
 
+def read_hotkey_groq_proxy_enabled_pref() -> bool | None:
+    p = hotkey_prefs_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    v = data.get("groq_proxy_enabled")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
 def read_hotkey_groq_api_key_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
@@ -244,16 +278,21 @@ def post_groq_audio_transcription(
     pref_api_key: str | None = None,
     pref_proxy_url: str | None = None,
     pref_proxy_secret: str | None = None,
+    pref_proxy_enabled: bool | None = None,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
-    proxy_base = resolve_groq_proxy_url(pref_proxy_url)
+    proxy_enabled = resolve_groq_proxy_enabled(pref_proxy_enabled)
+    proxy_base = resolve_groq_proxy_url(pref_proxy_url) if proxy_enabled else ""
     url = (
         f"{proxy_base}/openai/v1/audio/transcriptions"
         if proxy_base
         else GROQ_TRANSCRIPTIONS_URL
     )
     use_proxy = bool(proxy_base)
-    proxy_secret = resolve_groq_proxy_secret(pref_proxy_secret)
-    key = resolve_groq_api_key(pref_api_key)
+    proxy_secret = resolve_groq_proxy_secret(pref_proxy_secret) if proxy_enabled else ""
+    env_key = groq_api_key_from_env()
+    pref_key = _clean_groq_key(pref_api_key)
+    key = env_key or pref_key
 
     if not use_proxy and not key:
         raise ValueError(
@@ -269,33 +308,66 @@ def post_groq_audio_transcription(
     }
     if proxy_secret:
         headers["X-Whisper-Groq-Proxy-Secret"] = proxy_secret
-    if key:
+    # Через прокси по умолчанию НЕ пробрасываем локальный ключ, чтобы серверный GROQ_API_KEY на прокси
+    # работал даже если у клиента в .env/prefs лежит устаревший ключ.
+    passthrough_auth = (os.environ.get("WHISPER_GROQ_PROXY_PASSTHROUGH_AUTH") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if key and (not use_proxy or passthrough_auth):
         headers["Authorization"] = f"Bearer {key}"
     elif not use_proxy:
         raise ValueError("Внутренняя ошибка: нет ключа для прямого запроса к Groq.")
 
-    def _post(model: str) -> requests.Response:
+    prompt_str = (prompt or "").strip()
+
+    def _post(model: str, *, auth_key: str | None) -> requests.Response:
         data: list[tuple[str, str]] = [
             ("model", model),
             ("response_format", "json"),
         ]
         if language:
             data.append(("language", language))
+        if prompt_str:
+            data.append(("prompt", prompt_str))
+        req_headers = dict(headers)
+        if auth_key:
+            req_headers["Authorization"] = f"Bearer {auth_key}"
+        else:
+            req_headers.pop("Authorization", None)
         with open(wav_path, "rb") as wav:
             files = {"file": ("audio.wav", wav, "audio/wav")}
             return requests.post(
                 url,
-                headers=headers,
+                headers=req_headers,
                 data=dict(data),
                 files=files,
                 timeout=timeout,
             )
 
-    resp = _post(primary)
+    auth_key = key if (not use_proxy or passthrough_auth) else None
+    resp = _post(primary, auth_key=auth_key)
+    # Для proxy-маршрута: если серверный ключ на прокси устарел, пробуем клиентские ключи.
+    if use_proxy and not passthrough_auth and resp.status_code == 401:
+        body = (resp.text or "").lower()
+        if "invalid api key" in body or "invalid_api_key" in body:
+            fallback_keys: list[str] = []
+            if pref_key:
+                fallback_keys.append(pref_key)
+            if env_key and env_key != pref_key:
+                fallback_keys.append(env_key)
+            for fk in fallback_keys:
+                if log_error:
+                    log_error("groq_proxy_401_retry_with_client_key")
+                resp = _post(primary, auth_key=fk)
+                if resp.status_code != 401:
+                    break
     if resp.status_code == 403 and primary == DEFAULT_GROQ_MODEL:
         if log_error:
             log_error("groq_transcribe_403_retry model=%s -> %s", primary, FALLBACK_GROQ_MODEL)
-        resp = _post(FALLBACK_GROQ_MODEL)
+        resp = _post(FALLBACK_GROQ_MODEL, auth_key=auth_key)
     if resp.status_code >= 400:
         detail = (resp.text or "")[:400]
         if log_error:

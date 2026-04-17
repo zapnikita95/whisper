@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 try:
-    from fastapi import FastAPI, File, Request, UploadFile, HTTPException
+    from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
     import numpy as np
@@ -240,11 +240,14 @@ async def transcribe(
     audio: UploadFile = File(...),
     language: str | None = None,
     spoken_punctuation: bool = True,
+    initial_prompt: str | None = Form(None),
 ):
     touch_client_from_request(request)
 
     if not audio.content_type or "audio" not in audio.content_type.lower():
         raise HTTPException(status_code=400, detail="Ожидается аудио файл")
+
+    initial_prompt = (initial_prompt or "").strip() or None
 
     try:
         contents = await audio.read()
@@ -267,13 +270,19 @@ async def transcribe(
                 data = data[:, 0]
 
             model = get_model()
+            transcribe_kwargs: dict[str, Any] = {
+                "language": language,
+                "beam_size": 5,
+            }
+            if initial_prompt:
+                transcribe_kwargs["initial_prompt"] = initial_prompt
             try:
-                segments, info = model.transcribe(tmp_path, language=language, beam_size=5)
+                segments, info = model.transcribe(tmp_path, **transcribe_kwargs)
             except Exception as e:
                 if not _switch_to_cpu_after_cuda_failure(e):
                     raise
                 model = get_model()
-                segments, info = model.transcribe(tmp_path, language=language, beam_size=5)
+                segments, info = model.transcribe(tmp_path, **transcribe_kwargs)
 
             text_parts = []
             for seg in segments:
