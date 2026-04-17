@@ -158,6 +158,21 @@ def _cpu_safe_compute_type(ct: str) -> str:
     return c or "int8"
 
 
+def _switch_to_cpu_after_cuda_failure(exc: BaseException) -> bool:
+    """Переключает глобальную модель на CPU после CUDA-сбоев; возвращает True если переключили."""
+    global _model, _device, _compute_type
+    if _device != "cuda" or not _cuda_init_failure(exc):
+        return False
+    log.warning(
+        "CUDA ошибка во время инференса (%s) — переключение на CPU и повтор запроса.",
+        exc,
+    )
+    _model = None
+    _device = "cpu"
+    _compute_type = _cpu_safe_compute_type(_compute_type)
+    return True
+
+
 def get_model() -> Any:
     global _model, _device, _compute_type
     if _model is None:
@@ -252,7 +267,13 @@ async def transcribe(
                 data = data[:, 0]
 
             model = get_model()
-            segments, info = model.transcribe(tmp_path, language=language, beam_size=5)
+            try:
+                segments, info = model.transcribe(tmp_path, language=language, beam_size=5)
+            except Exception as e:
+                if not _switch_to_cpu_after_cuda_failure(e):
+                    raise
+                model = get_model()
+                segments, info = model.transcribe(tmp_path, language=language, beam_size=5)
 
             text_parts = []
             for seg in segments:
