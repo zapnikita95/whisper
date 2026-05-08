@@ -161,7 +161,7 @@ except Exception:
 		fi
 	done
 	if [ -z "$URL" ]; then
-		URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8000}"
+		URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8001}"
 	fi
 fi
 

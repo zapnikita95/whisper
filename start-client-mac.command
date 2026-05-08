@@ -91,7 +91,7 @@ except Exception:
 				fi
 			done
 			if [ -z "$SERVER_URL" ]; then
-				SERVER_URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8000}"
+				SERVER_URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8001}"
 			fi
 			echo "⚠ Авто-поиск не сработал — подставляю $SERVER_URL (клиент всё равно запустится)."
 			echo "  Укажи IP: export WHISPER_MAC_SERVER_HOST=твой_tailscale_ip"
