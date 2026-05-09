@@ -806,6 +806,42 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
     path.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _mac_ui_ask_string(
+    *,
+    title: str,
+    message: str,
+    default: str = "",
+    password: bool = False,
+) -> str | None:
+    """Строковый ввод из меню: на macOS сначала AppKit (Tk из NSMenu часто не показывает окно)."""
+    import sys
+
+    if sys.platform == "darwin":
+        try:
+            from whisper_mac_cocoa_dialogs import mac_cocoa_ask_string
+
+            return mac_cocoa_ask_string(
+                title=title,
+                message=message,
+                default=default,
+                password=password,
+            )
+        except Exception as e:
+            _mac_log("warning", "mac_ui_ask_string cocoa err=%s", e)
+    try:
+        from whisper_mac_tk_dialogs import mac_tk_ask_string
+
+        return mac_tk_ask_string(
+            title=title,
+            message=message,
+            default=default,
+            password=password,
+        )
+    except Exception as e:
+        _mac_log("warning", "mac_ui_ask_string tk err=%s", e)
+        return None
+
+
 def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
     """Без утечки секретов в лог."""
     out = dict(prefs)
@@ -817,22 +853,16 @@ def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _mac_osascript_prompt_groq_key() -> str | None:
-    """Диалог ввода ключа Groq; None = отмена (Tk, без osascript — быстрее из menubar)."""
-    try:
-        from whisper_mac_tk_dialogs import mac_tk_ask_string
-
-        return mac_tk_ask_string(
-            title="Whisper — Groq",
-            message=(
-                "API-ключ Groq (gsk_…). Сохранить в ~/.whisper/mac_client_prefs.json. "
-                "Пусто + Сохранить — очистить ключ в prefs."
-            ),
-            default="",
-            password=True,
-        )
-    except Exception as e:
-        _mac_log("warning", "tk_groq_key_dialog err=%s", e)
-        return None
+    """Диалог ввода ключа Groq; None = отмена (Cocoa из меню, иначе Tk)."""
+    return _mac_ui_ask_string(
+        title="Whisper — Groq",
+        message=(
+            "API-ключ Groq (gsk_…). Сохранить в ~/.whisper/mac_client_prefs.json. "
+            "Пусто + Сохранить — очистить ключ в prefs."
+        ),
+        default="",
+        password=True,
+    )
 
 
 def _mac_osascript_prompt_line(
@@ -842,19 +872,13 @@ def _mac_osascript_prompt_line(
     ok_button: str = "Сохранить",
     default_answer: str = "",
 ) -> str | None:
-    """Однострочный ввод; None = отмена. ok_button зарезервирован (кнопка всегда «Сохранить» в Tk)."""
-    try:
-        from whisper_mac_tk_dialogs import mac_tk_ask_string
-
-        return mac_tk_ask_string(
-            title=title,
-            message=message,
-            default=default_answer,
-            password=False,
-        )
-    except Exception as e:
-        _mac_log("warning", "tk_prompt_line err=%s", e)
-        return None
+    """Однострочный ввод; None = отмена. ok_button зарезервирован (кнопка «Сохранить» в UI)."""
+    return _mac_ui_ask_string(
+        title=title,
+        message=message,
+        default=default_answer,
+        password=False,
+    )
 
 
 def _history_preview_title(text: str, max_len: int = 56) -> str:
@@ -3507,9 +3531,8 @@ if rumps is not None:
         def _edit_server_host_port_menu(self, _sender) -> None:
             try:
                 from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
-                from whisper_mac_tk_dialogs import mac_tk_server_host_port_dialog
             except ImportError as e:
-                rumps.alert("Ошибка", f"Не удалось загрузить диалог: {e}")
+                rumps.alert("Ошибка", f"Не удалось загрузить константы: {e}")
                 return
             p = load_mac_client_prefs()
             hd = p.get("server_host")
@@ -3524,11 +3547,31 @@ if rumps is not None:
                         port0 = DEFAULT_SERVER_PORT
                 except (TypeError, ValueError):
                     port0 = DEFAULT_SERVER_PORT
-            out = mac_tk_server_host_port_dialog(
-                title="Whisper — сервер",
-                host=host0,
-                port=port0,
-            )
+            out = None
+            cocoa_ok = False
+            try:
+                from whisper_mac_cocoa_dialogs import mac_cocoa_server_host_port_dialog
+
+                out = mac_cocoa_server_host_port_dialog(
+                    title="Whisper — сервер",
+                    host=host0,
+                    port=port0,
+                )
+                cocoa_ok = True
+            except Exception as e:
+                _mac_log("warning", "server host/port cocoa err=%s — tk fallback", e)
+            if not cocoa_ok:
+                try:
+                    from whisper_mac_tk_dialogs import mac_tk_server_host_port_dialog
+
+                    out = mac_tk_server_host_port_dialog(
+                        title="Whisper — сервер",
+                        host=host0,
+                        port=port0,
+                    )
+                except ImportError as e:
+                    rumps.alert("Ошибка", f"Не удалось открыть диалог сервера: {e}")
+                    return
             if out is None:
                 return
             hs, pt = out
@@ -4089,18 +4132,13 @@ if rumps is not None:
             rumps.alert("Таймауты", "Сохранено: долгий профиль (ответ до 30 мин).")
 
         def _timeouts_custom(self, _sender) -> None:
-            try:
-                from whisper_mac_tk_dialogs import mac_tk_three_numbers_dialog
-            except ImportError as e:
-                rumps.alert("Ошибка", str(e))
-                return
             tc, tr = self.client._effective_transcribe_timeouts()
             h = self.client._effective_health_timeout_sec()
             default = f"{int(h)} {int(tc)} {int(tr)}"
-            out = mac_tk_three_numbers_dialog(
+            out = _mac_ui_ask_string(
                 title="Таймауты Whisper",
                 message="Три числа через пробел: health_сек · tcp_сек · ответ_сек",
-                default_text=default,
+                default=default,
             )
             if out is None:
                 return
@@ -4141,11 +4179,6 @@ if rumps is not None:
             return _cb
 
         def _speaker_threshold_custom(self, _sender) -> None:
-            try:
-                from whisper_mac_tk_dialogs import mac_tk_one_float_dialog
-            except ImportError as e:
-                rumps.alert("Ошибка", str(e))
-                return
             cur: float | None = self.client._pref_speaker_threshold
             if cur is None:
                 try:
@@ -4154,10 +4187,10 @@ if rumps is not None:
                     cur = float(_sv_thr())
                 except Exception:
                     cur = 0.70
-            out = mac_tk_one_float_dialog(
+            out = _mac_ui_ask_string(
                 title="Порог эталона",
                 message="Косинусное сходство с эталоном: 0.50 … 0.95",
-                default_text=f"{cur:.4f}".rstrip("0").rstrip("."),
+                default=f"{cur:.4f}".rstrip("0").rstrip("."),
             )
             if out is None:
                 return
