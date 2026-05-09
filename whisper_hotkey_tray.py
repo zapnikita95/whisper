@@ -146,6 +146,16 @@ def _speaker_threshold_from_env() -> float | None:
         return None
 
 
+def _speaker_threshold_from_prefs(hp: dict) -> float | None:
+    v = hp.get("speaker_threshold")
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return _speaker_threshold_from_env()
+
+
 def _run_enroll_speaker_worker(log, notify) -> None:
     """Запись ~45 с с микрофона → ~/.whisper/speaker_embedding.npy (как enroll на Mac)."""
     import tempfile
@@ -297,8 +307,20 @@ def main() -> int:
                 status_callback=lambda m: log.info("status: %s", m),
                 toast_callback=toast_cb,
                 speaker_verify=bool(hp.get("speaker_verify", False)),
-                speaker_threshold=_speaker_threshold_from_env(),
+                speaker_threshold=_speaker_threshold_from_prefs(hp),
             )
+            try:
+                to = hp.get("transcribe_timeout_sec")
+                if to is not None:
+                    svc._transcribe_timeout_sec = max(30.0, float(to))
+            except (TypeError, ValueError):
+                pass
+            try:
+                mh = hp.get("max_hold_seconds")
+                if mh is not None:
+                    svc.max_hold_seconds = max(10.0, float(mh))
+            except (TypeError, ValueError):
+                pass
             svc.run()
         except Exception:
             log.exception("Фатальная ошибка hotkey")
@@ -662,11 +684,247 @@ def main() -> int:
         except Exception as e:
             _notify("Словарь", f"Не удалось сохранить: {e}", True)
 
+    def vocab_show_prompt(icon: pystray.Icon, item: object) -> None:
+        try:
+            from whisper_vocab import build_initial_prompt
+
+            t = build_initial_prompt(None)
+            body = (t or "(пусто)")[:500]
+            _notify("Словарь — подсказка", body, False, force=True)
+        except Exception as e:
+            _notify("Словарь", str(e)[:220], True)
+
+    def hotkey_check_for_updates(icon: pystray.Icon, item: object) -> None:
+        def worker() -> None:
+            import tempfile
+            import urllib.request
+            import webbrowser
+            from pathlib import Path
+
+            try:
+                from whisper_update_check import (
+                    fetch_latest_release,
+                    is_remote_newer,
+                    pick_asset_url,
+                    releases_repo,
+                )
+                from whisper_version import get_version
+            except ImportError as e:
+                _notify("Обновления", f"Нет модулей: {e}", True, force=True)
+                return
+            if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
+                _notify("Обновления", "Проверка отключена (WHISPER_SKIP_UPDATE_CHECK).", False, force=True)
+                return
+            try:
+                cur = get_version()
+            except Exception:
+                cur = "?"
+            rel = fetch_latest_release(force=True)
+            html = f"https://github.com/{releases_repo()}/releases/latest"
+            if rel is None:
+                try:
+                    webbrowser.open(html)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    "Не удалось получить релиз — открыта страница GitHub.",
+                    False,
+                    force=True,
+                )
+                return
+            tag = (rel.get("tag_name") or "").strip()
+            if not is_remote_newer(tag, cur):
+                _notify("Whisper Hotkey", f"Установлена актуальная версия ({cur}).", False, force=True)
+                return
+            page = (rel.get("html_url") or "").strip() or html
+            picked = pick_asset_url(rel, suffix=".exe", contains="whisperhotkey")
+            if not picked:
+                try:
+                    webbrowser.open(page)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    f"Доступна {tag}. Скачай WhisperHotkeySetup (страница открыта).",
+                    False,
+                    force=True,
+                )
+                return
+            name, url = picked
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".exe")
+                os.close(fd)
+                req = urllib.request.Request(url, headers={"User-Agent": "WhisperHotkey/1.0"})
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    Path(tmp).write_bytes(resp.read())
+                os.startfile(tmp)  # type: ignore[attr-defined]
+                _notify("Обновления", f"Запущен установщик: {name}", False, force=True)
+            except Exception as e:
+                try:
+                    webbrowser.open(page)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    f"Скачивание не удалось ({e!s:.120}) — открыта страница релиза.",
+                    True,
+                    force=True,
+                )
+
+        threading.Thread(target=worker, name="whisper-hotkey-update", daemon=True).start()
+
+    def _set_speaker_threshold(icon: pystray.Icon, val: float | None) -> None:
+        p = _load_prefs()
+        if val is None:
+            p.pop("speaker_threshold", None)
+        else:
+            p["speaker_threshold"] = float(val)
+        _save_prefs(p)
+        _notify("Порог эталона", "Перезапусти Whisper Hotkey, чтобы применить.", False, force=True)
+        icon.update_menu()
+
+    def clear_speaker_threshold(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, None)
+
+    def set_spk_065(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, 0.65)
+
+    def set_spk_070(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, 0.70)
+
+    def edit_speaker_threshold(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Порог", "Нет tkinter.", True)
+            return
+        hp = _load_prefs()
+        cur = hp.get("speaker_threshold", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Порог эталона",
+                "Число 0.45 … 0.99 (косинусное сходство). Пусто — убрать из prefs.",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        s = ans.strip()
+        if not s:
+            clear_speaker_threshold(icon, None)
+            return
+        try:
+            v = float(s.replace(",", "."))
+        except ValueError:
+            _notify("Порог", "Нужно число.", True)
+            return
+        if not 0.45 <= v <= 0.99:
+            _notify("Порог", "Ожидается 0.45 … 0.99.", True)
+            return
+        _set_speaker_threshold(icon, v)
+
+    def speaker_threshold_submenu():
+        return pystray.Menu(
+            Item("Сбросить prefs (env)", clear_speaker_threshold),
+            Item("Порог 0.65", set_spk_065),
+            Item("Порог 0.70", set_spk_070),
+            Item("Своё число…", edit_speaker_threshold),
+        )
+
+    def edit_transcribe_timeout(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            return
+        hp = _load_prefs()
+        cur = hp.get("transcribe_timeout_sec", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Таймаут транскрипции",
+                "Секунды ожидания GPU/Groq (не длина записи). Пусто — по умолчанию из env.",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        st = ans.strip()
+        p = _load_prefs()
+        if not st:
+            p.pop("transcribe_timeout_sec", None)
+        else:
+            try:
+                p["transcribe_timeout_sec"] = float(st.replace(",", "."))
+            except ValueError:
+                _notify("Таймаут", "Нужно число.", True)
+                return
+        _save_prefs(p)
+        _notify("Таймаут", "Перезапусти Whisper Hotkey.", False, force=True)
+        icon.update_menu()
+
+    def edit_max_hold(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            return
+        hp = _load_prefs()
+        cur = hp.get("max_hold_seconds", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Макс. удержание записи",
+                "Секунды (защита от переполнения памяти). Пусто — по умолчанию (120).",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        st = ans.strip()
+        p = _load_prefs()
+        if not st:
+            p.pop("max_hold_seconds", None)
+        else:
+            try:
+                p["max_hold_seconds"] = float(st.replace(",", "."))
+            except ValueError:
+                _notify("Запись", "Нужно число.", True)
+                return
+        _save_prefs(p)
+        _notify("Запись", "Перезапусти Whisper Hotkey.", False, force=True)
+        icon.update_menu()
+
     def vocab_submenu():
         return pystray.Menu(
             Item("Открыть словарь…", open_vocab_file),
             Item("Добавить из буфера…", vocab_add_from_clipboard),
             Item("Добавить замену…", vocab_add_replacement),
+            Item("Показать подсказку словаря", vocab_show_prompt),
         )
 
     def groq_api_submenu():
@@ -728,8 +986,12 @@ def main() -> int:
         Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item("Модель → (перезапуск)", model_submenu()),
         Item("Транскрипция → (перезапуск)", transcribe_backend_submenu()),
+        Item("Порог эталона →", speaker_threshold_submenu()),
+        Item("Таймаут транскрипции (сек)…", edit_transcribe_timeout),
+        Item("Макс. удержание записи (сек)…", edit_max_hold),
         Item("Словарь →", vocab_submenu()),
         Item("Groq API →", groq_api_submenu()),
+        Item("Проверить обновления…", hotkey_check_for_updates),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),

@@ -667,10 +667,17 @@ _MAC_CLIENT_PREF_STR_KEYS = frozenset(
         "groq_proxy_url",
         "groq_proxy_secret",
         "server_url",
+        "server_host",
     }
 )
+_MAC_CLIENT_PREF_INT_KEYS = frozenset({"server_port"})
 _MAC_CLIENT_PREF_BOOL_KEYS = frozenset({"skip_health_check", "groq_proxy_enabled"})
-_MAC_CLIENT_PREF_KEYS = _MAC_CLIENT_PREF_FLOAT_KEYS | _MAC_CLIENT_PREF_STR_KEYS | _MAC_CLIENT_PREF_BOOL_KEYS
+_MAC_CLIENT_PREF_KEYS = (
+    _MAC_CLIENT_PREF_FLOAT_KEYS
+    | _MAC_CLIENT_PREF_STR_KEYS
+    | _MAC_CLIENT_PREF_INT_KEYS
+    | _MAC_CLIENT_PREF_BOOL_KEYS
+)
 
 _MAC_HISTORY_LOCK = threading.Lock()
 
@@ -707,6 +714,13 @@ def load_mac_client_prefs() -> dict[str, Any]:
                 if k == "server_url" and s and not s.startswith(("http://", "https://")):
                     continue
                 out[k] = s
+        elif k in _MAC_CLIENT_PREF_INT_KEYS:
+            try:
+                iv = int(v)
+                if k == "server_port" and 1 <= iv <= 65535:
+                    out[k] = iv
+            except (TypeError, ValueError):
+                continue
         elif k in _MAC_CLIENT_PREF_BOOL_KEYS:
             if isinstance(v, bool):
                 out[k] = v
@@ -766,7 +780,23 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 elif s.startswith(("http://", "https://")):
                     cur[k] = s.rstrip("/")
                 continue
+            if k == "server_host":
+                if not s:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = s
+                continue
             cur[k] = s
+        elif k in _MAC_CLIENT_PREF_INT_KEYS:
+            if v is None:
+                cur.pop(k, None)
+            else:
+                try:
+                    iv = int(v)
+                    if k == "server_port" and 1 <= iv <= 65535:
+                        cur[k] = iv
+                except (TypeError, ValueError):
+                    pass
         elif k in _MAC_CLIENT_PREF_BOOL_KEYS:
             if isinstance(v, bool):
                 cur[k] = v
@@ -787,38 +817,22 @@ def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _mac_osascript_prompt_groq_key() -> str | None:
-    """Диалог ввода ключа Groq; None = отмена; пустая строка = очистить не вызывается здесь."""
-    import subprocess
-
-    script = r'''
-try
-    set r to text returned of (display dialog "Вставь API-ключ Groq (gsk_…). Ок — сохранить в настройках клиента (файл ~/.whisper/mac_client_prefs.json)." default answer "" with title "Whisper — Groq" buttons {"Отмена", "Сохранить"} default button "Сохранить")
-    return r
-on error number -128
-    return "__CANCEL__"
-end try
-'''
+    """Диалог ввода ключа Groq; None = отмена (Tk, без osascript — быстрее из menubar)."""
     try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        from whisper_mac_tk_dialogs import mac_tk_ask_string
+
+        return mac_tk_ask_string(
+            title="Whisper — Groq",
+            message=(
+                "API-ключ Groq (gsk_…). Сохранить в ~/.whisper/mac_client_prefs.json. "
+                "Пусто + Сохранить — очистить ключ в prefs."
+            ),
+            default="",
+            password=True,
         )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        _mac_log("warning", "groq_key_dialog_failed err=%s", e)
+    except Exception as e:
+        _mac_log("warning", "tk_groq_key_dialog err=%s", e)
         return None
-    if proc.returncode != 0:
-        _mac_log("warning", "groq_key_dialog code=%s err=%r", proc.returncode, (proc.stderr or "")[:200])
-        return None
-    t = (proc.stdout or "").strip()
-    if t == "__CANCEL__":
-        return None
-    return t
-
-
-def _mac_ascript_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _mac_osascript_prompt_line(
@@ -828,37 +842,19 @@ def _mac_osascript_prompt_line(
     ok_button: str = "Сохранить",
     default_answer: str = "",
 ) -> str | None:
-    """Однострочный ввод; None = отмена."""
-    import subprocess
-
-    t = _mac_ascript_escape(title)
-    m = _mac_ascript_escape(message)
-    ob = _mac_ascript_escape(ok_button)
-    da = _mac_ascript_escape(default_answer)
-    script = f'''
-try
-    set r to text returned of (display dialog "{m}" default answer "{da}" with title "{t}" buttons {{"Отмена", "{ob}"}} default button "{ob}")
-    return r
-on error number -128
-    return "__CANCEL__"
-end try
-'''
+    """Однострочный ввод; None = отмена. ok_button зарезервирован (кнопка всегда «Сохранить» в Tk)."""
     try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        from whisper_mac_tk_dialogs import mac_tk_ask_string
+
+        return mac_tk_ask_string(
+            title=title,
+            message=message,
+            default=default_answer,
+            password=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        _mac_log("warning", "osascript_prompt_line err=%s", e)
+    except Exception as e:
+        _mac_log("warning", "tk_prompt_line err=%s", e)
         return None
-    if proc.returncode != 0:
-        return None
-    out = (proc.stdout or "").strip()
-    if out == "__CANCEL__":
-        return None
-    return out
 
 
 def _history_preview_title(text: str, max_len: int = 56) -> str:
@@ -1948,6 +1944,8 @@ class WhisperClientMac:
         self._pref_groq_proxy_secret: str | None = None
         self._pref_groq_proxy_enabled: bool | None = None
         self._pref_server_url: str | None = None
+        self._pref_server_host: str | None = None
+        self._pref_server_port: int | None = None
         self._menu_bar_ref: Any = None
         self._reload_mac_prefs_from_disk()
 
@@ -1987,25 +1985,21 @@ class WhisperClientMac:
             if isinstance(su, str) and su.strip().startswith(("http://", "https://"))
             else None
         )
-        if self._pref_server_url:
-            if self.server_url != self._pref_server_url:
+        sh = p.get("server_host")
+        self._pref_server_host = sh.strip() if isinstance(sh, str) and sh.strip() else None
+        sp = p.get("server_port")
+        self._pref_server_port = sp if isinstance(sp, int) and 1 <= sp <= 65535 else None
+
+        nu = _resolve_server_url(self._cli_server_arg)
+        if nu:
+            if self.server_url != nu.rstrip("/"):
                 _mac_log(
                     "info",
-                    "server_url_from_prefs old=%r new=%r",
-                    self.server_url,
-                    self._pref_server_url,
-                )
-            self.server_url = self._pref_server_url
-        else:
-            nu = _resolve_server_url_tail(self._cli_server_arg)
-            if nu and self.server_url != nu:
-                _mac_log(
-                    "info",
-                    "server_url_revert_no_prefs from=%r to=%r",
+                    "server_url_resolved old=%r new=%r",
                     self.server_url,
                     nu,
                 )
-                self.server_url = nu
+            self.server_url = nu.rstrip("/")
 
     def _merge_save_mac_prefs(self, **kwargs: Any) -> None:
         merge_mac_client_prefs(dict(kwargs))
@@ -3510,10 +3504,44 @@ if rumps is not None:
             u = self.client.server_url
             return u if len(u) <= 56 else u[:53] + "…"
 
+        def _edit_server_host_port_menu(self, _sender) -> None:
+            try:
+                from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+                from whisper_mac_tk_dialogs import mac_tk_server_host_port_dialog
+            except ImportError as e:
+                rumps.alert("Ошибка", f"Не удалось загрузить диалог: {e}")
+                return
+            p = load_mac_client_prefs()
+            hd = p.get("server_host")
+            host0 = (hd.strip() if isinstance(hd, str) else "") or DEFAULT_SERVER_HOST
+            spd = p.get("server_port")
+            if isinstance(spd, int) and 1 <= spd <= 65535:
+                port0 = spd
+            else:
+                try:
+                    port0 = int(spd) if spd is not None else DEFAULT_SERVER_PORT
+                    if not (1 <= port0 <= 65535):
+                        port0 = DEFAULT_SERVER_PORT
+                except (TypeError, ValueError):
+                    port0 = DEFAULT_SERVER_PORT
+            out = mac_tk_server_host_port_dialog(
+                title="Whisper — сервер",
+                host=host0,
+                port=port0,
+            )
+            if out is None:
+                return
+            hs, pt = out
+            url = f"http://{hs}:{pt}".rstrip("/")
+            self.client._merge_save_mac_prefs(server_host=hs, server_port=pt, server_url=url)
+            mac_banner_notification("Whisper", f"Сервер сохранён: {url}")
+            self.client._reload_mac_prefs_from_disk()
+            self._mi_server.title = self._server_title()
+
         def _edit_server_url_menu(self, _sender) -> None:
             cur = self.client.server_url
             raw = _mac_osascript_prompt_line(
-                title="Whisper — адрес сервера",
+                title="Whisper — полный URL сервера",
                 message=(
                     "Полный URL ПК с Whisper Server (Tailscale IP Windows), порт как в GUI сервера "
                     "(часто 8001). Локальный 127.0.0.1 на ПК ≠ адрес для Mac."
@@ -3524,10 +3552,10 @@ if rumps is not None:
                 return
             s = raw.strip().rstrip("/")
             if not s:
-                self.client._merge_save_mac_prefs(server_url=None)
+                self.client._merge_save_mac_prefs(server_url=None, server_host=None, server_port=None)
                 mac_banner_notification(
                     "Whisper",
-                    "Адрес из настроек сброшен — подставлен URL из run.sh.",
+                    "Настройки сервера сброшены — подставится URL из run.sh / авто-поиск.",
                 )
                 self.menu = self._compose_menu()
                 return
@@ -3539,10 +3567,10 @@ if rumps is not None:
             self.menu = self._compose_menu()
 
         def _clear_server_url_menu(self, _sender) -> None:
-            self.client._merge_save_mac_prefs(server_url=None)
+            self.client._merge_save_mac_prefs(server_url=None, server_host=None, server_port=None)
             mac_banner_notification(
                 "Whisper",
-                "Адрес из ~/.whisper/mac_client_prefs.json удалён — используется URL из run.sh.",
+                "Сервер (URL / IP / порт) в ~/.whisper/mac_client_prefs.json сброшен.",
             )
             self.menu = self._compose_menu()
 
@@ -3584,8 +3612,9 @@ if rumps is not None:
             return [
                 self._mi_version,
                 self._mi_server,
-                rumps.MenuItem("Адрес сервера…", callback=self._edit_server_url_menu),
-                rumps.MenuItem("Сбросить адрес сервера", callback=self._clear_server_url_menu),
+                rumps.MenuItem("Сервер: IP и порт…", callback=self._edit_server_host_port_menu),
+                rumps.MenuItem("Полный URL сервера…", callback=self._edit_server_url_menu),
+                rumps.MenuItem("Сбросить настройки сервера", callback=self._clear_server_url_menu),
                 rumps.separator,
                 ("Таймауты сервера", _menu_timeouts),
                 ("Порог эталона голоса", _menu_speaker),
@@ -4060,16 +4089,19 @@ if rumps is not None:
             rumps.alert("Таймауты", "Сохранено: долгий профиль (ответ до 30 мин).")
 
         def _timeouts_custom(self, _sender) -> None:
+            try:
+                from whisper_mac_tk_dialogs import mac_tk_three_numbers_dialog
+            except ImportError as e:
+                rumps.alert("Ошибка", str(e))
+                return
             tc, tr = self.client._effective_transcribe_timeouts()
             h = self.client._effective_health_timeout_sec()
             default = f"{int(h)} {int(tc)} {int(tr)}"
-            w = rumps.Window(
-                message="Три числа через пробел: health_сек · tcp_сек · ответ_сек",
+            out = mac_tk_three_numbers_dialog(
                 title="Таймауты Whisper",
+                message="Три числа через пробел: health_сек · tcp_сек · ответ_сек",
                 default_text=default,
-                dimensions=(420, 160),
             )
-            out = w.run()
             if out is None:
                 return
             parts = out.strip().split()
@@ -4109,6 +4141,11 @@ if rumps is not None:
             return _cb
 
         def _speaker_threshold_custom(self, _sender) -> None:
+            try:
+                from whisper_mac_tk_dialogs import mac_tk_one_float_dialog
+            except ImportError as e:
+                rumps.alert("Ошибка", str(e))
+                return
             cur: float | None = self.client._pref_speaker_threshold
             if cur is None:
                 try:
@@ -4117,13 +4154,11 @@ if rumps is not None:
                     cur = float(_sv_thr())
                 except Exception:
                     cur = 0.70
-            w = rumps.Window(
-                message="Косинусное сходство с эталоном: 0.50 … 0.95",
+            out = mac_tk_one_float_dialog(
                 title="Порог эталона",
+                message="Косинусное сходство с эталоном: 0.50 … 0.95",
                 default_text=f"{cur:.4f}".rstrip("0").rstrip("."),
-                dimensions=(380, 120),
             )
-            out = w.run()
             if out is None:
                 return
             try:
@@ -4372,15 +4407,45 @@ def _resolve_server_url_tail(cli_server: str | None) -> str | None:
     return None
 
 
-def _resolve_server_url(cli_server: str | None) -> str | None:
-    """Приоритет: server_url в ~/.whisper/mac_client_prefs.json (меню «Адрес сервера»), затем цепочка без prefs."""
-    prefs = load_mac_client_prefs()
+def _effective_server_url_from_prefs(prefs: dict[str, Any]) -> str | None:
+    """Полный URL из server_url или пары server_host + server_port (с дефолтами)."""
+    try:
+        from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+    except ImportError:
+        DEFAULT_SERVER_HOST = "100.115.68.2"
+        DEFAULT_SERVER_PORT = 8001
     psu = prefs.get("server_url")
     if isinstance(psu, str):
         s = psu.strip().rstrip("/")
         if s.startswith(("http://", "https://")):
-            _mac_log("info", "resolve_server_url prefs_server_url=%s", s)
             return s
+    sh = ""
+    if isinstance(prefs.get("server_host"), str):
+        sh = prefs["server_host"].strip()
+    sp_raw = prefs.get("server_port")
+    port: int | None = None
+    if sp_raw is not None:
+        try:
+            port = int(sp_raw)
+        except (TypeError, ValueError):
+            port = None
+    if not sh and port is None:
+        return None
+    if sh:
+        pnum = port if port is not None and 1 <= port <= 65535 else DEFAULT_SERVER_PORT
+        return f"http://{sh}:{pnum}".rstrip("/")
+    if port is not None and 1 <= port <= 65535:
+        return f"http://{DEFAULT_SERVER_HOST}:{port}".rstrip("/")
+    return None
+
+
+def _resolve_server_url(cli_server: str | None) -> str | None:
+    """Приоритет: prefs (server_url или host+port), затем --server / env / pick_server_url."""
+    prefs = load_mac_client_prefs()
+    eff = _effective_server_url_from_prefs(prefs)
+    if eff:
+        _mac_log("info", "resolve_server_url effective_from_prefs=%s", eff)
+        return eff
     return _resolve_server_url_tail(cli_server)
 
 

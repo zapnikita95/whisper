@@ -20,7 +20,12 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-HOST = os.environ.get("WHISPER_MAC_SERVER_HOST", "100.115.68.2")
+try:
+    from whisper_mac_defaults import DEFAULT_SERVER_HOST
+except ImportError:
+    DEFAULT_SERVER_HOST = "100.115.68.2"
+
+HOST = os.environ.get("WHISPER_MAC_SERVER_HOST", DEFAULT_SERVER_HOST)
 TIMEOUT = float((os.environ.get("WHISPER_MAC_SERVER_PROBE_TIMEOUT") or "2.5").strip() or "2.5")
 
 
