@@ -968,7 +968,11 @@ class WhisperClientMac:
 
                     # Проверяем доступность сервера перед отправкой
                     try:
-                        health_check = requests.get(f"{self.server_url}/", timeout=5.0)
+                        health_check = requests.get(
+                            f"{self.server_url}/",
+                            timeout=5.0,
+                            headers={"X-Whisper-Client": "mac"},
+                        )
                         if health_check.status_code != 200:
                             print(f"[Client] Сервер недоступен (код {health_check.status_code})", flush=True)
                             _mac_log(

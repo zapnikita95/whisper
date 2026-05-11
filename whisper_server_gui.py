@@ -713,7 +713,11 @@ def _build_server_main_form(
     )
     ttk.Label(frm, text=hotkey_txt, wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 12))
 
-    ttk.Label(frm, text="Недавние HTTP-клиенты (POST /transcribe)", font=("", 12, "bold")).pack(anchor=tk.W)
+    ttk.Label(
+        frm,
+        text="Недавние удалённые клиенты (GET / или POST /transcribe; не 127.0.0.1)",
+        font=("", 12, "bold"),
+    ).pack(anchor=tk.W)
     cols = ("ip", "client", "sec")
     tree = ttk.Treeview(frm, columns=cols, show="headings", height=8)
     tree.heading("ip", text="IP")

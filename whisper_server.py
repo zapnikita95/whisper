@@ -95,6 +95,25 @@ _clients_lock = threading.Lock()
 _clients: dict[str, tuple[float, str]] = {}
 
 
+def _request_client_host(request: Request) -> str:
+    c = request.client
+    return (c.host if c else "") or ""
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Локальный опрос GUI с 127.0.0.1 не считаем «удалённым клиентом»."""
+    if not host:
+        return True
+    h = host.strip().lower()
+    if h in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if h.startswith("127."):
+        return True
+    if h.startswith("::ffff:127."):
+        return True
+    return False
+
+
 def touch_client_from_request(request: Request) -> None:
     ip = request.client.host if request.client else "?"
     label = (request.headers.get("x-whisper-client") or "unknown").strip() or "unknown"
@@ -159,7 +178,14 @@ def _log_http_ready() -> None:
 
 
 @app.get("/")
-def root():
+def root(request: Request):
+    # Удалённый Mac делает GET / перед transcribe — регистрируем в списке клиентов GUI.
+    # Запросы с этой же машины (127.0.0.1) не засоряют таблицу.
+    try:
+        if not _is_loopback_host(_request_client_host(request)):
+            touch_client_from_request(request)
+    except Exception:
+        pass
     with _clients_lock:
         n = len(_clients)
     return {
@@ -175,7 +201,7 @@ def root():
 
 @app.get("/clients")
 def list_clients():
-    """Кто недавно вызывал POST /transcribe (по IP и заголовку X-Whisper-Client)."""
+    """Кто недавно дергал GET / или POST /transcribe (не localhost; заголовок X-Whisper-Client)."""
     return get_clients_snapshot()
 
 
