@@ -31,6 +31,13 @@ import time
 from pathlib import Path
 
 from collections.abc import Callable
+from typing import Any
+
+from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+from whisper_vocab import (
+    apply_replacements as vocab_apply_replacements,
+    build_initial_prompt as vocab_build_initial_prompt,
+)
 
 
 log = logging.getLogger("whisper.hotkey")
@@ -503,6 +510,73 @@ class WhisperHotkey:
 
 
 
+    def _current_app_name(self) -> str | None:
+        """Имя активного приложения (для per-app профиля словаря). Только Windows."""
+        if sys.platform != "win32":
+            return None
+        try:
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            length = user32.GetWindowTextLengthW(hwnd) or 0
+            if length <= 0:
+                return None
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = (buf.value or "").strip()
+            if not title:
+                return None
+            for sep in (" — ", " - ", " – "):
+                if sep in title:
+                    title = title.split(sep)[-1].strip()
+                    break
+            return title or None
+        except Exception as e:
+            log.debug("current_app_name_err: %s", e)
+            return None
+
+    def _vocab_prompt_for_current_app(self) -> tuple[str, str | None]:
+        try:
+            app = self._current_app_name()
+            return vocab_build_initial_prompt(app), app
+        except Exception as e:
+            log.debug("vocab_build_prompt_err: %s", e)
+            return "", None
+
+    def _apply_vocab_replacements_local(self, text: str, app_name: str | None) -> str:
+        if not text:
+            return text
+        try:
+            replaced = vocab_apply_replacements(text, app_name)
+            if replaced != text:
+                log.info(
+                    "vocab_replacements_applied app=%r before=%d after=%d",
+                    app_name,
+                    len(text),
+                    len(replaced),
+                )
+            return replaced
+        except Exception as e:
+            log.debug("vocab_apply_err: %s", e)
+            return text
+
+    def _local_gpu_transcribe_for_chain(
+        self, audio: np.ndarray, *, initial_prompt: str | None = None
+    ) -> str:
+
+        """Локальный Whisper без тостов — для цепочки с Groq."""
+
+        if self._cancel_processing.is_set():
+
+            return ""
+
+        self._load_model_impl()
+
+        return self._transcribe_audio(audio, initial_prompt=initial_prompt) or ""
+
+
+
     def _record_worker(self) -> None:
 
         if not _USE_PYAUDIO:
@@ -829,41 +903,167 @@ class WhisperHotkey:
 
                 tmo = self._transcribe_timeout_sec
 
-                fut = self._gpu_pool_get().submit(self._gpu_transcribe_job, audio)
+                from whisper_groq import hotkey_transcribe_backend_order
 
-                try:
+                order = hotkey_transcribe_backend_order()
 
-                    text = fut.result(timeout=tmo)
+                log.info("transcribe route=%s", order)
 
-                except concurrent.futures.TimeoutError:
+                vocab_prompt, vocab_app = self._vocab_prompt_for_current_app()
 
-                    print(f"[Whisper] Таймаут GPU ({tmo:.0f} с) — задача ещё в очереди/на видеокарте.", flush=True)
+                for idx, backend in enumerate(order):
 
-                    log.warning("Таймаут future.result %.0f с (один GPU-поток)", tmo)
+                    if self._cancel_processing.is_set():
 
-                    self._emit_toast(
+                        return
 
-                        "Таймаут",
+                    try:
 
-                        f"GPU не ответил за {tmo:.0f} с (WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT). Это не длина записи; после обновления hotkey короткая речь не должна упираться в минуту.",
+                        if backend == "server":
 
-                        True,
+                            fut = self._gpu_pool_get().submit(
+                                self._local_gpu_transcribe_for_chain,
+                                audio,
+                                initial_prompt=vocab_prompt or None,
+                            )
 
-                    )
+                            try:
 
-                    self._cancel_processing.set()
+                                raw = fut.result(timeout=tmo)
 
-                    text = None
+                            except concurrent.futures.TimeoutError:
 
-                except Exception as e:
+                                print(
 
-                    print(f"[Ошибка распознавания] {e}", file=sys.stderr, flush=True)
+                                    f"[Whisper] Таймаут GPU ({tmo:.0f} с) — задача ещё в очереди/на видеокарте.",
 
-                    log.exception("future.result распознавания")
+                                    flush=True,
 
-                    self._emit_toast("Распознавание", str(e)[:200], True)
+                                )
 
-                    text = None
+                                log.warning(
+
+                                    "Таймаут future.result %.0f с (один GPU-поток)",
+
+                                    tmo,
+
+                                )
+
+                                if idx + 1 < len(order):
+
+                                    continue
+
+                                self._emit_toast(
+
+                                    "Таймаут",
+
+                                    f"GPU не ответил за {tmo:.0f} с (WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT). Это не длина записи; после обновления hotkey короткая речь не должна упираться в минуту.",
+
+                                    True,
+
+                                )
+
+                                self._cancel_processing.set()
+
+                                text = None
+
+                                break
+
+                            text = (raw or "").strip() or None
+
+                        else:
+
+                            from whisper_groq import (
+
+                                groq_http_timeout_tuple,
+
+                                post_groq_audio_transcription,
+
+                                read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_enabled_pref,
+
+                                read_hotkey_groq_proxy_secret_pref,
+
+                                read_hotkey_groq_proxy_url_pref,
+
+                            )
+
+                            import soundfile as sf
+
+                            self._emit_status("Распознавание (Groq)…")
+
+                            tmp_groq: str | None = None
+
+                            try:
+
+                                fd, tmp_groq = tempfile.mkstemp(suffix=".wav")
+
+                                os.close(fd)
+
+                                sf.write(tmp_groq, audio, self.sample_rate)
+
+                                conn, read = groq_http_timeout_tuple(read_cap=600.0)
+
+                                out = post_groq_audio_transcription(
+
+                                    tmp_groq,
+
+                                    language=self.language,
+
+                                    timeout=(conn, read),
+
+                                    log_error=log.error,
+
+                                    pref_api_key=read_hotkey_groq_api_key_pref(),
+
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+
+                                    pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                                    pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+
+                                    prompt=vocab_prompt or None,
+
+                                )
+
+                                text = (out.get("text") or "").strip() or None
+
+                            finally:
+
+                                if tmp_groq:
+
+                                    try:
+
+                                        os.unlink(tmp_groq)
+
+                                    except OSError:
+
+                                        pass
+
+                        if text:
+
+                            break
+
+                        if idx + 1 < len(order):
+
+                            log.info("transcribe_empty backend=%s try_fallback", backend)
+
+                            continue
+
+                    except Exception as e:
+
+                        print(f"[Ошибка распознавания] {e}", file=sys.stderr, flush=True)
+
+                        log.exception("transcribe backend=%s", backend)
+
+                        if idx + 1 < len(order):
+
+                            continue
+
+                        self._emit_toast("Распознавание", str(e)[:200], True)
+
+                        text = None
+
+                        break
 
                 # Проверяем отмену перед дальнейшей обработкой
 
@@ -878,6 +1078,8 @@ class WhisperHotkey:
                     if self.spoken_punctuation:
 
                         text = apply_spoken_punctuation(text)
+
+                    text = self._apply_vocab_replacements_local(text, vocab_app)
 
                     if text and not self._cancel_processing.is_set():
 
@@ -951,7 +1153,9 @@ class WhisperHotkey:
 
 
 
-    def _transcribe_audio(self, audio: np.ndarray) -> str:
+    def _transcribe_audio(
+        self, audio: np.ndarray, *, initial_prompt: str | None = None
+    ) -> str:
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
 
@@ -964,16 +1168,14 @@ class WhisperHotkey:
             sf.write(tmp_path, audio, self.sample_rate)
 
             try:
-
-                segments, info = self.model.transcribe(
-
-                    tmp_path,
-
-                    language=self.language,
-
-                    beam_size=5,
-
-                )
+                _kwargs: dict[str, Any] = {
+                    "language": self.language,
+                    "beam_size": 5,
+                }
+                ip = (initial_prompt or "").strip()
+                if ip:
+                    _kwargs["initial_prompt"] = ip
+                segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
                 # Собираем ВСЕ сегменты (генератор нужно полностью прочитать)
                 text_parts = []
@@ -1102,6 +1304,20 @@ def main() -> int:
     from whisper_models import resolve_model
 
     configure("whisper.hotkey", "whisper_hotkey.log")
+
+
+
+    if sys.platform == "win32":
+
+        try:
+
+            from whisper_groq import load_whisper_dotenv_files
+
+            load_whisper_dotenv_files()
+
+        except ImportError:
+
+            pass
 
 
 

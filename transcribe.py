@@ -6,29 +6,10 @@ from __future__ import annotations
 
 import argparse
 import os
-import site
 import sys
 from pathlib import Path
 
-
-def _prepend_nvidia_cublas_to_path() -> None:
-    """На Windows CTranslate2 ищет cublas64_12.dll; wheel nvidia-cublas-cu12 кладёт её в site-packages."""
-    if sys.platform != "win32":
-        return
-    candidates: list[Path] = []
-    try:
-        candidates.append(Path(site.getusersitepackages()))
-    except Exception:
-        pass
-    try:
-        candidates.extend(Path(p) for p in site.getsitepackages())
-    except Exception:
-        pass
-    for base in candidates:
-        bin_dir = base / "nvidia" / "cublas" / "bin"
-        if (bin_dir / "cublas64_12.dll").is_file():
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            return
+from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
 
 
 def main() -> int:
@@ -63,7 +44,7 @@ def main() -> int:
         print(f"Файл не найден: {path}", file=sys.stderr)
         return 1
 
-    _prepend_nvidia_cublas_to_path()
+    prepend_nvidia_cuda_bins_to_path()
 
     from faster_whisper import WhisperModel
 

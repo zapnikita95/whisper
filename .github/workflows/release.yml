@@ -58,6 +58,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey \
             "${ICON_ARGS[@]}" \
             --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray \
+            --hidden-import whisper_groq --hidden-import whisper_vocab --hidden-import whisper_update_check \
             --hidden-import whisper_models --hidden-import whisper_file_log \
             --hidden-import faster_whisper --hidden-import whisper_version \
             --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip \
@@ -109,6 +110,8 @@ jobs:
         run: ./packaging/build_mac_app.sh
 
       - name: DMG
+        env:
+          WHISPER_DMG_SKIP_APP_BUILD: "1"
         run: |
           brew install create-dmg
           ./packaging/mac/make_dmg.sh "$VERSION"

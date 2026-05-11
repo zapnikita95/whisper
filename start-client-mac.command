@@ -5,6 +5,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)" || exit 1
 SELF="$HERE/$(basename "$0")"
 cd "$HERE" || exit 1
 
+# Локальный venv в корне репо (см. packaging/mac/setup_mac_venv.sh)
+if [ -z "${WHISPER_PYTHON3:-}" ] && [ -x "$HERE/.venv/bin/python3" ]; then
+	export WHISPER_PYTHON3="$HERE/.venv/bin/python3"
+fi
+
+# Нативный CGEventTap daemon (нет SIGTRAP / зависаний pynput на macOS 15+).
+# Собираем один раз при первом запуске если бинарь ещё не существует.
+_DAEMON_BIN="$HERE/packaging/mac/whisper_hotkey_daemon"
+_DAEMON_SRC="$HERE/packaging/mac/whisper_hotkey_daemon.c"
+if [ ! -x "$_DAEMON_BIN" ] && [ -f "$_DAEMON_SRC" ] && command -v clang >/dev/null 2>&1; then
+	echo "Компилирую whisper_hotkey_daemon (CGEventTap, один раз)…"
+	clang -O2 -framework ApplicationServices -framework Carbon \
+		-o "$_DAEMON_BIN" "$_DAEMON_SRC" 2>/dev/null && \
+		echo "✓ whisper_hotkey_daemon готов." || \
+		echo "⚠ Не удалось скомпилировать whisper_hotkey_daemon (fallback на pynput)."
+fi
+if [ -x "$_DAEMON_BIN" ]; then
+	export WHISPER_HOTKEY_DAEMON="$_DAEMON_BIN"
+fi
+
 if [ ! -t 0 ] && [ -z "${WHISPER_MAC_COMMAND_SKIP_TTY_REDIRECT:-}" ]; then
 	echo "Нет интерактивного TTY (часто при «Run» из Cursor). Открываю Terminal.app…" >&2
 	exec open -a Terminal "$SELF"
@@ -15,9 +35,9 @@ fi
 source "$HERE/packaging/mac/pick_python_for_whisper.sh"
 
 if ! PY="$(pick_python_for_whisper)"; then
-	echo "Ошибка: нет python3 с модулями requests, sounddevice, pynput, pyperclip…"
-	echo "  Установи: /opt/homebrew/bin/python3 -m pip install requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip"
-	echo "  Или задай WHISPER_PYTHON3=/путь/к/python3 с уже установленными пакетами."
+	echo "Ошибка: нет python3 с модулями Mac-клиента."
+	echo "  Один раз: bash packaging/mac/setup_mac_venv.sh"
+	echo "  Или вручную: WHISPER_PYTHON3=/путь/к/python3 с requests, sounddevice, numpy, soundfile, 'pynput>=1.8.1', pyperclip, rumps"
 	[ -t 0 ] && read -p "Нажми Enter для выхода..."
 	exit 1
 fi
@@ -49,14 +69,33 @@ else
 		fi
 	fi
 	if [ -z "$SERVER_URL" ]; then
-		echo "Поиск Whisper API на $H:8000–8010 (параллельно, ~2 c)…"
+		echo "Поиск Whisper API на $H:8000–8020 (параллельно)…"
 		if DETECTED="$("$PY" "$HERE/packaging/mac/pick_server_url.py" 2>/dev/null)" && [ -n "$DETECTED" ]; then
 			SERVER_URL="$DETECTED"
 			echo "✓ Сервер: $SERVER_URL"
 		else
-			SERVER_URL="http://${H}:8000"
-			echo "⚠ API не ответил — подставляю $SERVER_URL (клиент всё равно запустится)."
+			SERVER_URL=""
+			for port in ${WHISPER_MAC_SERVER_FALLBACK_PORTS:-8001 8000 8002 8003 8004 8005 8006 8007 8008 8009 8010 8011 8012 8013 8014 8015 8016 8017 8018 8019 8020}; do
+				if "$PY" -c "
+import json, sys, urllib.error, urllib.request
+h, port = sys.argv[1], int(sys.argv[2])
+try:
+    r = urllib.request.urlopen(f'http://{h}:{port}/', timeout=2.5)
+    d = json.loads(r.read().decode())
+    raise SystemExit(0 if d.get('status') == 'ok' and 'model' in d else 1)
+except Exception:
+    raise SystemExit(1)
+" "$H" "$port" 2>/dev/null; then
+					SERVER_URL="http://${H}:${port}"
+					break
+				fi
+			done
+			if [ -z "$SERVER_URL" ]; then
+				SERVER_URL="http://${H}:${WHISPER_MAC_SERVER_PORT:-8001}"
+			fi
+			echo "⚠ Авто-поиск не сработал — подставляю $SERVER_URL (клиент всё равно запустится)."
 			echo "  Укажи IP: export WHISPER_MAC_SERVER_HOST=твой_tailscale_ip"
+			echo "  Или порт: export WHISPER_MAC_SERVER_PORT=8001"
 			echo "  Или URL: ./start-client-mac.command 'http://IP:ПОРТ'"
 		fi
 	fi

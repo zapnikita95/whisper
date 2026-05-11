@@ -1,6 +1,7 @@
 """
 Верификация говорящего по embedding (Resemblyzer). Опциональные зависимости: requirements-speaker.txt
 Эталон: ~/.whisper/speaker_embedding.npy (или WHISPER_SPEAKER_EMBEDDING_PATH).
+Файл в домашней папке — пересборка WhisperClient.app его не трогает; переустановка клиента тоже, пока не удаляешь ~/.whisper.
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_THRESHOLD = 0.72
+DEFAULT_THRESHOLD = 0.70
 
 
 class SpeakerRejected(Exception):

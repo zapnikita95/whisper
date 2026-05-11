@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import site
 import sys
 from pathlib import Path
 
@@ -17,24 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-def _prepend_nvidia_cublas_to_path() -> None:
-    if sys.platform != "win32":
-        return
-    candidates: list[Path] = []
-    try:
-        candidates.append(Path(site.getusersitepackages()))
-    except Exception:
-        pass
-    try:
-        candidates.extend(Path(p) for p in site.getsitepackages())
-    except Exception:
-        pass
-    for base in candidates:
-        bin_dir = base / "nvidia" / "cublas" / "bin"
-        if (bin_dir / "cublas64_12.dll").is_file():
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            return
+from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
 
 
 def main() -> int:
@@ -43,7 +25,7 @@ def main() -> int:
     p.add_argument("--compute-type", default="int8", help="int8, float16, …")
     args = p.parse_args()
 
-    _prepend_nvidia_cublas_to_path()
+    prepend_nvidia_cuda_bins_to_path()
 
     from faster_whisper import WhisperModel
 

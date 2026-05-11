@@ -3,14 +3,15 @@
 
 #define MyAppName "Whisper Server"
 #ifndef MyAppVersion
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.2"
 #endif
 #define MyAppPublisher "Whisper"
 #define MyAppExeName "WhisperServer.exe"
-#define MyAppGuid "A7B8C9D0-E1F2-4A5B-8C9D-0E1F2A3B4C5D"
+; AppId в скрипте должен быть буквально {{GUID}} — иначе Inno парсит {#MyAppGuid} как {константу}.
+#define MyAppId "{{A7B8C9D0-E1F2-4A5B-8C9D-0E1F2A3B4C5D}}"
 
 [Setup]
-AppId={{#MyAppGuid}}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}

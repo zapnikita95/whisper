@@ -2,6 +2,7 @@
 """
 Whisper Hotkey в фоне: иконка в трее, уведомления (запуск / запись / результат / ошибки).
 Лог: whisper_hotkey.log рядом с exe. Отключить уведомления: трей «Уведомления» или WHISPER_HOTKEY_NO_NOTIFICATIONS=1.
+Groq: GROQ_API_KEY в .env или ключ в меню «Groq API ключ…» (whisper_hotkey_prefs.json); env важнее. «Транскрипция» — как на Mac (server = локальный GPU). WHISPER_TRANSCRIBE_BACKEND / WHISPER_MAC_TRANSCRIBE_BACKEND.
 Голос (как на Mac): эталон в ~/.whisper/speaker_embedding.npy, меню «Записать эталон…», «Проверка голоса» или WHISPER_SPEAKER_VERIFY=1 (нужен pip install -r requirements-speaker.txt при сборке exe).
 Без стартового тоста: WHISPER_HOTKEY_SILENT_START=1. Повторы одного и того же текста и частые тосты режутся (антиспам).
 
@@ -33,6 +34,13 @@ ROOT = _project_root()
 os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+try:
+    from whisper_groq import load_whisper_dotenv_files
+
+    load_whisper_dotenv_files()
+except ImportError:
+    pass
 
 PREFS_PATH = ROOT / "whisper_hotkey_prefs.json"
 OLD_PREFS = ROOT / "whisper_hotkey_gui_prefs.json"
@@ -136,6 +144,16 @@ def _speaker_threshold_from_env() -> float | None:
         return float(raw)
     except ValueError:
         return None
+
+
+def _speaker_threshold_from_prefs(hp: dict) -> float | None:
+    v = hp.get("speaker_threshold")
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return _speaker_threshold_from_env()
 
 
 def _run_enroll_speaker_worker(log, notify) -> None:
@@ -291,8 +309,20 @@ def main() -> int:
                 status_callback=lambda m: log.info("status: %s", m),
                 toast_callback=toast_cb,
                 speaker_verify=bool(hp.get("speaker_verify", False)),
-                speaker_threshold=_speaker_threshold_from_env(),
+                speaker_threshold=_speaker_threshold_from_prefs(hp),
             )
+            try:
+                to = hp.get("transcribe_timeout_sec")
+                if to is not None:
+                    svc._transcribe_timeout_sec = max(30.0, float(to))
+            except (TypeError, ValueError):
+                pass
+            try:
+                mh = hp.get("max_hold_seconds")
+                if mh is not None:
+                    svc.max_hold_seconds = max(10.0, float(mh))
+            except (TypeError, ValueError):
+                pass
             svc.run()
         except Exception:
             log.exception("Фатальная ошибка hotkey")
@@ -305,6 +335,19 @@ def main() -> int:
         os.environ["WHISPER_MODEL"] = key
         log.info("В prefs выбрана модель %s (нужен перезапуск)", key)
         _notify("Модель", "Перезапусти Whisper Hotkey, чтобы применить модель.", False, force=True)
+        icon.update_menu()
+
+    def set_transcribe_backend(icon: pystray.Icon, mode: str) -> None:
+        p = _load_prefs()
+        p["transcribe_backend"] = mode
+        _save_prefs(p)
+        log.info("В prefs transcribe_backend=%s (нужен перезапуск, если не переопределяет env)", mode)
+        _notify(
+            "Транскрипция",
+            "Перезапусти Whisper Hotkey, чтобы применить цепочку (если не задан WHISPER_TRANSCRIBE_BACKEND в среде).",
+            False,
+            force=True,
+        )
         icon.update_menu()
 
     def toggle_notifications(icon: pystray.Icon, item: object) -> None:
@@ -371,6 +414,562 @@ def main() -> int:
             items.append(Item(f"{key}: {short}", make_pick(key)))
         return pystray.Menu(*items)
 
+    def groq_key_status_label(item: object) -> str:
+        from whisper_groq import (
+            groq_api_key_from_env,
+            read_hotkey_groq_api_key_pref,
+            read_hotkey_groq_proxy_enabled_pref,
+            read_hotkey_groq_proxy_url_pref,
+            resolve_groq_proxy_url,
+        )
+
+        proxy_enabled = read_hotkey_groq_proxy_enabled_pref()
+        if proxy_enabled is False:
+            return "Groq: прокси выключен"
+        if resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()):
+            return "Groq: прокси ✓"
+        if groq_api_key_from_env():
+            return "Groq ключ: из среды / .env"
+        if read_hotkey_groq_api_key_pref():
+            return "Groq ключ: в настройках (prefs) ✓"
+        return "Groq ключ: не задан"
+
+    def edit_groq_key(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception as e:
+            log.warning("tkinter недоступен: %s", e)
+            _notify(
+                "Groq",
+                "Добавь groq_api_key в whisper_hotkey_prefs.json рядом с exe или GROQ_API_KEY в .env.",
+                True,
+                force=True,
+            )
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Whisper — Groq API",
+                "Ключ gsk_…\nПусто + OK — удалить из prefs.\nGROQ_API_KEY в среде важнее prefs.",
+                show="*",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        if not ans.strip():
+            p.pop("groq_api_key", None)
+        else:
+            p["groq_api_key"] = ans.strip()
+        _save_prefs(p)
+        log.info("groq_api_key обновлён в prefs")
+        _notify("Groq", "Сохранено в whisper_hotkey_prefs.json.", False, force=True)
+        icon.update_menu()
+
+    def clear_groq_key(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p.pop("groq_api_key", None)
+        _save_prefs(p)
+        log.info("groq_api_key удалён из prefs")
+        _notify("Groq", "Ключ удалён из настроек (env не трогаем).", False, force=True)
+        icon.update_menu()
+
+    def edit_groq_proxy_url(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception as e:
+            log.warning("tkinter: %s", e)
+            _notify("Прокси", "Добавь groq_proxy_url в whisper_hotkey_prefs.json или WHISPER_GROQ_PROXY_URL в .env.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Groq прокси",
+                "Базовый URL прокси без / в конце.\nПусто + OK — убрать из prefs.",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        s = (ans or "").strip().rstrip("/")
+        if not s:
+            p.pop("groq_proxy_url", None)
+        else:
+            p["groq_proxy_url"] = s
+        _save_prefs(p)
+        _notify("Groq прокси", "URL сохранён. Ключ на стороне прокси — см. groq_proxy/README.md.", False, force=True)
+        icon.update_menu()
+
+    def toggle_groq_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        cur = p.get("groq_proxy_enabled")
+        if isinstance(cur, bool):
+            enabled = cur
+        elif isinstance(cur, (int, float)):
+            enabled = bool(cur)
+        elif isinstance(cur, str):
+            enabled = cur.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            enabled = True
+        p["groq_proxy_enabled"] = not enabled
+        _save_prefs(p)
+        _notify(
+            "Groq прокси",
+            "Прокси включен." if (not enabled) else "Прокси выключен (прямой Groq).",
+            False,
+            force=True,
+        )
+        icon.update_menu()
+
+    def use_default_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p["groq_proxy_enabled"] = True
+        p["groq_proxy_url"] = "https://whisper-groq-proxy-production.up.railway.app"
+        p.pop("groq_proxy_secret", None)
+        _save_prefs(p)
+        _notify(
+            "Groq прокси",
+            "Базовый прокси выбран. При необходимости добавь секрет прокси.",
+            False,
+            force=True,
+        )
+        icon.update_menu()
+
+    def show_proxy_help(icon: pystray.Icon, item: object) -> None:
+        _notify(
+            "Groq прокси — настройки",
+            (
+                "Для своего прокси укажи: 1) URL, 2) секрет (если сервер требует), "
+                "3) включи «Использовать Groq прокси». "
+                "Можно выбрать «Использовать базовый прокси» и работать сразу."
+            ),
+            False,
+            force=True,
+        )
+
+    def edit_groq_proxy_secret(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Прокси", "groq_proxy_secret в prefs или WHISPER_GROQ_PROXY_SECRET в .env.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Секрет прокси",
+                "Как PROXY_SHARED_SECRET на Railway. Пусто + OK — убрать.",
+                show="*",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        p = _load_prefs()
+        if not (ans or "").strip():
+            p.pop("groq_proxy_secret", None)
+        else:
+            p["groq_proxy_secret"] = ans.strip()
+        _save_prefs(p)
+        _notify("Groq прокси", "Секрет сохранён.", False, force=True)
+        icon.update_menu()
+
+    def clear_groq_proxy(icon: pystray.Icon, item: object) -> None:
+        p = _load_prefs()
+        p.pop("groq_proxy_enabled", None)
+        p.pop("groq_proxy_url", None)
+        p.pop("groq_proxy_secret", None)
+        _save_prefs(p)
+        _notify("Groq прокси", "URL и секрет сброшены в prefs.", False, force=True)
+        icon.update_menu()
+
+    def groq_proxy_toggle_label(item: object) -> str:
+        p = _load_prefs()
+        cur = p.get("groq_proxy_enabled")
+        if isinstance(cur, bool):
+            on = cur
+        elif isinstance(cur, (int, float)):
+            on = bool(cur)
+        elif isinstance(cur, str):
+            on = cur.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            on = True
+        mark = "✓ " if on else ""
+        return f"{mark}Использовать Groq прокси"
+
+    def open_vocab_file(icon: pystray.Icon, item: object) -> None:
+        try:
+            from whisper_vocab import ensure_vocab_file
+
+            path = ensure_vocab_file()
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception as e:
+            _notify("Словарь", f"Не удалось открыть файл: {e}", True)
+
+    def vocab_add_from_clipboard(icon: pystray.Icon, item: object) -> None:
+        try:
+            import pyperclip
+
+            raw = pyperclip.paste() or ""
+        except Exception as e:
+            _notify("Словарь", f"Не удалось прочитать буфер: {e}", True)
+            return
+        term = (raw or "").strip().split("\n", 1)[0].strip()
+        if not term:
+            _notify("Словарь", "Буфер пуст.", True)
+            return
+        try:
+            from whisper_vocab import add_term
+
+            add_term(term)
+            _notify("Словарь", f"Термин добавлен: {term}", False, force=True)
+        except Exception as e:
+            _notify("Словарь", f"Не удалось сохранить: {e}", True)
+
+    def vocab_add_replacement(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Словарь", "Открой ~/.whisper/vocab.json вручную.", True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            frm = simpledialog.askstring(
+                "Словарь — замена",
+                "Что заменять (regex, напр. 'кубернетес|кубер нетес'):",
+                parent=root,
+            )
+            if not frm:
+                return
+            to = simpledialog.askstring(
+                "Словарь — замена",
+                f"На что заменять («{frm.strip()}»):",
+                parent=root,
+            )
+            if not to:
+                return
+        finally:
+            root.destroy()
+        try:
+            from whisper_vocab import add_replacement
+
+            add_replacement(frm.strip(), to.strip())
+            _notify("Словарь", f"Замена сохранена: {frm.strip()} → {to.strip()}", False, force=True)
+        except Exception as e:
+            _notify("Словарь", f"Не удалось сохранить: {e}", True)
+
+    def vocab_show_prompt(icon: pystray.Icon, item: object) -> None:
+        try:
+            from whisper_vocab import build_initial_prompt
+
+            t = build_initial_prompt(None)
+            body = (t or "(пусто)")[:500]
+            _notify("Словарь — подсказка", body, False, force=True)
+        except Exception as e:
+            _notify("Словарь", str(e)[:220], True)
+
+    def hotkey_check_for_updates(icon: pystray.Icon, item: object) -> None:
+        def worker() -> None:
+            import tempfile
+            import urllib.request
+            import webbrowser
+            from pathlib import Path
+
+            try:
+                from whisper_update_check import (
+                    fetch_latest_release,
+                    is_remote_newer,
+                    pick_asset_url,
+                    releases_repo,
+                )
+                from whisper_version import get_version
+            except ImportError as e:
+                _notify("Обновления", f"Нет модулей: {e}", True, force=True)
+                return
+            if os.environ.get("WHISPER_SKIP_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes"):
+                _notify("Обновления", "Проверка отключена (WHISPER_SKIP_UPDATE_CHECK).", False, force=True)
+                return
+            try:
+                cur = get_version()
+            except Exception:
+                cur = "?"
+            rel = fetch_latest_release(force=True)
+            html = f"https://github.com/{releases_repo()}/releases/latest"
+            if rel is None:
+                try:
+                    webbrowser.open(html)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    "Не удалось получить релиз — открыта страница GitHub.",
+                    False,
+                    force=True,
+                )
+                return
+            tag = (rel.get("tag_name") or "").strip()
+            if not is_remote_newer(tag, cur):
+                _notify("Whisper Hotkey", f"Установлена актуальная версия ({cur}).", False, force=True)
+                return
+            page = (rel.get("html_url") or "").strip() or html
+            picked = pick_asset_url(rel, suffix=".exe", contains="whisperhotkey")
+            if not picked:
+                try:
+                    webbrowser.open(page)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    f"Доступна {tag}. Скачай WhisperHotkeySetup (страница открыта).",
+                    False,
+                    force=True,
+                )
+                return
+            name, url = picked
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".exe")
+                os.close(fd)
+                req = urllib.request.Request(url, headers={"User-Agent": "WhisperHotkey/1.0"})
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    Path(tmp).write_bytes(resp.read())
+                os.startfile(tmp)  # type: ignore[attr-defined]
+                _notify("Обновления", f"Запущен установщик: {name}", False, force=True)
+            except Exception as e:
+                try:
+                    webbrowser.open(page)
+                except Exception:
+                    pass
+                _notify(
+                    "Обновления",
+                    f"Скачивание не удалось ({e!s:.120}) — открыта страница релиза.",
+                    True,
+                    force=True,
+                )
+
+        threading.Thread(target=worker, name="whisper-hotkey-update", daemon=True).start()
+
+    def _set_speaker_threshold(icon: pystray.Icon, val: float | None) -> None:
+        p = _load_prefs()
+        if val is None:
+            p.pop("speaker_threshold", None)
+        else:
+            p["speaker_threshold"] = float(val)
+        _save_prefs(p)
+        _notify("Порог эталона", "Перезапусти Whisper Hotkey, чтобы применить.", False, force=True)
+        icon.update_menu()
+
+    def clear_speaker_threshold(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, None)
+
+    def set_spk_065(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, 0.65)
+
+    def set_spk_070(icon: pystray.Icon, item: object) -> None:
+        _set_speaker_threshold(icon, 0.70)
+
+    def edit_speaker_threshold(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            _notify("Порог", "Нет tkinter.", True)
+            return
+        hp = _load_prefs()
+        cur = hp.get("speaker_threshold", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Порог эталона",
+                "Число 0.45 … 0.99 (косинусное сходство). Пусто — убрать из prefs.",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        s = ans.strip()
+        if not s:
+            clear_speaker_threshold(icon, None)
+            return
+        try:
+            v = float(s.replace(",", "."))
+        except ValueError:
+            _notify("Порог", "Нужно число.", True)
+            return
+        if not 0.45 <= v <= 0.99:
+            _notify("Порог", "Ожидается 0.45 … 0.99.", True)
+            return
+        _set_speaker_threshold(icon, v)
+
+    def speaker_threshold_submenu():
+        return pystray.Menu(
+            Item("Сбросить prefs (env)", clear_speaker_threshold),
+            Item("Порог 0.65", set_spk_065),
+            Item("Порог 0.70", set_spk_070),
+            Item("Своё число…", edit_speaker_threshold),
+        )
+
+    def edit_transcribe_timeout(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            return
+        hp = _load_prefs()
+        cur = hp.get("transcribe_timeout_sec", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Таймаут транскрипции",
+                "Секунды ожидания GPU/Groq (не длина записи). Пусто — по умолчанию из env.",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        st = ans.strip()
+        p = _load_prefs()
+        if not st:
+            p.pop("transcribe_timeout_sec", None)
+        else:
+            try:
+                p["transcribe_timeout_sec"] = float(st.replace(",", "."))
+            except ValueError:
+                _notify("Таймаут", "Нужно число.", True)
+                return
+        _save_prefs(p)
+        _notify("Таймаут", "Перезапусти Whisper Hotkey.", False, force=True)
+        icon.update_menu()
+
+    def edit_max_hold(icon: pystray.Icon, item: object) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception:
+            return
+        hp = _load_prefs()
+        cur = hp.get("max_hold_seconds", "")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            ans = simpledialog.askstring(
+                "Макс. удержание записи",
+                "Секунды (защита от переполнения памяти). Пусто — по умолчанию (120).",
+                initialvalue=str(cur) if cur != "" else "",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if ans is None:
+            return
+        st = ans.strip()
+        p = _load_prefs()
+        if not st:
+            p.pop("max_hold_seconds", None)
+        else:
+            try:
+                p["max_hold_seconds"] = float(st.replace(",", "."))
+            except ValueError:
+                _notify("Запись", "Нужно число.", True)
+                return
+        _save_prefs(p)
+        _notify("Запись", "Перезапусти Whisper Hotkey.", False, force=True)
+        icon.update_menu()
+
+    def vocab_submenu():
+        return pystray.Menu(
+            Item("Открыть словарь…", open_vocab_file),
+            Item("Добавить из буфера…", vocab_add_from_clipboard),
+            Item("Добавить замену…", vocab_add_replacement),
+            Item("Показать подсказку словаря", vocab_show_prompt),
+        )
+
+    def groq_api_submenu():
+        return pystray.Menu(
+            Item(groq_key_status_label, None, enabled=False),
+            Item("Groq API ключ…", edit_groq_key),
+            Item("Сбросить ключ Groq (prefs)", clear_groq_key),
+            Item("Что нужно для своего прокси…", show_proxy_help),
+            Item(groq_proxy_toggle_label, toggle_groq_proxy),
+            Item("Использовать базовый прокси", use_default_proxy),
+            Item("Свой Groq прокси URL…", edit_groq_proxy_url),
+            Item("Свой Groq прокси секрет…", edit_groq_proxy_secret),
+            Item("Сбросить Groq прокси", clear_groq_proxy),
+        )
+
+    def transcribe_backend_submenu():
+        from whisper_groq import read_hotkey_transcribe_backend_pref, resolve_transcribe_backend_mode
+
+        cur = resolve_transcribe_backend_mode(
+            read_hotkey_transcribe_backend_pref(),
+            "WHISPER_TRANSCRIBE_BACKEND",
+            "WHISPER_MAC_TRANSCRIBE_BACKEND",
+        )
+        specs = [
+            ("server", "Только локальный GPU"),
+            ("groq", "Только Groq (large v3)"),
+            ("server_then_groq", "GPU → Groq"),
+            ("groq_then_server", "Groq → GPU"),
+        ]
+        items = []
+        for mode, label in specs:
+            mark = "✓ " if cur == mode else ""
+            short = label if len(label) <= 48 else label[:45] + "…"
+
+            def make_pick(m: str):
+                def pick(icon: pystray.Icon, item: object) -> None:
+                    set_transcribe_backend(icon, m)
+
+                return pick
+
+            items.append(Item(f"{mark}{short}", make_pick(mode)))
+        return pystray.Menu(*items)
+
     def notif_label(item: object) -> str:
         env_off = os.environ.get("WHISPER_HOTKEY_NO_NOTIFICATIONS", "").strip().lower() in ("1", "true", "yes")
         if env_off:
@@ -388,6 +987,13 @@ def main() -> int:
         Item(spk_label, toggle_speaker_verify),
         Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item("Модель → (перезапуск)", model_submenu()),
+        Item("Транскрипция → (перезапуск)", transcribe_backend_submenu()),
+        Item("Порог эталона →", speaker_threshold_submenu()),
+        Item("Таймаут транскрипции (сек)…", edit_transcribe_timeout),
+        Item("Макс. удержание записи (сек)…", edit_max_hold),
+        Item("Словарь →", vocab_submenu()),
+        Item("Groq API →", groq_api_submenu()),
+        Item("Проверить обновления…", hotkey_check_for_updates),
         Item("Папка с логами", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),
