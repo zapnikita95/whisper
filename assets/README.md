@@ -1,2 +1,3 @@
 - `app_icon.png` — исходник (можно заменить). Должен быть **настоящий PNG**; если файл на самом деле JPEG с расширением `.png`, скрипт всё равно конвертирует через `sips`, но лучше сохранить как PNG.
 - `AppIcon.icns` / `app_icon.ico` — пересборка: `../packaging/regenerate_icons.sh` (macOS, нужен Pillow для `.ico`).
+- **Windows, разные значки в панели:** `packaging/generate_windows_icons.py` — создаёт `hotkey_icon.ico` (зелёный **H**), `server_icon.ico` (синий **S**), копию `app_icon.ico` = hotkey для совместимости. Перед сборкой exe: `python packaging/generate_windows_icons.py`.

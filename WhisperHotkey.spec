@@ -6,7 +6,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 _pylib = Path(sysconfig.get_paths()["purelib"])
-datas = [('packaging\\VERSION', 'packaging'), ('assets\\app_icon.ico', 'assets')]
+datas = [('packaging\\VERSION', 'packaging'), ('assets\\hotkey_icon.ico', 'assets')]
 # Иначе в exe: RuntimeError cublas64_12.dll — venv site-packages не виден, кладём CUDA-библиотеки в _internal.
 for _nv_sub in ("cublas", "cudnn", "cusparse", "cufft", "curand", "nvjitlink"):
     _p = _pylib / "nvidia" / _nv_sub
@@ -51,7 +51,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\app_icon.ico'],
+    icon=['assets\\hotkey_icon.ico'],
 )
 coll = COLLECT(
     exe,

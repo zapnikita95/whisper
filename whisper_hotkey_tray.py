@@ -221,11 +221,13 @@ def _load_tray_image():
     from PIL import Image
 
     if getattr(sys, "frozen", False):
-        ico = Path(sys._MEIPASS) / "assets" / "app_icon.ico"
+        base = Path(sys._MEIPASS) / "assets"
     else:
-        ico = ROOT / "assets" / "app_icon.ico"
-    if ico.is_file():
-        return Image.open(ico)
+        base = ROOT / "assets"
+    for name in ("hotkey_icon.ico", "app_icon.ico"):
+        ico = base / name
+        if ico.is_file():
+            return Image.open(ico)
     img = Image.new("RGB", (64, 64), color=(32, 110, 75))
     return img
 

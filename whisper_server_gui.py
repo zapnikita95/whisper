@@ -33,6 +33,18 @@ os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def _server_window_ico_path() -> Path | None:
+    """Иконка окна (в exe — из _internal/assets)."""
+    if getattr(sys, "frozen", False):
+        meip = getattr(sys, "_MEIPASS", None)
+        if meip:
+            p = Path(meip) / "assets" / "server_icon.ico"
+            if p.is_file():
+                return p
+    p = ROOT / "assets" / "server_icon.ico"
+    return p if p.is_file() else None
+
 try:
     from whisper_version import get_version as _get_app_version
 except ImportError:
@@ -798,6 +810,12 @@ def main() -> int:
     root.title(f"Whisper GPU Server  v{app_ver}")
     root.geometry("520x160")
     root.minsize(400, 120)
+    _ico = _server_window_ico_path()
+    if _ico is not None:
+        try:
+            root.iconbitmap(default=str(_ico))
+        except tk.TclError:
+            pass
 
     boot_frm = ttk.Frame(root, padding=24)
     boot_frm.pack(fill=tk.BOTH, expand=True)

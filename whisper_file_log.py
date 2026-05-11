@@ -10,6 +10,9 @@ from pathlib import Path
 
 _CONFIGURED: set[str] = set()
 
+# После первого configure() — каталог, куда реально пишется лог (важно для записи из Program Files).
+_RESOLVED_LOG_ROOT: Path | None = None
+
 
 class _FlushRotatingFileHandler(RotatingFileHandler):
     def emit(self, record: logging.LogRecord) -> None:
@@ -30,10 +33,44 @@ def app_root() -> Path:
 
 
 def log_dir() -> Path:
+    """Каталог логов: после configure() совпадает с тем, куда удалось записать файл."""
+    global _RESOLVED_LOG_ROOT
+    if _RESOLVED_LOG_ROOT is not None:
+        return _RESOLVED_LOG_ROOT
     raw = os.environ.get("WHISPER_LOG_DIR", "").strip()
     if raw:
         return Path(raw)
     return app_root()
+
+
+def _try_writable_dir(d: Path) -> bool:
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".whisper_log_probe"
+        probe.write_text("ok", encoding="ascii")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _pick_writable_log_root(logger_name: str) -> Path:
+    """Установка в Program Files: каталог exe часто только для чтения — уводим лог в %LOCALAPPDATA%."""
+    env = os.environ.get("WHISPER_LOG_DIR", "").strip()
+    if env:
+        return Path(env)
+    candidates: list[Path] = [app_root()]
+    if sys.platform == "win32":
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            sub = "WhisperHotkey" if "hotkey" in logger_name else "WhisperServer"
+            candidates.append(Path(la) / sub)
+    safe = logger_name.replace(".", "_")
+    candidates.append(Path(tempfile.gettempdir()) / f"Whisper_{safe}")
+    for d in candidates:
+        if _try_writable_dir(d):
+            return d
+    return Path(tempfile.gettempdir())
 
 
 def configure(
@@ -53,8 +90,10 @@ def configure(
         return logging.getLogger(name)
     _CONFIGURED.add(name)
 
-    log_dir().mkdir(parents=True, exist_ok=True)
-    path = log_dir() / filename
+    global _RESOLVED_LOG_ROOT
+    chosen_root = _pick_writable_log_root(name)
+    _RESOLVED_LOG_ROOT = chosen_root
+    path = chosen_root / filename
     logger = logging.getLogger(name)
     logger.setLevel(level)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")

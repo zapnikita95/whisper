@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_all
 
 _pylib = Path(sysconfig.get_paths()["purelib"])
 datas = [("packaging\\VERSION", "packaging")]
-_icon = Path("assets/app_icon.ico")
+_icon = Path("assets/server_icon.ico")
 if _icon.is_file():
     datas.append((str(_icon), "assets"))
 
