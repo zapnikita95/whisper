@@ -4,6 +4,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MAC="$ROOT/packaging/mac"
 APP="$MAC/WhisperClient.app"
 
+# Автоподпись Developer ID: создай packaging/mac/whisper_codesign_local.env (см. .example) — тогда любой
+# запуск этого скрипта (в т.ч. из Cursor) подписывает без ручного export.
+# build_signed_app.sh выставляет WHISPER_CODESIGN_PREPARE_MODE=always — подпись даже без env-файла (GUI-пароль).
+PREP_MODE="${WHISPER_CODESIGN_PREPARE_MODE:-auto}"
+if [ "$PREP_MODE" = "always" ] || [ -f "$MAC/whisper_codesign_local.env" ]; then
+	# shellcheck disable=SC1091
+	source "$MAC/whisper_codesign_prepare.sh"
+	echo "Подпись: WHISPER_MAC_CODESIGN_IDENTITY=${WHISPER_MAC_CODESIGN_IDENTITY}"
+fi
+
 # Иначе clang из Xcode 26 вшивает minos 26 → на macOS 15 и ниже «You can't use this version…»
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 # Универсальный бинарь: коллеги на Intel; при ошибке x86_64 — собери на машине с полным SDK или убери -arch x86_64.
@@ -67,6 +77,9 @@ fi
 # - По умолчанию ad-hoc (sign -) — без Apple Developer.
 # - Своя подпись: export WHISPER_MAC_CODESIGN_IDENTITY="Apple Development: …" или "Developer ID Application: …"
 #   см. packaging/mac/APPLE_SIGNING.md и security find-identity -v -p codesigning
+# Прерванный codesign оставляет *.cstemp — без этого следующая подпись падает с «invalid … format».
+find "$APP" -name '*.cstemp*' -delete 2>/dev/null || true
+
 if [ -n "${WHISPER_MAC_CODESIGN_IDENTITY:-}" ]; then
 	echo "Подпись codesign: ${WHISPER_MAC_CODESIGN_IDENTITY}"
 	if codesign --force --deep --timestamp --options runtime \

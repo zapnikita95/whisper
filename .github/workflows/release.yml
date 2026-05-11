@@ -106,15 +106,17 @@ jobs:
           echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
           echo "${GITHUB_REF#refs/tags/v}" > packaging/VERSION
 
-      - name: Build WhisperClient.app
-        run: ./packaging/build_mac_app.sh
-
-      - name: DMG
+      - name: Build WhisperClient.app + DMG (Developer ID если заданы секреты)
         env:
-          WHISPER_DMG_SKIP_APP_BUILD: "1"
-        run: |
-          brew install create-dmg
-          ./packaging/mac/make_dmg.sh "$VERSION"
+          VERSION: ${{ env.VERSION }}
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          WHISPER_MAC_CODESIGN_IDENTITY: ${{ secrets.WHISPER_MAC_CODESIGN_IDENTITY }}
+          APPLE_NOTARY_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_SPECIFIC_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+        run: bash packaging/mac/ci_mac_signed_build.sh
 
       - uses: actions/upload-artifact@v4
         with:

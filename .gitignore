@@ -23,3 +23,6 @@ whisper_hotkey_prefs.json
 whisper_hotkey.log
 whisper_server.log
 assets/AppIcon.iconset/
+# Локальная подпись (личность / эксперименты)
+packaging/mac/whisper_codesign_local.env
+packaging/mac/whisper_notary_local.env
