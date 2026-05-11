@@ -3529,6 +3529,14 @@ if rumps is not None:
             return u if len(u) <= 56 else u[:53] + "…"
 
         def _edit_server_host_port_menu(self, _sender) -> None:
+            # После закрытия меню: иначе NSAlert у LSUIElement-агента может не показаться.
+            from Foundation import NSOperationQueue  # type: ignore[import-untyped]
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._edit_server_host_port_menu_impl(),
+            )
+
+        def _edit_server_host_port_menu_impl(self) -> None:
             try:
                 from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
             except ImportError as e:
@@ -3582,6 +3590,13 @@ if rumps is not None:
             self._mi_server.title = self._server_title()
 
         def _edit_server_url_menu(self, _sender) -> None:
+            from Foundation import NSOperationQueue  # type: ignore[import-untyped]
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._edit_server_url_menu_impl(),
+            )
+
+        def _edit_server_url_menu_impl(self) -> None:
             cur = self.client.server_url
             raw = _mac_osascript_prompt_line(
                 title="Whisper — полный URL сервера",
@@ -3652,26 +3667,34 @@ if rumps is not None:
                 rumps.MenuItem("Порог 0.75", callback=self._speaker_threshold_set_factory(0.75)),
                 rumps.MenuItem("Своё число…", callback=self._speaker_threshold_custom),
             ]
-            return [
-                self._mi_version,
-                self._mi_server,
+            _menu_server = [
                 rumps.MenuItem("Сервер: IP и порт…", callback=self._edit_server_host_port_menu),
                 rumps.MenuItem("Полный URL сервера…", callback=self._edit_server_url_menu),
                 rumps.MenuItem("Сбросить настройки сервера", callback=self._clear_server_url_menu),
                 rumps.separator,
                 ("Таймауты сервера", _menu_timeouts),
+                rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),
+            ]
+            _menu_recognition = [
                 ("Порог эталона голоса", _menu_speaker),
-                # rumps: подменю только через кортеж (title, [items]) — keyword submenu= не везде есть.
-                ("История расшифровок", self._history_submenu_items()),
+                rumps.MenuItem("Записать эталон голоса (45 с)…", callback=self._enroll_speaker_menu),
+                rumps.separator,
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
                 ("Словарь", self._vocab_submenu_items()),
                 ("Groq API", self._groq_api_submenu_items()),
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
-                rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),
+            ]
+            return [
+                self._mi_version,
+                self._mi_server,
+                rumps.separator,
+                ("Сервер", _menu_server),
+                ("Распознавание и текст", _menu_recognition),
+                rumps.separator,
+                ("История расшифровок", self._history_submenu_items()),
                 rumps.separator,
                 rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
-                rumps.MenuItem("Записать эталон голоса (45 с)…", callback=self._enroll_speaker_menu),
                 rumps.separator,
                 rumps.MenuItem("Перезапустить перехват клавиш", callback=self._restart_hotkey),
                 rumps.MenuItem("Показать лог…", callback=self._open_log),

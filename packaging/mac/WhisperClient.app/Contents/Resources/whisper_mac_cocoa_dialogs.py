@@ -19,6 +19,16 @@ _NS_ALERT_FIRST = 1000
 _NS_ALERT_SECOND = 1001
 
 
+def _activate_for_modal_dialog() -> None:
+    """Whisper Client — LSUIElement (нет Dock). Иначе NSAlert не выходит на передний план."""
+    try:
+        from AppKit import NSApplication  # type: ignore[import-untyped]
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
+
+
 def _test_whisper_server(host: str, port: int) -> tuple[bool, str]:
     host = host.strip()
     if not host:
@@ -97,6 +107,7 @@ def mac_cocoa_ask_string(
     alert.addButtonWithTitle_("Сохранить")
     alert.addButtonWithTitle_("Отмена")
 
+    _activate_for_modal_dialog()
     resp = alert.runModal()
     if resp != _NS_ALERT_FIRST:
         return None
@@ -160,8 +171,16 @@ def mac_cocoa_server_host_port_dialog(
     test_btn.setTitle_("Проверить")
     test_btn.setBezelStyle_(NSBezelStyleRounded)
 
-    status = NSTextField.wrappingLabelWithString_("Нажми «Проверить» для проверки GET / (JSON status/model).")
-    status.setFrame_(NSMakeRect(0, 0, 440, 48))
+    try:
+        status = NSTextField.wrappingLabelWithString_(
+            "Нажми «Проверить» для проверки GET / (JSON status/model)."
+        )
+        status.setFrame_(NSMakeRect(0, 0, 440, 48))
+    except AttributeError:
+        status = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 440, 48))
+        status.setStringValue_("Нажми «Проверить» для проверки GET / (JSON status/model).")
+        status.setEditable_(False)
+        status.setBezeled_(True)
 
     handler = _HostPortTestHandler.alloc().init()
     handler.hostField = he
@@ -184,6 +203,7 @@ def mac_cocoa_server_host_port_dialog(
     alert.addButtonWithTitle_("Сохранить")
     alert.addButtonWithTitle_("Отмена")
 
+    _activate_for_modal_dialog()
     resp = alert.runModal()
     if resp != _NS_ALERT_FIRST:
         return None
