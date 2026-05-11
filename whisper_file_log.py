@@ -49,9 +49,26 @@ def _try_writable_dir(d: Path) -> bool:
         probe = d / ".whisper_log_probe"
         probe.write_text("ok", encoding="ascii")
         probe.unlink(missing_ok=True)
+        # Реальный лог — как при RotatingFileHandler; probe мог пройти из‑за странных ACL.
+        real = d / ".whisper_log_probe_real.log"
+        try:
+            with real.open("a", encoding="ascii") as f:
+                f.write("")
+        finally:
+            real.unlink(missing_ok=True)
         return True
     except OSError:
         return False
+
+
+def _is_windows_program_files_tree(p: Path) -> bool:
+    """Каталог установки под Program Files — обычному пользователю часто нельзя создавать *.log."""
+    try:
+        resolved = p.resolve()
+    except OSError:
+        return False
+    low = {part.lower() for part in resolved.parts}
+    return "program files" in low or "program files (x86)" in low
 
 
 def _pick_writable_log_root(logger_name: str) -> Path:
@@ -59,12 +76,27 @@ def _pick_writable_log_root(logger_name: str) -> Path:
     env = os.environ.get("WHISPER_LOG_DIR", "").strip()
     if env:
         return Path(env)
-    candidates: list[Path] = [app_root()]
+    root = app_root()
+    candidates: list[Path] = []
     if sys.platform == "win32":
         la = os.environ.get("LOCALAPPDATA", "").strip()
-        if la:
-            sub = "WhisperHotkey" if "hotkey" in logger_name else "WhisperServer"
-            candidates.append(Path(la) / sub)
+        la_sub = (
+            Path(la)
+            / ("WhisperHotkey" if "hotkey" in logger_name else "WhisperServer")
+            if la
+            else None
+        )
+        restricted = _is_windows_program_files_tree(root)
+        if restricted:
+            # Не предлагаем Program Files — даже если mkdir/probe прошли, *.log часто запрещён политикой.
+            if la_sub is not None:
+                candidates.append(la_sub)
+        else:
+            candidates.append(root)
+            if la_sub is not None:
+                candidates.append(la_sub)
+    else:
+        candidates.append(root)
     safe = logger_name.replace(".", "_")
     candidates.append(Path(tempfile.gettempdir()) / f"Whisper_{safe}")
     for d in candidates:
