@@ -63,8 +63,22 @@ else
 	echo "Предупреждение: нет assets/AppIcon.icns — иконка не вшита"
 fi
 
-# Локальная подпись — меньше сюрпризов у Gatekeeper при запуске из произвольной папки.
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+# Подпись:
+# - По умолчанию ad-hoc (sign -) — без Apple Developer.
+# - Своя подпись: export WHISPER_MAC_CODESIGN_IDENTITY="Apple Development: …" или "Developer ID Application: …"
+#   см. packaging/mac/APPLE_SIGNING.md и security find-identity -v -p codesigning
+if [ -n "${WHISPER_MAC_CODESIGN_IDENTITY:-}" ]; then
+	echo "Подпись codesign: ${WHISPER_MAC_CODESIGN_IDENTITY}"
+	if codesign --force --deep --timestamp --options runtime \
+		--sign "${WHISPER_MAC_CODESIGN_IDENTITY}" "$APP"; then
+		:
+	else
+		echo "Предупреждение: подпись с --options runtime не удалась — пробую без hardened runtime."
+		codesign --force --deep --timestamp --sign "${WHISPER_MAC_CODESIGN_IDENTITY}" "$APP"
+	fi
+else
+	codesign --force --deep --sign - "$APP" 2>/dev/null || true
+fi
 
 # Finder часто показывает дату «Изменён» по корню .app; без touch внутренние правки не видны как «свежее».
 touch "$APP"
@@ -72,7 +86,7 @@ touch "$APP"
 echo "Готово. Перетащи WhisperClient.app в Программы."
 echo "Нужны: Python 3 с pynput, requests, sounddevice, … (как в README)."
 echo ""
-echo "ВАЖНО (macOS Privacy): после каждой пересборки ad-hoc подпись меняется — старые разрешения"
+echo "ВАЖНО (macOS Privacy): без WHISPER_MAC_CODESIGN_IDENTITY ad-hoc подпись каждый раз другая — старые разрешения"
 echo "микрофона / мониторинга ввода могут не подходить (в Console: Failed to match … kTCCServiceListenEvent / Microphone)."
 echo "Один раз запусти:  packaging/mac/reset_whisper_client_privacy.command"
 echo "или в Терминале:"

@@ -1,6 +1,29 @@
 # Подпись и установка Whisper Client без «танцев» (Gatekeeper)
 
-Сейчас в репозитории сборка делает **ad-hoc** подпись (`codesign --sign -`). macOS тогда часто требует **Ctrl+открыть**, сброс TCC после каждой пересборки и т.д.
+## Файл `development.cer` и Apple Development
+
+Если у тебя в Downloads лежит **`development.cer`** — это обычно **публичная часть** сертификата **Apple Development** (WWDR). Подписывать им напрямую нельзя: нужна пара **сертификат + закрытый ключ** в **Связке ключей**.
+
+Проверка, что всё на месте:
+
+```bash
+security find-identity -v -p codesigning
+```
+
+Должна быть строка вида **`Apple Development: your@email.com (…)`** — это и есть **личность для codesign**. Файл `.cer` на диске при этом может быть не нужен: главное — импорт в Keychain был с приватным ключом (часто ключ подтягивается автоматически, если создавали CSR из Xcode).
+
+Сборка Whisper Client с твоей подписью **Apple Development**:
+
+```bash
+export WHISPER_MAC_CODESIGN_IDENTITY='Apple Development: zap.nikita@icloud.com (6L3B9RR8L8)'
+bash packaging/build_mac_app.sh
+```
+
+Это лучше ad-hoc для **твоего Mac**, но **не заменяет** сертификат **Developer ID Application** для спокойной установки у всех пользователей и нотаризации.
+
+---
+
+Сейчас в репозитории без переменной сборка делает **ad-hoc** подпись (`codesign --sign -`). macOS тогда часто требует **Ctrl+открыть**, сброс TCC после каждой пересборки и т.д.
 
 Чтобы **один раз разрешил и забыл** (как нормальные приложения):
 
