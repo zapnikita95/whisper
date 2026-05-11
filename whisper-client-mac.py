@@ -2273,11 +2273,12 @@ class WhisperClientMac:
                     result = self._transcribe_post_groq(
                         tmp_path, prompt=vocab_prompt or None
                     )
+                result = dict(result)
                 raw_text = (result.get("text") or "").strip()
+                result["_mac_raw_transcript"] = raw_text
                 if raw_text:
                     replaced = self._apply_vocab_replacements(raw_text, vocab_app)
                     if replaced != raw_text:
-                        result = dict(result)
                         result["text"] = replaced
                 text = (result.get("text") or "").strip()
                 if text:
@@ -3277,11 +3278,14 @@ class WhisperClientMac:
                         skip_progress_for_first_backend=order_pre[0] if order_pre else None,
                     )
                     text = result.get("text", "").strip()
+                    raw_fb = (result.get("_mac_raw_transcript") or "").strip()
+                    hist_line = text or raw_fb
+                    out_text = text if text else hist_line
                     if os.environ.get("WHISPER_MAC_DEBUG"):
-                        _mac_log("debug", "transcribe_full_text=%r", text)
+                        _mac_log("debug", "transcribe_full_text=%r raw_fb=%r", text, raw_fb)
 
-                    if text:
-                        append_mac_transcription_history(text)
+                    if hist_line:
+                        append_mac_transcription_history(hist_line)
                         self._notify_menu_history_refresh()
                         mode = self._effective_paste_mode()
                         paste_ok = False
@@ -3297,7 +3301,7 @@ class WhisperClientMac:
                                 self._reset_hotkey_tracker()
                                 self._reset_native_hotkey_tap_state()
                             if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                prev = hist_line[:130] + ("…" if len(hist_line) > 130 else "")
                                 mac_banner_notification("Whisper — в истории", prev)
                             _mac_log("info", "paste_mode=history_only")
                         elif mode == "clipboard":
@@ -3307,10 +3311,10 @@ class WhisperClientMac:
                                 if not self._using_daemon:
                                     self._release_sticky_modifiers_safe()
                                 time.sleep(0.12)
-                                self._copy_to_clipboard_mac(text)
+                                self._copy_to_clipboard_mac(text if text else hist_line)
                             except Exception as e:
                                 try:
-                                    pyperclip.copy(text)
+                                    pyperclip.copy(text if text else hist_line)
                                 except Exception:
                                     pass
                                 print(f"[Client] Буфер: {e}", flush=True)
@@ -3319,7 +3323,7 @@ class WhisperClientMac:
                                 self._reset_hotkey_tracker()
                                 self._reset_native_hotkey_tap_state()
                             if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                prev = out_text[:130] + ("…" if len(out_text) > 130 else "")
                                 mac_banner_notification("Whisper — в буфере", prev)
                             _mac_log("info", "paste_mode=clipboard_only")
                         else:
@@ -3346,48 +3350,53 @@ class WhisperClientMac:
                                         "(кликни в поле ввода до хоткея; если Terminal/Python был активен — снимок PID отброшен)",
                                     )
                                 time.sleep(0.08)
-                                self._copy_to_clipboard_mac(text)
+                                self._copy_to_clipboard_mac(out_text)
                                 time.sleep(0.06)
-                                if self._clipboard_matches_expected(text):
-                                    _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(text))
+                                if self._clipboard_matches_expected(out_text):
+                                    _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(out_text))
                                 else:
                                     _mac_log(
                                         "warning",
                                         "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
-                                        text[:80],
+                                        out_text[:80],
                                         self._clipboard_preview(100),
                                     )
                                 time.sleep(0.12)
                                 ok = self._paste_via_system_events(paste_pid)
                                 paste_ok = bool(ok)
                                 if ok:
-                                    print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
+                                    print(f"[Client] Текст вставлен: {out_text[:60]}…", flush=True)
                                     _mac_log("info", "paste_cmd_v_ok")
                                 else:
-                                    pyperclip.copy(text)
+                                    pyperclip.copy(out_text)
                                     print(
-                                        f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {text[:60]}…",
+                                        f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {out_text[:60]}…",
                                         flush=True,
                                     )
                                     print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
                                     _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
                             except Exception as e:
                                 try:
-                                    pyperclip.copy(text)
+                                    pyperclip.copy(out_text)
                                 except Exception:
                                     pass
-                                print(f"[Client] Вставка не удалась ({e}), текст в буфере: {text[:60]}…", flush=True)
+                                print(f"[Client] Вставка не удалась ({e}), текст в буфере: {out_text[:60]}…", flush=True)
                                 print("[Client] Нажми Cmd+V для вставки.", flush=True)
                                 _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
                             finally:
                                 self._reset_hotkey_tracker()
                                 self._reset_native_hotkey_tap_state()
                             if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
+                                prev = out_text[:130] + ("…" if len(out_text) > 130 else "")
                                 if paste_ok:
                                     mac_banner_notification("Whisper — готово", prev)
                                 else:
                                     mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
+                            if not text and raw_fb:
+                                mac_banner_notification(
+                                    "Whisper",
+                                    "После словаря строка пустая — в буфер/историю ушёл исходный распознанный текст.",
+                                )
                     else:
                         print("[Client] Текст не распознан.", flush=True)
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
@@ -3832,7 +3841,7 @@ if rumps is not None:
 
         def _history_submenu_items(self) -> list:
             items: list = []
-            for entry in load_mac_transcription_history(limit=10):
+            for entry in load_mac_transcription_history(limit=15):
                 t = entry.get("text")
                 if not isinstance(t, str) or not t.strip():
                     continue
@@ -3886,7 +3895,11 @@ if rumps is not None:
                 ("server_then_groq", "Сервер → Groq"),
                 ("groq_then_server", "Groq → сервер"),
             ]
-            out: list = []
+            cur_label = dict(specs).get(cur, cur or "по умолчанию")
+            out: list = [
+                rumps.MenuItem(f"Сейчас: {cur_label}", callback=None),
+                rumps.separator,
+            ]
             for mode, label in specs:
                 mark = "✓ " if cur == mode else "   "
                 out.append(
