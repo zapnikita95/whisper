@@ -842,6 +842,28 @@ def _mac_ui_ask_string(
         return None
 
 
+def _mac_ping_icmp_host(host: str) -> tuple[bool, str]:
+    """Один ICMP Echo Request (macOS /sbin/ping). Возвращает (успех, хвост вывода или ошибка)."""
+    h = (host or "").strip()
+    if not h:
+        return False, "(пустой хост)"
+    try:
+        r = subprocess.run(
+            ["/sbin/ping", "-c", "1", "-W", "2000", h],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        ok = r.returncode == 0
+        tail = ""
+        if r.stdout:
+            lines = [ln for ln in r.stdout.strip().split("\n") if ln.strip()]
+            tail = lines[-1] if lines else ""
+        return ok, (tail or r.stderr or "")[:200]
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
     """Без утечки секретов в лог."""
     out = dict(prefs)
@@ -3518,6 +3540,7 @@ if rumps is not None:
             # Запрашиваем разрешение на уведомления из контекста работающего NSApp.
             # Таймер 3 с: к тому времени RunLoop уже запущен → completionHandler доставляется корректно.
             threading.Timer(3.0, self._request_notifications_permission).start()
+            threading.Timer(5.0, self._autoprobe_server_once).start()
             _ensure_whisper_un_for_updates()
             _ir = _listener_idle_recycle_sec()
             if _ir > 0:
@@ -3532,19 +3555,108 @@ if rumps is not None:
             u = self.client.server_url
             return u if len(u) <= 56 else u[:53] + "…"
 
-        def _edit_server_host_port_menu(self, _sender) -> None:
-            # После закрытия меню: иначе NSAlert у LSUIElement-агента может не показаться.
-            from Foundation import NSOperationQueue  # type: ignore[import-untyped]
+        def _autoprobe_server_once(self) -> None:
+            """Фон: если GET / по текущему URL не Whisper — сканируем порты на известном хосте и сохраняем."""
+            if self.client._run_stop:
+                return
 
-            NSOperationQueue.mainQueue().addOperationWithBlock_(
-                lambda: self._edit_server_host_port_menu_impl(),
-            )
+            def work() -> None:
+                try:
+                    import json as _json
+                    import urllib.error
+                    import urllib.request
+                    from urllib.parse import urlparse
+
+                    from whisper_mac_defaults import DEFAULT_SERVER_HOST
+                    from whisper_mac_server_probe import probe_ports_on_host
+
+                    u_cur = self.client.server_url.rstrip("/")
+                    try:
+                        req = urllib.request.Request(
+                            u_cur + "/",
+                            headers={"User-Agent": "WhisperMacAutoProbe/1"},
+                        )
+                        with urllib.request.urlopen(req, timeout=3.0) as resp:
+                            raw = resp.read().decode("utf-8", errors="replace")
+                        d = _json.loads(raw)
+                        if d.get("status") == "ok" and "model" in d:
+                            return
+                    except (
+                        urllib.error.HTTPError,
+                        urllib.error.URLError,
+                        TimeoutError,
+                        _json.JSONDecodeError,
+                        OSError,
+                        ValueError,
+                    ):
+                        pass
+
+                    prefs = load_mac_client_prefs()
+                    sh = prefs.get("server_host")
+                    host_guess = (sh.strip() if isinstance(sh, str) else "") or DEFAULT_SERVER_HOST
+                    try:
+                        pr = urlparse(u_cur)
+                        if pr.hostname:
+                            host_guess = pr.hostname
+                    except Exception:
+                        pass
+
+                    url_new, msg = probe_ports_on_host(host_guess)
+                    if not url_new:
+                        _mac_log("info", "autoprobe_no_server host=%s msg=%s", host_guess, msg)
+                        return
+                    pr2 = urlparse(url_new)
+                    hp = pr2.hostname or host_guess
+                    pp = int(pr2.port or 8001)
+                    self.client._merge_save_mac_prefs(
+                        server_url=url_new.rstrip("/"),
+                        server_host=hp,
+                        server_port=pp,
+                    )
+                    self.client._reload_mac_prefs_from_disk()
+                    mac_banner_notification("Whisper", f"Сервер найден автоматически: {url_new}")
+                    try:
+                        self._mi_server.title = self._server_title()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    _mac_log("warning", "autoprobe err=%s", e)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _ping_server_connection_menu(self, _sender) -> None:
+            from urllib.parse import urlparse
+
+            try:
+                from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+                from whisper_mac_cocoa_dialogs import _test_whisper_server
+            except ImportError as e:
+                rumps.alert("Ошибка", str(e))
+                return
+
+            pr = urlparse(self.client.server_url)
+            host = pr.hostname or DEFAULT_SERVER_HOST
+            port = int(pr.port or DEFAULT_SERVER_PORT)
+            icmp_ok, icmp_tail = _mac_ping_icmp_host(host)
+            http_ok, http_msg = _test_whisper_server(host, port)
+            lines = [
+                f"Текущий URL: {self.client.server_url}",
+                f"ICMP: {'ответ есть' if icmp_ok else 'нет ответа'} — {icmp_tail}",
+                f"HTTP GET /: {'OK' if http_ok else 'ошибка'} — {http_msg}",
+            ]
+            rumps.alert("Проверка связи с сервером", "\n".join(lines))
+
+        def _edit_server_host_port_menu(self, _sender) -> None:
+            self._edit_server_host_port_menu_impl()
 
         def _edit_server_host_port_menu_impl(self) -> None:
             try:
+                from urllib.parse import urlparse
+
                 from whisper_mac_defaults import DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT
+                from whisper_mac_server_probe import probe_ports_on_host
             except ImportError as e:
-                rumps.alert("Ошибка", f"Не удалось загрузить константы: {e}")
+                rumps.alert("Ошибка", f"Не удалось загрузить модули: {e}")
                 return
             p = load_mac_client_prefs()
             hd = p.get("server_host")
@@ -3559,6 +3671,19 @@ if rumps is not None:
                         port0 = DEFAULT_SERVER_PORT
                 except (TypeError, ValueError):
                     port0 = DEFAULT_SERVER_PORT
+
+            scan_summary = ""
+            try:
+                url_hit, scan_summary = probe_ports_on_host(host0)
+                if url_hit:
+                    pr = urlparse(url_hit)
+                    if pr.hostname:
+                        host0 = pr.hostname
+                    if pr.port:
+                        port0 = int(pr.port)
+            except Exception as e:
+                scan_summary = f"Авто-поиск: ошибка ({e})"
+
             out = None
             cocoa_ok = False
             try:
@@ -3568,6 +3693,7 @@ if rumps is not None:
                     title="Whisper — сервер",
                     host=host0,
                     port=port0,
+                    scan_summary=scan_summary,
                 )
                 cocoa_ok = True
             except Exception as e:
@@ -3580,6 +3706,7 @@ if rumps is not None:
                         title="Whisper — сервер",
                         host=host0,
                         port=port0,
+                        scan_summary=scan_summary,
                     )
                 except ImportError as e:
                     rumps.alert("Ошибка", f"Не удалось открыть диалог сервера: {e}")
@@ -3594,11 +3721,7 @@ if rumps is not None:
             self._mi_server.title = self._server_title()
 
         def _edit_server_url_menu(self, _sender) -> None:
-            from Foundation import NSOperationQueue  # type: ignore[import-untyped]
-
-            NSOperationQueue.mainQueue().addOperationWithBlock_(
-                lambda: self._edit_server_url_menu_impl(),
-            )
+            self._edit_server_url_menu_impl()
 
         def _edit_server_url_menu_impl(self) -> None:
             cur = self.client.server_url
@@ -3675,6 +3798,8 @@ if rumps is not None:
                 rumps.MenuItem("Сервер: IP и порт…", callback=self._edit_server_host_port_menu),
                 rumps.MenuItem("Полный URL сервера…", callback=self._edit_server_url_menu),
                 rumps.MenuItem("Сбросить настройки сервера", callback=self._clear_server_url_menu),
+                rumps.separator,
+                rumps.MenuItem("Проверить связь (ping + HTTP)…", callback=self._ping_server_connection_menu),
                 rumps.separator,
                 ("Таймауты сервера", _menu_timeouts),
                 rumps.MenuItem(self._skip_health_menu_title(), callback=self._toggle_skip_health),

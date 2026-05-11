@@ -108,6 +108,7 @@ def mac_tk_server_host_port_dialog(
     title: str,
     host: str,
     port: int,
+    scan_summary: str = "",
     on_test: Callable[[str, int], tuple[bool, str]] | None = None,
 ) -> tuple[str, int] | None:
     """Два поля + Проверить + Сохранить. Возвращает (host, port) или None."""
@@ -191,6 +192,9 @@ def mac_tk_server_host_port_dialog(
     ttk.Button(bf, text="Отмена", command=cancel).pack(side=tk.RIGHT, padx=(4, 0))
     ttk.Button(bf, text="Сохранить", command=save).pack(side=tk.RIGHT)
     ttk.Button(bf, text="Проверить", command=do_test).pack(side=tk.RIGHT, padx=(0, 8))
+
+    if scan_summary.strip():
+        set_status(scan_summary.strip())
 
     he.focus_set()
     win.protocol("WM_DELETE_WINDOW", cancel)
