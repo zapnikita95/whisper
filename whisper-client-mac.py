@@ -3916,13 +3916,22 @@ if rumps is not None:
 
         def _vocab_submenu_items(self) -> list:
             return [
-                rumps.MenuItem("Открыть словарь…", callback=self._vocab_open_menu),
-                rumps.MenuItem("Добавить из буфера…", callback=self._vocab_add_from_clipboard_menu),
-                rumps.MenuItem("Добавить замену…", callback=self._vocab_add_replacement_menu),
-                rumps.MenuItem("Показать, как видит словарь", callback=self._vocab_show_prompt_menu),
+                rumps.MenuItem("Редактор словаря…", callback=self._vocab_open_menu),
+                rumps.MenuItem("Открыть vocab.json в TextEdit…", callback=self._vocab_open_json_menu),
+                rumps.MenuItem("Добавить слово из буфера…", callback=self._vocab_add_from_clipboard_menu),
+                rumps.MenuItem("Показать подсказку для модели", callback=self._vocab_show_prompt_menu),
             ]
 
         def _vocab_open_menu(self, _sender) -> None:
+            try:
+                vocab_ensure_file()
+                from whisper_mac_vocab_ui import open_vocab_editor
+
+                open_vocab_editor(preview_app_name=self.client._current_app_name())
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось открыть редактор: {e}")
+
+        def _vocab_open_json_menu(self, _sender) -> None:
             try:
                 path = vocab_ensure_file()
                 subprocess.run(["open", "-e", path], check=False)
@@ -3946,30 +3955,6 @@ if rumps is not None:
             try:
                 add_term(term)
                 mac_banner_notification("Whisper", f"Термин добавлен в словарь: {term}")
-                self.menu = self._compose_menu()
-            except Exception as e:
-                rumps.alert("Словарь", f"Не удалось сохранить: {e}")
-
-        def _vocab_add_replacement_menu(self, _sender) -> None:
-            from_raw = _mac_osascript_prompt_line(
-                title="Whisper — словарь",
-                message="Что заменять (regex, напр. 'кубернетес|кубер нетес'):",
-            )
-            if not from_raw:
-                return
-            to_raw = _mac_osascript_prompt_line(
-                title="Whisper — словарь",
-                message=f"На что заменять («{from_raw.strip()}»):",
-            )
-            if not to_raw:
-                return
-            from whisper_vocab import add_replacement
-
-            try:
-                add_replacement(from_raw.strip(), to_raw.strip())
-                mac_banner_notification(
-                    "Whisper", f"Замена добавлена: {from_raw.strip()} → {to_raw.strip()}"
-                )
                 self.menu = self._compose_menu()
             except Exception as e:
                 rumps.alert("Словарь", f"Не удалось сохранить: {e}")

@@ -18,7 +18,7 @@
 {
     "version": 1,
     "global": {
-        "terms": [str, ...],
+        "terms": [str | {"term": str, "aliases": [str], "note": str}, ...],
         "replacements": [{"from": <regex>, "to": <str>}, ...],
         "context_hint": str
     },
@@ -27,6 +27,11 @@
         ...
     }
 }
+
+Элемент terms может быть строкой («kubernetes») или объектом: term — слово в тексте;
+aliases — как модель может услышать слово (варианты произношения/орфографии для initial_prompt);
+note — короткая подсказка декодеру. Отдельной «фонетической таблицы» у Whisper API нет:
+подсказка идёт в initial_prompt / prompt и статистически смещает распознавание.
 
 profiles[AppName] сматчивается по имени активного приложения, которое детектит
 клиент (Mac: NSWorkspace, Windows: win32gui). Регистр имени игнорируется, точное
@@ -70,13 +75,66 @@ def default_vocab() -> dict[str, Any]:
     }
 
 
+def _normalize_term_entry(raw: Any) -> dict[str, Any] | None:
+    """Одна запись словаря: term + опционально aliases (как слышится) и note."""
+    if isinstance(raw, (str, int)):
+        t = str(raw).strip()
+        if not t:
+            return None
+        return {"term": t, "aliases": [], "note": ""}
+    if isinstance(raw, dict):
+        term = str(raw.get("term") or raw.get("word") or "").strip()
+        if not term:
+            return None
+        aliases_raw = raw.get("aliases")
+        if aliases_raw is None:
+            aliases_raw = raw.get("hear_as")
+        if isinstance(aliases_raw, str):
+            aliases = [a.strip() for a in re.split(r"[,;|\n]+", aliases_raw) if a.strip()]
+        elif isinstance(aliases_raw, list):
+            aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+        else:
+            aliases = []
+        note = str(raw.get("note") or raw.get("hint") or "").strip()
+        return {"term": term, "aliases": aliases, "note": note}
+    return None
+
+
+def _serialize_term_entry(entry: dict[str, Any]) -> str | dict[str, Any]:
+    term = str(entry.get("term") or "").strip()
+    aliases = list(entry.get("aliases") or [])
+    note = str(entry.get("note") or "").strip()
+    if not aliases and not note:
+        return term
+    return {"term": term, "aliases": aliases, "note": note}
+
+
+def serialize_term_for_json(entry: dict[str, Any]) -> str | dict[str, Any]:
+    """Сериализация одного термина для vocab.json (для UI и тестов)."""
+    return _serialize_term_entry(entry)
+
+
+def parse_terms_list(raw: Any) -> list[dict[str, Any]]:
+    """Список терминов из JSON → нормализованные dict'ы (для UI и build_initial_prompt)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        e = _normalize_term_entry(item)
+        if e:
+            out.append(e)
+    return out
+
+
 def _ensure_shape(raw: Any) -> dict[str, Any]:
     """Приводит произвольный JSON к валидной структуре без потери данных."""
     if not isinstance(raw, dict):
         return default_vocab()
     out = default_vocab()
     g = raw.get("global") if isinstance(raw.get("global"), dict) else {}
-    out["global"]["terms"] = [str(t) for t in (g.get("terms") or []) if isinstance(t, (str, int))]
+    out["global"]["terms"] = [
+        _serialize_term_entry(e) for e in parse_terms_list(g.get("terms"))
+    ]
     out["global"]["context_hint"] = str(g.get("context_hint") or "")
     reps = g.get("replacements") or []
     if isinstance(reps, list):
@@ -96,7 +154,9 @@ def _ensure_shape(raw: Any) -> dict[str, Any]:
         if not key:
             continue
         prof = {
-            "terms": [str(t) for t in (body.get("terms") or []) if isinstance(t, (str, int))],
+            "terms": [
+                _serialize_term_entry(e) for e in parse_terms_list(body.get("terms"))
+            ],
             "context_hint": str(body.get("context_hint") or ""),
             "replacements": [],
         }
@@ -108,6 +168,21 @@ def _ensure_shape(raw: Any) -> dict[str, Any]:
                     prof["replacements"].append({"from": frm, "to": to})
         out["profiles"][key] = prof
     return out
+
+
+def term_prompt_fragment(entry: dict[str, Any]) -> str:
+    """Фрагмент для initial_prompt по одному термину."""
+    term = str(entry.get("term") or "").strip()
+    if not term:
+        return ""
+    parts = [term]
+    aliases = [a for a in (entry.get("aliases") or []) if str(a).strip()]
+    if aliases:
+        parts.append("слышать как: " + ", ".join(aliases))
+    note = str(entry.get("note") or "").strip()
+    if note:
+        parts.append("(" + note + ")")
+    return " ".join(parts)
 
 
 def ensure_vocab_file() -> str:
@@ -205,7 +280,8 @@ def build_initial_prompt(
     Пустая строка — значит клиент может НЕ передавать prompt (обратная совместимость)."""
     data = vocab if vocab is not None else load_vocab()
     g = data.get("global") or {}
-    terms: list[str] = list(g.get("terms") or [])
+    entries: list[dict[str, Any]] = parse_terms_list(g.get("terms"))
+    seen_lower = {e["term"].lower() for e in entries}
     hint_parts: list[str] = []
     g_hint = str(g.get("context_hint") or "").strip()
     if g_hint:
@@ -214,16 +290,20 @@ def build_initial_prompt(
     profile_key = _match_profile_key(data.get("profiles") or {}, app_name)
     if profile_key:
         prof = (data.get("profiles") or {}).get(profile_key) or {}
-        for t in (prof.get("terms") or []):
-            if t not in terms:
-                terms.append(t)
+        for e in parse_terms_list(prof.get("terms")):
+            low = e["term"].lower()
+            if low not in seen_lower:
+                seen_lower.add(low)
+                entries.append(e)
         p_hint = str(prof.get("context_hint") or "").strip()
         if p_hint:
             hint_parts.append(p_hint)
 
     pieces: list[str] = []
-    if terms:
-        pieces.append("Термины: " + ", ".join(terms) + ".")
+    if entries:
+        frags = [term_prompt_fragment(e) for e in entries if term_prompt_fragment(e)]
+        if frags:
+            pieces.append("Термины и произношения: " + "; ".join(frags) + ".")
     if hint_parts:
         pieces.append(" ".join(hint_parts))
     prompt = " ".join(pieces).strip()
@@ -280,7 +360,13 @@ def apply_replacements(
     return out
 
 
-def add_term(term: str, *, profile: str | None = None) -> None:
+def add_term(
+    term: str,
+    *,
+    profile: str | None = None,
+    aliases: str | list[str] | None = None,
+    note: str = "",
+) -> None:
     data = load_vocab(force=True)
     term = term.strip()
     if not term:
@@ -288,9 +374,19 @@ def add_term(term: str, *, profile: str | None = None) -> None:
     bucket = data["global"] if not profile else data["profiles"].setdefault(
         profile, {"terms": [], "replacements": [], "context_hint": ""}
     )
-    if term not in bucket["terms"]:
-        bucket["terms"].append(term)
-        save_vocab(data)
+    raw_list = list(bucket.get("terms") or [])
+    existing = parse_terms_list(raw_list)
+    if any(e["term"].lower() == term.lower() for e in existing):
+        return
+    alias_list: list[str] = []
+    if isinstance(aliases, str):
+        alias_list = [a.strip() for a in re.split(r"[,;|\n]+", aliases) if a.strip()]
+    elif isinstance(aliases, list):
+        alias_list = [str(a).strip() for a in aliases if str(a).strip()]
+    entry = {"term": term, "aliases": alias_list, "note": (note or "").strip()}
+    raw_list.append(_serialize_term_entry(entry))
+    bucket["terms"] = raw_list
+    save_vocab(data)
 
 
 def add_replacement(from_pattern: str, to_text: str, *, profile: str | None = None) -> None:
@@ -311,11 +407,14 @@ def add_replacement(from_pattern: str, to_text: str, *, profile: str | None = No
 
 def list_terms(app_name: str | None = None) -> list[str]:
     data = load_vocab()
-    terms = list((data.get("global") or {}).get("terms") or [])
+    entries = parse_terms_list((data.get("global") or {}).get("terms"))
+    seen = {e["term"].lower() for e in entries}
     profile_key = _match_profile_key(data.get("profiles") or {}, app_name)
     if profile_key:
         prof = (data.get("profiles") or {}).get(profile_key) or {}
-        for t in prof.get("terms") or []:
-            if t not in terms:
-                terms.append(t)
-    return terms
+        for e in parse_terms_list(prof.get("terms")):
+            low = e["term"].lower()
+            if low not in seen:
+                seen.add(low)
+                entries.append(e)
+    return [e["term"] for e in entries]
