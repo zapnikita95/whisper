@@ -36,6 +36,7 @@ import os
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -680,6 +681,7 @@ _MAC_CLIENT_PREF_KEYS = (
 )
 
 _MAC_HISTORY_LOCK = threading.Lock()
+_MAC_PENDING_LOCK = threading.Lock()
 
 
 def _mac_client_prefs_path() -> Path:
@@ -912,6 +914,50 @@ def _history_preview_title(text: str, max_len: int = 56) -> str:
     return one
 
 
+def _mac_json_store_mtime(path: Path) -> float:
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _pending_item_age_label(ts: float) -> str:
+    age = max(0, int(time.time() - ts)) if ts > 0 else 0
+    if age >= 3600:
+        return f"{age // 3600}ч {(age % 3600) // 60}м назад"
+    if age >= 60:
+        return f"{age // 60}м {age % 60}с назад"
+    return f"{age}с назад"
+
+
+def _pending_item_menu_title(item: dict[str, Any], max_len: int = 52) -> str:
+    ts = float(item.get("ts") or 0.0)
+    age = _pending_item_age_label(ts)
+    reason = str(item.get("reason") or "").strip()
+    if reason.startswith("connection:"):
+        reason = "нет связи"
+    elif reason.startswith("timeout:"):
+        reason = "таймаут"
+    elif reason.startswith("error:"):
+        reason = reason[6:].strip() or "ошибка"
+    reason = " ".join(reason.split())
+    if len(reason) > 36:
+        reason = reason[:35] + "…"
+    title = f"{age}: {reason}" if reason else age
+    if len(title) > max_len:
+        return title[: max_len - 1] + "…"
+    return title
+
+
+def append_mac_transcription_history_failure(reason: str) -> None:
+    """Маркер в истории: запись не ушла, но сохранена в очередь."""
+    r = " ".join(str(reason or "").split())
+    if len(r) > 100:
+        r = r[:99] + "…"
+    label = f"⏸ Не отправлено: {r} — «Очередь отправки» → переотправить"
+    append_mac_transcription_history(label)
+
+
 def load_mac_transcription_history(limit: int = 200) -> list[dict[str, Any]]:
     path = _mac_transcription_history_path()
     try:
@@ -954,6 +1000,100 @@ def append_mac_transcription_history(text: str) -> None:
             json.dumps({"items": cur}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def _mac_pending_audio_dir() -> Path:
+    return Path.home() / ".whisper" / "mac_pending_audio"
+
+
+def _mac_pending_index_path() -> Path:
+    return Path.home() / ".whisper" / "mac_pending_transcriptions.json"
+
+
+def load_mac_pending_transcriptions(limit: int = 50) -> list[dict[str, Any]]:
+    path = _mac_pending_index_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw["items"]:
+        if not isinstance(item, dict):
+            continue
+        wav = str(item.get("wav_path") or "").strip()
+        if not wav:
+            continue
+        try:
+            ts = float(item.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        out.append(
+            {
+                "id": str(item.get("id") or ""),
+                "ts": ts,
+                "wav_path": wav,
+                "reason": str(item.get("reason") or ""),
+                "route": str(item.get("route") or ""),
+            }
+        )
+    out.sort(key=lambda x: float(x.get("ts") or 0.0), reverse=True)
+    return out[:limit]
+
+
+def _save_mac_pending_transcriptions(items: list[dict[str, Any]]) -> None:
+    path = _mac_pending_index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"items": items}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def enqueue_mac_pending_transcription(wav_path: str, *, reason: str, route: str) -> dict[str, Any]:
+    src = Path(wav_path)
+    if not src.is_file():
+        raise FileNotFoundError(str(src))
+    with _MAC_PENDING_LOCK:
+        d = _mac_pending_audio_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        ts = time.time()
+        rid = f"{int(ts * 1000)}"
+        dst = d / f"pending_{rid}.wav"
+        shutil.copy2(src, dst)
+        cur = load_mac_pending_transcriptions(limit=500)
+        item = {
+            "id": rid,
+            "ts": ts,
+            "wav_path": str(dst),
+            "reason": reason[:240],
+            "route": route[:120],
+        }
+        cur.insert(0, item)
+        cur = cur[:200]
+        _save_mac_pending_transcriptions(cur)
+        return item
+
+
+def remove_mac_pending_transcription(item_id: str) -> None:
+    kill = (item_id or "").strip()
+    if not kill:
+        return
+    with _MAC_PENDING_LOCK:
+        cur = load_mac_pending_transcriptions(limit=500)
+        kept: list[dict[str, Any]] = []
+        for it in cur:
+            if str(it.get("id") or "") == kill:
+                p = Path(str(it.get("wav_path") or ""))
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+                continue
+            kept.append(it)
+        _save_mac_pending_transcriptions(kept)
 
 
 def _download_release_dmg(url: str, dest: Path) -> None:
@@ -1993,6 +2133,7 @@ class WhisperClientMac:
         self._pref_server_host: str | None = None
         self._pref_server_port: int | None = None
         self._menu_bar_ref: Any = None
+        self._last_route_warn_ts = 0.0
         self._reload_mac_prefs_from_disk()
 
     def _reload_mac_prefs_from_disk(self) -> None:
@@ -2129,6 +2270,15 @@ class WhisperClientMac:
             return True
         return bool(self._pref_groq_proxy_enabled)
 
+    def _effective_groq_proxy_url(self) -> str:
+        if not self._effective_groq_proxy_enabled():
+            return ""
+        raw = (self._pref_groq_proxy_url or "").strip().rstrip("/")
+        if raw:
+            return raw
+        env = (os.environ.get("WHISPER_GROQ_PROXY_URL") or os.environ.get("GROQ_PROXY_URL") or "").strip().rstrip("/")
+        return env
+
     def _effective_transcribe_backend_mode(self) -> str:
         return resolve_transcribe_backend_mode(
             self._pref_transcribe_backend,
@@ -2161,6 +2311,38 @@ class WhisperClientMac:
                 self.server_url,
             )
             raise ConnectionError(f"Сервер недоступен (код {health_check.status_code})")
+
+    def _preflight_route_warning(self) -> None:
+        """Быстро проверяет первый backend в цепочке и предупреждает заранее."""
+        order = self._effective_transcribe_backend_order()
+        if not order:
+            return
+        now = time.monotonic()
+        if now - float(self._last_route_warn_ts or 0.0) < 20.0:
+            return
+        first = order[0]
+        if first == "server":
+            try:
+                req = requests.get(
+                    f"{self.server_url}/",
+                    timeout=(1.5, 1.5),
+                    headers={"X-Whisper-Client": "mac-preflight"},
+                )
+                if req.status_code != 200:
+                    raise RuntimeError(f"server_status_{req.status_code}")
+            except Exception:
+                self._last_route_warn_ts = now
+                mac_banner_notification(
+                    "Whisper — сервер не отвечает",
+                    "Если продолжишь запись, она не пропадёт: уйдёт в «Очередь отправки» и можно отправить позже.",
+                )
+        elif first == "groq":
+            if not resolve_groq_api_key(self._pref_groq_api_key):
+                self._last_route_warn_ts = now
+                mac_banner_notification(
+                    "Whisper — Groq не настроен",
+                    "Запись не потеряется: уйдёт в «Очередь отправки», когда настроишь ключ/прокси.",
+                )
 
     def _transcribe_post_server(
         self, tmp_path: str, *, initial_prompt: str | None = None
@@ -2224,26 +2406,33 @@ class WhisperClientMac:
         self, tmp_path: str, *, prompt: str | None = None
     ) -> dict[str, Any]:
         """Groq OpenAI-совместимый /audio/transcriptions (см. whisper_groq)."""
-        from whisper_groq import resolve_groq_proxy_url
-
         proxy_enabled = self._effective_groq_proxy_enabled()
-        proxy_on = proxy_enabled and bool(resolve_groq_proxy_url(self._pref_groq_proxy_url))
+        proxy_on = proxy_enabled and bool(self._effective_groq_proxy_url())
         if not proxy_on and not self._effective_groq_api_key():
             raise ValueError(
                 "Нет ключа Groq или прокси: меню «Groq API ключ…», .env, либо «Groq прокси URL» (Railway).",
             )
         _tx_conn, _tx_read = self._effective_transcribe_timeouts()
-        return post_groq_audio_transcription(
-            tmp_path,
-            language=self.language,
-            timeout=(_tx_conn, min(_tx_read, 600.0)),
-            log_error=lambda msg, *args: _mac_log("error", msg, *args),
-            pref_api_key=self._pref_groq_api_key,
-            pref_proxy_url=self._pref_groq_proxy_url,
-            pref_proxy_secret=self._pref_groq_proxy_secret,
-            pref_proxy_enabled=proxy_enabled,
-            prompt=prompt,
-        )
+        try:
+            return post_groq_audio_transcription(
+                tmp_path,
+                language=self.language,
+                timeout=(_tx_conn, min(_tx_read, 600.0)),
+                log_error=lambda msg, *args: _mac_log("error", msg, *args),
+                pref_api_key=self._pref_groq_api_key,
+                pref_proxy_url=self._effective_groq_proxy_url(),
+                pref_proxy_secret=self._pref_groq_proxy_secret,
+                pref_proxy_enabled=proxy_enabled,
+                prompt=prompt,
+            )
+        except RuntimeError as e:
+            low = str(e).lower()
+            if "proxy secret" in low or "missing proxy secret" in low:
+                raise ValueError(
+                    "Groq-прокси требует секрет. В меню: Groq API → «Свой Groq прокси секрет…» "
+                    "(тот же PROXY_SHARED_SECRET из Railway)."
+                ) from e
+            raise
 
     def _transcribe_audio_file(
         self,
@@ -2273,11 +2462,12 @@ class WhisperClientMac:
                     result = self._transcribe_post_groq(
                         tmp_path, prompt=vocab_prompt or None
                     )
+                result = dict(result)
                 raw_text = (result.get("text") or "").strip()
+                result["_mac_raw_transcript"] = raw_text
                 if raw_text:
                     replaced = self._apply_vocab_replacements(raw_text, vocab_app)
                     if replaced != raw_text:
-                        result = dict(result)
                         result["text"] = replaced
                 text = (result.get("text") or "").strip()
                 if text:
@@ -2304,14 +2494,206 @@ class WhisperClientMac:
             raise last_exc
         raise RuntimeError("transcribe_no_backend")
 
-    def _notify_menu_history_refresh(self) -> None:
+    def _notify_menu_refresh(self) -> None:
         app = getattr(self, "_menu_bar_ref", None)
         if app is None:
             return
         try:
-            app._history_menu_dirty = True
+            app._menu_dirty = True
         except Exception:
-            _MAC_LOGGER.debug("menu_history_refresh", exc_info=True)
+            _MAC_LOGGER.debug("menu_refresh", exc_info=True)
+
+    def _queue_failed_audio_for_retry(self, wav_path: str, *, reason: str) -> dict[str, Any] | None:
+        try:
+            item = enqueue_mac_pending_transcription(
+                wav_path,
+                reason=reason,
+                route=",".join(self._effective_transcribe_backend_order()),
+            )
+            _mac_log("warning", "pending_audio_queued id=%s reason=%s", item.get("id"), reason)
+            append_mac_transcription_history_failure(reason)
+            self._notify_menu_refresh()
+            return item
+        except Exception as e:
+            _mac_log("error", "pending_audio_queue_failed err=%s", e)
+            return None
+
+    def _deliver_transcription_text(
+        self,
+        hist_line: str,
+        *,
+        out_text: str | None = None,
+        text: str | None = None,
+        raw_fb: str | None = None,
+        paste_pid: int | None = None,
+        notify_vocab_fallback: bool = True,
+    ) -> None:
+        """История + буфер/вставка по текущему paste_mode."""
+        if not hist_line.strip():
+            return
+        append_mac_transcription_history(hist_line)
+        self._notify_menu_refresh()
+        out = (out_text or hist_line).strip()
+        vocab_text = (text or "").strip()
+        raw = (raw_fb or "").strip()
+        mode = self._effective_paste_mode()
+        paste_ok = False
+
+        if mode == "history_only":
+            with self._hk_lock:
+                self._hk_suppress = True
+            try:
+                if not self._using_daemon:
+                    self._release_sticky_modifiers_safe()
+            finally:
+                self._reset_hotkey_tracker()
+                self._reset_native_hotkey_tap_state()
+            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                prev = hist_line[:130] + ("…" if len(hist_line) > 130 else "")
+                mac_banner_notification("Whisper — в истории", prev)
+            _mac_log("info", "paste_mode=history_only")
+            return
+
+        if mode == "clipboard":
+            with self._hk_lock:
+                self._hk_suppress = True
+            try:
+                if not self._using_daemon:
+                    self._release_sticky_modifiers_safe()
+                time.sleep(0.12)
+                self._copy_to_clipboard_mac(out)
+            except Exception as e:
+                try:
+                    pyperclip.copy(out)
+                except Exception:
+                    pass
+                print(f"[Client] Буфер: {e}", flush=True)
+                _MAC_LOGGER.error("clipboard_mode_copy_error", exc_info=True)
+            finally:
+                self._reset_hotkey_tracker()
+                self._reset_native_hotkey_tap_state()
+            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+                prev = out[:130] + ("…" if len(out) > 130 else "")
+                mac_banner_notification("Whisper — в буфере", prev)
+            _mac_log("info", "paste_mode=clipboard_only")
+            return
+
+        with self._hk_lock:
+            self._hk_suppress = True
+        try:
+            if not self._using_daemon:
+                self._release_sticky_modifiers_safe()
+            time.sleep(0.15)
+            if paste_pid is not None:
+                activated = self._activate_process_by_unix_id(paste_pid)
+                _mac_log("info", "restore_focus pid=%s ok=%s", paste_pid, activated)
+            else:
+                _mac_log(
+                    "warning",
+                    "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно",
+                )
+            time.sleep(0.08)
+            self._copy_to_clipboard_mac(out)
+            time.sleep(0.06)
+            if self._clipboard_matches_expected(out):
+                _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(out))
+            else:
+                _mac_log(
+                    "warning",
+                    "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
+                    out[:80],
+                    self._clipboard_preview(100),
+                )
+            time.sleep(0.12)
+            ok = self._paste_via_system_events(paste_pid)
+            paste_ok = bool(ok)
+            if ok:
+                print(f"[Client] Текст вставлен: {out[:60]}…", flush=True)
+                _mac_log("info", "paste_cmd_v_ok")
+            else:
+                pyperclip.copy(out)
+                print(
+                    f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {out[:60]}…",
+                    flush=True,
+                )
+                print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
+                _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
+        except Exception as e:
+            try:
+                pyperclip.copy(out)
+            except Exception:
+                pass
+            print(f"[Client] Вставка не удалась ({e}), текст в буфере: {out[:60]}…", flush=True)
+            print("[Client] Нажми Cmd+V для вставки.", flush=True)
+            _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
+        finally:
+            self._reset_hotkey_tracker()
+            self._reset_native_hotkey_tap_state()
+        if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
+            prev = out[:130] + ("…" if len(out) > 130 else "")
+            if paste_ok:
+                mac_banner_notification("Whisper — готово", prev)
+            else:
+                mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
+        if notify_vocab_fallback and not vocab_text and raw:
+            mac_banner_notification(
+                "Whisper",
+                "После словаря строка пустая — в буфер/историю ушёл исходный распознанный текст.",
+            )
+
+    def _retry_pending_item(self, item: dict[str, Any]) -> bool:
+        wav = str(item.get("wav_path") or "")
+        rid = str(item.get("id") or "")
+        if not wav or not Path(wav).is_file():
+            if rid:
+                remove_mac_pending_transcription(rid)
+                self._notify_menu_refresh()
+            return False
+        result = self._transcribe_audio_file(wav)
+        text = (result.get("text") or "").strip()
+        raw_fb = (result.get("_mac_raw_transcript") or "").strip()
+        hist_line = text or raw_fb
+        if not hist_line:
+            raise RuntimeError("pending_transcribe_empty")
+        paste_pid = self._snapshot_frontmost_unix_pid()
+        self._deliver_transcription_text(
+            hist_line,
+            out_text=hist_line,
+            text=text,
+            raw_fb=raw_fb,
+            paste_pid=paste_pid,
+        )
+        if rid:
+            remove_mac_pending_transcription(rid)
+            self._notify_menu_refresh()
+        return True
+
+    def retry_latest_pending_transcription(self) -> bool:
+        pending = load_mac_pending_transcriptions(limit=1)
+        if not pending:
+            mac_banner_notification("Whisper", "Очередь отправки пуста.")
+            return False
+        try:
+            return self._retry_pending_item(pending[0])
+        except Exception as e:
+            mac_banner_notification("Whisper — очередь", f"Не удалось отправить: {str(e)[:180]}")
+            return False
+
+    def retry_pending_transcription_by_id(self, item_id: str) -> bool:
+        rid = (item_id or "").strip()
+        if not rid:
+            return False
+        pending = load_mac_pending_transcriptions(limit=500)
+        item = next((x for x in pending if str(x.get("id") or "") == rid), None)
+        if item is None:
+            mac_banner_notification("Whisper", "Запись уже отправлена или удалена из очереди.")
+            self._notify_menu_refresh()
+            return False
+        try:
+            return self._retry_pending_item(item)
+        except Exception as e:
+            mac_banner_notification("Whisper — очередь", f"Не удалось отправить: {str(e)[:180]}")
+            return False
 
     def request_shutdown(self) -> None:
         """Остановка клиента (меню «Выход», SIGINT)."""
@@ -3137,6 +3519,11 @@ class WhisperClientMac:
         self._record_thread.start()
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
+        threading.Thread(
+            target=self._preflight_route_warning,
+            name="whisper-route-preflight",
+            daemon=True,
+        ).start()
 
         def _beep_async() -> None:
             try:
@@ -3216,6 +3603,7 @@ class WhisperClientMac:
                         self._schedule_listener_kick()
 
         def _work_body(paste_pid: int | None) -> None:
+            tmp_path: str | None = None
             try:
                 # Сохраняем во временный WAV
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -3277,117 +3665,20 @@ class WhisperClientMac:
                         skip_progress_for_first_backend=order_pre[0] if order_pre else None,
                     )
                     text = result.get("text", "").strip()
+                    raw_fb = (result.get("_mac_raw_transcript") or "").strip()
+                    hist_line = text or raw_fb
+                    out_text = text if text else hist_line
                     if os.environ.get("WHISPER_MAC_DEBUG"):
-                        _mac_log("debug", "transcribe_full_text=%r", text)
+                        _mac_log("debug", "transcribe_full_text=%r raw_fb=%r", text, raw_fb)
 
-                    if text:
-                        append_mac_transcription_history(text)
-                        self._notify_menu_history_refresh()
-                        mode = self._effective_paste_mode()
-                        paste_ok = False
-
-                        if mode == "history_only":
-                            # Только запись в ~/.whisper/mac_transcription_history.json — без буфера и Cmd+V.
-                            with self._hk_lock:
-                                self._hk_suppress = True
-                            try:
-                                if not self._using_daemon:
-                                    self._release_sticky_modifiers_safe()
-                            finally:
-                                self._reset_hotkey_tracker()
-                                self._reset_native_hotkey_tap_state()
-                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
-                                mac_banner_notification("Whisper — в истории", prev)
-                            _mac_log("info", "paste_mode=history_only")
-                        elif mode == "clipboard":
-                            with self._hk_lock:
-                                self._hk_suppress = True
-                            try:
-                                if not self._using_daemon:
-                                    self._release_sticky_modifiers_safe()
-                                time.sleep(0.12)
-                                self._copy_to_clipboard_mac(text)
-                            except Exception as e:
-                                try:
-                                    pyperclip.copy(text)
-                                except Exception:
-                                    pass
-                                print(f"[Client] Буфер: {e}", flush=True)
-                                _MAC_LOGGER.error("clipboard_mode_copy_error", exc_info=True)
-                            finally:
-                                self._reset_hotkey_tracker()
-                                self._reset_native_hotkey_tap_state()
-                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
-                                mac_banner_notification("Whisper — в буфере", prev)
-                            _mac_log("info", "paste_mode=clipboard_only")
-                        else:
-                            # auto: буфер + вставка в поле (как раньше).
-                            # Не даём synthetic release от Controller/osascript попасть в pressed — иначе hotkey ломается.
-                            with self._hk_lock:
-                                self._hk_suppress = True
-                            try:
-                                if not self._using_daemon:
-                                    self._release_sticky_modifiers_safe()
-                                time.sleep(0.15)
-                                if paste_pid is not None:
-                                    activated = self._activate_process_by_unix_id(paste_pid)
-                                    _mac_log(
-                                        "info",
-                                        "restore_focus pid=%s ok=%s",
-                                        paste_pid,
-                                        activated,
-                                    )
-                                else:
-                                    _mac_log(
-                                        "warning",
-                                        "paste_target_pid_unknown — Cmd+V уйдёт в текущее frontmost-окно "
-                                        "(кликни в поле ввода до хоткея; если Terminal/Python был активен — снимок PID отброшен)",
-                                    )
-                                time.sleep(0.08)
-                                self._copy_to_clipboard_mac(text)
-                                time.sleep(0.06)
-                                if self._clipboard_matches_expected(text):
-                                    _mac_log("info", "clipboard_ok after pbcopy (%d chars)", len(text))
-                                else:
-                                    _mac_log(
-                                        "warning",
-                                        "clipboard_mismatch after pbcopy expected_prefix=%r got_preview=%r",
-                                        text[:80],
-                                        self._clipboard_preview(100),
-                                    )
-                                time.sleep(0.12)
-                                ok = self._paste_via_system_events(paste_pid)
-                                paste_ok = bool(ok)
-                                if ok:
-                                    print(f"[Client] Текст вставлен: {text[:60]}…", flush=True)
-                                    _mac_log("info", "paste_cmd_v_ok")
-                                else:
-                                    pyperclip.copy(text)
-                                    print(
-                                        f"[Client] Системная вставка не сработала (osascript). Текст в буфере: {text[:60]}…",
-                                        flush=True,
-                                    )
-                                    print("[Client] Нажми Cmd+V в нужном поле.", flush=True)
-                                    _mac_log("warning", "paste_cmd_v_failed text_left_in_clipboard=yes")
-                            except Exception as e:
-                                try:
-                                    pyperclip.copy(text)
-                                except Exception:
-                                    pass
-                                print(f"[Client] Вставка не удалась ({e}), текст в буфере: {text[:60]}…", flush=True)
-                                print("[Client] Нажми Cmd+V для вставки.", flush=True)
-                                _MAC_LOGGER.error("paste_pipeline_error", exc_info=True)
-                            finally:
-                                self._reset_hotkey_tracker()
-                                self._reset_native_hotkey_tap_state()
-                            if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
-                                prev = text[:130] + ("…" if len(text) > 130 else "")
-                                if paste_ok:
-                                    mac_banner_notification("Whisper — готово", prev)
-                                else:
-                                    mac_banner_notification("Whisper — текст в буфере", prev + " — нажми Cmd+V.")
+                    if hist_line:
+                        self._deliver_transcription_text(
+                            hist_line,
+                            out_text=out_text,
+                            text=text,
+                            raw_fb=raw_fb,
+                            paste_pid=paste_pid,
+                        )
                     else:
                         print("[Client] Текст не распознан.", flush=True)
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
@@ -3396,15 +3687,26 @@ class WhisperClientMac:
                             "Текст не распознан — говори громче или подольше.",
                         )
                 finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                    pass
             except requests.exceptions.ConnectionError as e:
-                print(f"[Client] Ошибка соединения с сервером: {e}", file=sys.stderr, flush=True)
-                print(f"[Client] Убедись, что сервер запущен на {self.server_url}", file=sys.stderr, flush=True)
-                print(f"[Client] Проверь Tailscale соединение и брандмауэр Windows", file=sys.stderr, flush=True)
-                mac_banner_notification("Whisper — нет связи", f"Сервер недоступен: {self.server_url}")
+                mode = self._effective_transcribe_backend_mode()
+                target = "Groq/прокси" if mode == "groq" else "бэкенд транскрипции"
+                print(f"[Client] Ошибка соединения ({target}): {e}", file=sys.stderr, flush=True)
+                item = (
+                    self._queue_failed_audio_for_retry(tmp_path, reason=f"connection:{e}")
+                    if tmp_path
+                    else None
+                )
+                if item:
+                    mac_banner_notification(
+                        "Whisper — нет связи",
+                        "Запись сохранена. 🎤 → «Очередь отправки» → «Переотправить».",
+                    )
+                else:
+                    if mode == "groq":
+                        mac_banner_notification("Whisper — нет связи", "Недоступен Groq/прокси.")
+                    else:
+                        mac_banner_notification("Whisper — нет связи", f"Сервер недоступен: {self.server_url}")
             except requests.exceptions.Timeout as e:
                 print(f"[Client] Таймаут HTTP: {e}", file=sys.stderr, flush=True)
                 print(
@@ -3413,17 +3715,45 @@ class WhisperClientMac:
                     file=sys.stderr,
                     flush=True,
                 )
-                mac_banner_notification(
-                    "Whisper — таймаут",
-                    "Сеть или сервер не ответили в срок. Проверь Tailscale/ПК; при долгом Whisper задай WHISPER_MAC_TRANSCRIBE_TIMEOUT.",
+                item = (
+                    self._queue_failed_audio_for_retry(tmp_path, reason=f"timeout:{e}")
+                    if tmp_path
+                    else None
                 )
+                if item:
+                    mac_banner_notification(
+                        "Whisper — таймаут",
+                        "Запись сохранена. 🎤 → «Очередь отправки» → «Переотправить».",
+                    )
+                else:
+                    mac_banner_notification(
+                        "Whisper — таймаут",
+                        "Сеть или backend не ответили в срок. Проверь сеть/прокси/сервер; при долгом Whisper задай WHISPER_MAC_TRANSCRIBE_TIMEOUT.",
+                    )
             except Exception as e:
                 print(f"[Client] Ошибка: {e}", file=sys.stderr, flush=True)
                 _MAC_LOGGER.exception("work_body_error")
-                mac_banner_notification("Whisper — ошибка", str(e)[:200])
+                item = (
+                    self._queue_failed_audio_for_retry(tmp_path, reason=f"error:{e}")
+                    if tmp_path
+                    else None
+                )
+                if item:
+                    mac_banner_notification(
+                        "Whisper — запись сохранена",
+                        "Ошибка отправки. 🎤 → «Очередь отправки» → «Переотправить» — без новой записи.",
+                    )
+                else:
+                    mac_banner_notification("Whisper — ошибка", str(e)[:200])
                 import traceback
 
                 traceback.print_exc()
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
 
         threading.Thread(target=work, name="whisper-transcribe", daemon=True).start()
 
@@ -3531,7 +3861,10 @@ if rumps is not None:
 
             self.client = client
             self.client._menu_bar_ref = self
-            self._history_menu_dirty = False
+            self._menu_dirty = False
+            self._last_history_mtime = 0.0
+            self._last_pending_mtime = 0.0
+            self._last_pending_count = 0
             self._mi_version = rumps.MenuItem(f"Версия {self._app_version}", callback=None)
             self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
             self.menu = self._compose_menu()
@@ -3814,25 +4147,99 @@ if rumps is not None:
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
             ]
-            return [
+            pending_total = len(load_mac_pending_transcriptions(limit=500))
+            out: list = [
                 self._mi_version,
                 self._mi_server,
-                rumps.separator,
-                ("Сервер", _menu_server),
-                ("Распознавание и текст", _menu_recognition),
-                rumps.separator,
-                ("История расшифровок", self._history_submenu_items()),
-                rumps.separator,
-                rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
-                rumps.separator,
-                rumps.MenuItem("Перезапустить перехват клавиш", callback=self._restart_hotkey),
-                rumps.MenuItem("Показать лог…", callback=self._open_log),
-                rumps.MenuItem("Выход", callback=self._quit),
             ]
+            if pending_total > 0:
+                out.append(
+                    rumps.MenuItem(
+                        f"⚠️ Переотправить запись ({pending_total})",
+                        callback=self._retry_latest_pending_menu,
+                    )
+                )
+            out.extend(
+                [
+                    rumps.separator,
+                    ("Сервер", _menu_server),
+                    ("Распознавание и текст", _menu_recognition),
+                    rumps.separator,
+                    ("Очередь отправки", self._pending_submenu_items()),
+                    ("История расшифровок", self._history_submenu_items()),
+                    rumps.separator,
+                    rumps.MenuItem("Проверить обновления…", callback=self._check_updates_menu),
+                    rumps.separator,
+                    rumps.MenuItem("Перезапустить перехват клавиш", callback=self._restart_hotkey),
+                    rumps.MenuItem("Показать лог…", callback=self._open_log),
+                    rumps.MenuItem("Выход", callback=self._quit),
+                ]
+            )
+            return out
+
+        def _pending_submenu_items(self) -> list:
+            pending = load_mac_pending_transcriptions(limit=8)
+            total = len(load_mac_pending_transcriptions(limit=500))
+            out: list = []
+            if pending:
+                out.append(rumps.MenuItem(f"В очереди: {total}", callback=None))
+                out.append(rumps.separator)
+                for item in pending:
+                    rid = str(item.get("id") or "")
+                    title = "↻ " + _pending_item_menu_title(item)
+                    out.append(
+                        rumps.MenuItem(title, callback=self._make_retry_pending_callback(rid))
+                    )
+                out.append(rumps.separator)
+                out.append(rumps.MenuItem("Переотправить последнюю", callback=self._retry_latest_pending_menu))
+                out.append(rumps.MenuItem("Очистить очередь", callback=self._clear_pending_queue_menu))
+            else:
+                out.append(rumps.MenuItem("(пусто)", callback=None))
+            out.append(rumps.separator)
+            out.append(rumps.MenuItem("Открыть папку очереди…", callback=self._open_pending_folder_menu))
+            return out
+
+        def _make_retry_pending_callback(self, item_id: str):
+            def _cb(_sender) -> None:
+                def work() -> None:
+                    try:
+                        self.client.retry_pending_transcription_by_id(item_id)
+                    except Exception as e:
+                        mac_banner_notification("Очередь отправки", str(e)[:180])
+                    finally:
+                        self._menu_dirty = True
+
+                threading.Thread(target=work, name="whisper-pending-retry", daemon=True).start()
+
+            return _cb
+
+        def _retry_latest_pending_menu(self, _sender) -> None:
+            def work() -> None:
+                try:
+                    self.client.retry_latest_pending_transcription()
+                except Exception as e:
+                    mac_banner_notification("Очередь отправки", str(e)[:180])
+                finally:
+                    self._menu_dirty = True
+
+            threading.Thread(target=work, name="whisper-pending-retry", daemon=True).start()
+
+        def _clear_pending_queue_menu(self, _sender) -> None:
+            for item in load_mac_pending_transcriptions(limit=500):
+                rid = str(item.get("id") or "")
+                if rid:
+                    remove_mac_pending_transcription(rid)
+            mac_banner_notification("Whisper", "Очередь отправки очищена.")
+            self.menu = self._compose_menu()
+
+        def _open_pending_folder_menu(self, _sender) -> None:
+            d = _mac_pending_audio_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["open", str(d)], check=False)
 
         def _history_submenu_items(self) -> list:
             items: list = []
-            for entry in load_mac_transcription_history(limit=10):
+            for entry in load_mac_transcription_history(limit=15):
                 t = entry.get("text")
                 if not isinstance(t, str) or not t.strip():
                     continue
@@ -3886,7 +4293,11 @@ if rumps is not None:
                 ("server_then_groq", "Сервер → Groq"),
                 ("groq_then_server", "Groq → сервер"),
             ]
-            out: list = []
+            cur_label = dict(specs).get(cur, cur or "по умолчанию")
+            out: list = [
+                rumps.MenuItem(f"Сейчас: {cur_label}", callback=None),
+                rumps.separator,
+            ]
             for mode, label in specs:
                 mark = "✓ " if cur == mode else "   "
                 out.append(
@@ -3903,13 +4314,22 @@ if rumps is not None:
 
         def _vocab_submenu_items(self) -> list:
             return [
-                rumps.MenuItem("Открыть словарь…", callback=self._vocab_open_menu),
-                rumps.MenuItem("Добавить из буфера…", callback=self._vocab_add_from_clipboard_menu),
-                rumps.MenuItem("Добавить замену…", callback=self._vocab_add_replacement_menu),
-                rumps.MenuItem("Показать, как видит словарь", callback=self._vocab_show_prompt_menu),
+                rumps.MenuItem("Редактор словаря…", callback=self._vocab_open_menu),
+                rumps.MenuItem("Открыть vocab.json в TextEdit…", callback=self._vocab_open_json_menu),
+                rumps.MenuItem("Добавить слово из буфера…", callback=self._vocab_add_from_clipboard_menu),
+                rumps.MenuItem("Показать подсказку для модели", callback=self._vocab_show_prompt_menu),
             ]
 
         def _vocab_open_menu(self, _sender) -> None:
+            try:
+                vocab_ensure_file()
+                from whisper_mac_vocab_ui import open_vocab_editor
+
+                open_vocab_editor(preview_app_name=self.client._current_app_name())
+            except Exception as e:
+                rumps.alert("Словарь", f"Не удалось открыть редактор: {e}")
+
+        def _vocab_open_json_menu(self, _sender) -> None:
             try:
                 path = vocab_ensure_file()
                 subprocess.run(["open", "-e", path], check=False)
@@ -3933,30 +4353,6 @@ if rumps is not None:
             try:
                 add_term(term)
                 mac_banner_notification("Whisper", f"Термин добавлен в словарь: {term}")
-                self.menu = self._compose_menu()
-            except Exception as e:
-                rumps.alert("Словарь", f"Не удалось сохранить: {e}")
-
-        def _vocab_add_replacement_menu(self, _sender) -> None:
-            from_raw = _mac_osascript_prompt_line(
-                title="Whisper — словарь",
-                message="Что заменять (regex, напр. 'кубернетес|кубер нетес'):",
-            )
-            if not from_raw:
-                return
-            to_raw = _mac_osascript_prompt_line(
-                title="Whisper — словарь",
-                message=f"На что заменять («{from_raw.strip()}»):",
-            )
-            if not to_raw:
-                return
-            from whisper_vocab import add_replacement
-
-            try:
-                add_replacement(from_raw.strip(), to_raw.strip())
-                mac_banner_notification(
-                    "Whisper", f"Замена добавлена: {from_raw.strip()} → {to_raw.strip()}"
-                )
                 self.menu = self._compose_menu()
             except Exception as e:
                 rumps.alert("Словарь", f"Не удалось сохранить: {e}")
@@ -4485,8 +4881,19 @@ if rumps is not None:
                 rumps.quit_application()
                 return
             self._mi_server.title = self._server_title()
-            if getattr(self, "_history_menu_dirty", False):
-                self._history_menu_dirty = False
+            history_mtime = _mac_json_store_mtime(_mac_transcription_history_path())
+            pending_mtime = _mac_json_store_mtime(_mac_pending_index_path())
+            pending_count = len(load_mac_pending_transcriptions(limit=500))
+            if (
+                getattr(self, "_menu_dirty", False)
+                or history_mtime != self._last_history_mtime
+                or pending_mtime != self._last_pending_mtime
+                or pending_count != self._last_pending_count
+            ):
+                self._menu_dirty = False
+                self._last_history_mtime = history_mtime
+                self._last_pending_mtime = pending_mtime
+                self._last_pending_count = pending_count
                 self.menu = self._compose_menu()
             if not self._emoji_mode:
                 return
@@ -4494,7 +4901,10 @@ if rumps is not None:
             with self.client._lock:
                 rec = self.client._recording
                 busy = self.client._busy
-            self.title = "🔴" if (rec or busy) else "🎤"
+            if pending_count > 0 and not (rec or busy):
+                self.title = f"🎤·{pending_count}"
+            else:
+                self.title = "🔴" if (rec or busy) else "🎤"
 
         @rumps.timer(2.0)
         def _watchdog_listener(self, _sender) -> None:
