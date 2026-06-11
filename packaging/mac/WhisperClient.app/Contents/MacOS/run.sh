@@ -168,6 +168,11 @@ fi
 # Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.
 export WHISPER_MAC_HOTKEY="shift+ctrl+alt"
 
+# pynput из .app: не перезапускать listener после каждой ошибки/отказа (ломает хоткей).
+if [ -z "${WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK+x}" ]; then
+	export WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK=0
+fi
+
 # Эталон голоса уже есть — включаем проверку без флагов (отключить: WHISPER_MAC_NO_SPEAKER_VERIFY=1 в run.sh).
 if [ -f "${HOME}/.whisper/speaker_embedding.npy" ] && [ "${WHISPER_MAC_NO_SPEAKER_VERIFY:-}" != "1" ]; then
 	export WHISPER_SPEAKER_VERIFY=1

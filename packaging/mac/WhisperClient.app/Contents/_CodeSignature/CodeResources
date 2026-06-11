@@ -46,7 +46,7 @@
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		psKAxSIUbs2DZVqAReCcuzS/12k=
+		zjCFp4SYQVcBFdFeFWUUX8p9Au0=
 		</data>
 		<key>Resources/whisper_groq.py</key>
 		<data>
@@ -100,7 +100,7 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			bVERcpSoy4M10+MTwEEZ+EpOE/E=
+			KySlgNzGCRnsLzElpwP8brzF14I=
 			</data>
 			<key>requirement</key>
 			<string>identifier run and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = Y52BT2N4L8</string>
@@ -197,7 +197,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			eMUw+rRxzsmHeNzUVqu8N4Jubo7qEPpWmQaZYK95ypk=
+			kEXjjkQMJ0DPi0icLjtCw1nPAL4s/M6wzzwJE2yg1tM=
 			</data>
 		</dict>
 		<key>Resources/whisper_groq.py</key>

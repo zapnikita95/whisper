@@ -2750,17 +2750,25 @@ class WhisperClientMac:
 
     # ── Нативный CGEventTap daemon (macOS 15+, без TSM-крашей) ────────────────
 
-    def _try_start_hotkey_daemon(self) -> bool:
-        """
-        Пробует запустить нативный CGEventTap (без pynput Listener).
-        Порядок: 1) _InProcessCGEventTap (Quartz в Python-процессе) → нет проблем с правами .app
-                 2) _HotkeyDaemon (внешний C-бинарь) → fallback для Terminal/dev-режима
-        Возвращает True при успехе; иначе нужен pynput fallback.
-        """
-        if sys.platform != "darwin":
+    def _try_start_external_hotkey_daemon(self) -> bool:
+        spec = _hotkey_spec_for_daemon(self.hotkey)
+        daemon = _HotkeyDaemon(
+            on_down=lambda: self._invoke_recording_on_main_thread(self._start_recording),
+            on_up=lambda: self._invoke_recording_on_main_thread(self._stop_recording_and_process),
+            hotkey_spec=spec,
+        )
+        if not daemon.start():
             return False
+        self._hotkey_daemon = daemon
+        _mac_log(
+            "info",
+            "hotkey=external_daemon pid=%s binary=%s pynput_listener=DISABLED",
+            daemon.pid(),
+            daemon.path(),
+        )
+        return True
 
-        # ── Вариант 1: CGEventTap прямо в Python-процессе (рекомендуется) ──────
+    def _try_start_inprocess_hotkey_tap(self) -> bool:
         target, reject = _InProcessCGEventTap.flags_for_spec(self.hotkey)
         tap = _InProcessCGEventTap(
             on_down=lambda: self._invoke_recording_on_main_thread(self._start_recording),
@@ -2768,30 +2776,67 @@ class WhisperClientMac:
             target_flags=target,
             reject_flags=reject,
         )
-        if tap.start():
-            self._hotkey_daemon = tap
-            _mac_log("info", "hotkey=in_process_cgeventtap pynput_listener=DISABLED")
-            return True
+        if not tap.start():
+            return False
+        self._hotkey_daemon = tap
+        _mac_log("info", "hotkey=in_process_cgeventtap pynput_listener=DISABLED")
+        return True
 
-        # ── Вариант 2: внешний C-бинарь whisper_hotkey_daemon ─────────────────
-        _mac_log("debug", "in_process_tap_failed trying external daemon")
-        spec = _hotkey_spec_for_daemon(self.hotkey)
-        daemon = _HotkeyDaemon(
-            on_down=lambda: self._invoke_recording_on_main_thread(self._start_recording),
-            on_up=lambda: self._invoke_recording_on_main_thread(self._stop_recording_and_process),
-            hotkey_spec=spec,
-        )
-        if daemon.start():
-            self._hotkey_daemon = daemon
-            _mac_log(
-                "info",
-                "hotkey=external_daemon pid=%s binary=%s pynput_listener=DISABLED",
-                daemon.pid(),
-                daemon.path(),
-            )
-            return True
+    def _try_start_hotkey_daemon(self) -> bool:
+        """
+        Нативный CGEventTap (без pynput Listener).
+        Из .app: сначала whisper_hotkey_daemon (TCC к бандлу), иначе Quartz в Python.app.
+        """
+        if sys.platform != "darwin":
+            return False
 
+        from_bundle = os.environ.get("WHISPER_FROM_APP_BUNDLE", "").strip() == "1"
+        if from_bundle:
+            if self._try_start_external_hotkey_daemon():
+                return True
+            _mac_log("debug", "external_daemon_failed trying in_process_tap")
+            if self._try_start_inprocess_hotkey_tap():
+                return True
+        else:
+            if self._try_start_inprocess_hotkey_tap():
+                return True
+            _mac_log("debug", "in_process_tap_failed trying external_daemon")
+            if self._try_start_external_hotkey_daemon():
+                return True
+
+        self._maybe_prompt_hotkey_permissions()
         return False
+
+    def _maybe_prompt_hotkey_permissions(self) -> None:
+        if getattr(self, "_hotkey_perm_prompt_sent", False):
+            return
+        self._hotkey_perm_prompt_sent = True
+        if os.environ.get("WHISPER_MAC_NO_PERM_PROMPT", "").strip().lower() in ("1", "true", "yes"):
+            return
+        _mac_log("warning", "hotkey_permissions_missing prompting_user")
+        try:
+            subprocess.run(
+                [
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListeningEvent",
+                ],
+                check=False,
+            )
+        except Exception:
+            _MAC_LOGGER.debug("open_listening_event_prefs", exc_info=True)
+        mac_banner_notification(
+            "Whisper — включи перехват клавиш",
+            "Системные настройки → Конфиденциальность → Мониторинг ввода: "
+            "включи Whisper Client (и Python, если есть). Поткрой .app заново.",
+        )
+
+    def _should_post_transcribe_listener_kick(self, *, did_paste_pipeline: bool) -> bool:
+        if self._using_daemon or self._run_stop:
+            return False
+        if not did_paste_pipeline:
+            return False
+        kick_off = (os.environ.get("WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK") or "").strip().lower()
+        return kick_off not in ("0", "false", "no", "off")
 
     def _ensure_daemon_running(self) -> None:
         """Watchdog: перезапускает tap если упал; fallback на pynput."""
@@ -3587,22 +3632,23 @@ class WhisperClientMac:
 
         def work() -> None:
             # Один поток обработки за раз — иначе два kick подряд убивают свежий Listener.
+            did_paste_pipeline = False
             with self._work_lock:
                 with self._lock:
                     self._busy = True
                 try:
-                    _work_body(paste_target_pid)
+                    did_paste_pipeline = _work_body(paste_target_pid)
                 finally:
                     self._reset_hotkey_tracker()
                     self._reset_native_hotkey_tap_state()
                     with self._lock:
                         self._busy = False
-                    # После Quartz/paste из whisper-transcribe pynput-CGEventTap часто перестаёт ловить хоткей — перезапуск по умолчанию.
-                    _kick_off = (os.environ.get("WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK") or "").strip().lower()
-                    if not self._using_daemon and _kick_off not in ("0", "false", "no", "off"):
+                    if self._should_post_transcribe_listener_kick(
+                        did_paste_pipeline=did_paste_pipeline
+                    ):
                         self._schedule_listener_kick()
 
-        def _work_body(paste_pid: int | None) -> None:
+        def _work_body(paste_pid: int | None) -> bool:
             tmp_path: str | None = None
             try:
                 # Сохраняем во временный WAV
@@ -3646,7 +3692,7 @@ class WhisperClientMac:
                                     print(f"[Client] {e}", flush=True)
                                     _mac_log("info", "speaker_rejected %s", e)
                                     mac_banner_notification("Whisper", str(e)[:220])
-                                    return
+                                    return False
                                 except SpeakerVerifyUnavailable as e:
                                     _mac_log(
                                         "warning",
@@ -3679,6 +3725,7 @@ class WhisperClientMac:
                             raw_fb=raw_fb,
                             paste_pid=paste_pid,
                         )
+                        return True
                     else:
                         print("[Client] Текст не распознан.", flush=True)
                         _mac_log("info", "transcribe_empty_text keys=%s", list(result.keys()))
@@ -3686,6 +3733,7 @@ class WhisperClientMac:
                             "Whisper",
                             "Текст не распознан — говори громче или подольше.",
                         )
+                        return False
                 finally:
                     pass
             except requests.exceptions.ConnectionError as e:
@@ -3754,6 +3802,7 @@ class WhisperClientMac:
                         os.unlink(tmp_path)
                     except Exception:
                         pass
+            return False
 
         threading.Thread(target=work, name="whisper-transcribe", daemon=True).start()
 
@@ -4883,18 +4932,22 @@ if rumps is not None:
             self._mi_server.title = self._server_title()
             history_mtime = _mac_json_store_mtime(_mac_transcription_history_path())
             pending_mtime = _mac_json_store_mtime(_mac_pending_index_path())
-            pending_count = len(load_mac_pending_transcriptions(limit=500))
+            menu_dirty = getattr(self, "_menu_dirty", False)
             if (
-                getattr(self, "_menu_dirty", False)
+                menu_dirty
                 or history_mtime != self._last_history_mtime
                 or pending_mtime != self._last_pending_mtime
-                or pending_count != self._last_pending_count
             ):
+                pending_count = len(load_mac_pending_transcriptions(limit=500))
                 self._menu_dirty = False
                 self._last_history_mtime = history_mtime
                 self._last_pending_mtime = pending_mtime
                 self._last_pending_count = pending_count
                 self.menu = self._compose_menu()
+            else:
+                pending_count = self._last_pending_count
+            if not self.client._using_daemon:
+                self.client._maybe_recover_stale_listener()
             if not self._emoji_mode:
                 return
             rec = busy = False
