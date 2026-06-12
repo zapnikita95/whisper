@@ -44,6 +44,13 @@ R="${R//$'\r'/}"
 [ -n "$R" ] || _ah_die_resources "FAIL cd Resources MACOS_DIR=$MACOS_DIR"
 [ -f "$R/whisper-client-mac.py" ] || _ah_die_resources "FAIL missing $R/whisper-client-mac.py"
 
+# Вшитый venv внутри .app — работает из /Applications без репозитория и без глобального pip.
+if [ -x "$R/venv/bin/python3" ]; then
+	export WHISPER_PYTHON3="$R/venv/bin/python3"
+	export WHISPER_MAC_BUNDLED_VENV=1
+	_run_log "bundled venv python=$WHISPER_PYTHON3"
+fi
+
 # DMG vs локальная сборка (почему «из packaging/mac работает, из /Applications — нет»):
 # macOS Privacy (TCC) привязан к *пути к .app* и к подписи бинарника. Копия из Desktop и копия
 # из DMG в /Applications — для системы разные приложения: разрешения нужно выдать каждой копии.
@@ -104,7 +111,7 @@ _run_log "picked PY=$PY"
 # Зависимости из venv — через PYTHONPATH. ВАЖНО: сначала stdlib фреймворка (lib/pythonX.Y), потом
 # site-packages; иначе в venv часто лежит устаревший pip-пакет «typing» и PyObjC падает при импорте —
 # из Finder это выглядит как «.app вообще не запускается».
-if [ "${WHISPER_FROM_APP_BUNDLE:-}" = "1" ]; then
+if [ "${WHISPER_FROM_APP_BUNDLE:-}" = "1" ] && [ "${WHISPER_MAC_BUNDLED_VENV:-}" != "1" ]; then
 	_GUI_PY="$("$PY" -c "
 import pathlib, sys
 e = pathlib.Path(sys.executable).resolve()

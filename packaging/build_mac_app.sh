@@ -68,6 +68,29 @@ else
 	echo "Предупреждение: не собран whisper_hotkey_daemon — hotkey через pynput (fallback)."
 fi
 
+# Вшитый venv — .app из /Applications не зависит от репозитория и глобального pip.
+VENV_DIR="$APP/Contents/Resources/venv"
+BUILD_PY="${WHISPER_BUNDLE_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13}"
+if [ "${WHISPER_SKIP_BUNDLE_VENV:-}" != "1" ]; then
+	echo "Вшиваю Python venv в .app (зависимости Mac-клиента)…"
+	if [ ! -x "$BUILD_PY" ]; then
+		BUILD_PY="$(command -v python3.13 2>/dev/null || command -v python3 2>/dev/null || true)"
+	fi
+	if [ -z "$BUILD_PY" ] || [ ! -x "$BUILD_PY" ]; then
+		echo "Ошибка: нужен python3.13 для сборки venv (WHISPER_BUNDLE_PYTHON=…)" >&2
+		exit 1
+	fi
+	if [ "${WHISPER_REFRESH_BUNDLE_VENV:-}" = "1" ] || [ ! -x "$VENV_DIR/bin/python3" ]; then
+		rm -rf "$VENV_DIR"
+		"$BUILD_PY" -m venv "$VENV_DIR"
+		"$VENV_DIR/bin/python3" -m pip install -U pip wheel
+		"$VENV_DIR/bin/python3" -m pip install -r "$ROOT/packaging/requirements-mac-client.txt"
+		"$VENV_DIR/bin/python3" -m pip uninstall -y typing >/dev/null 2>&1 || true
+	fi
+	"$VENV_DIR/bin/python3" -c "import rumps, pynput, requests, sounddevice, numpy, soundfile, pyperclip; from importlib.metadata import version as v; assert tuple(int(x) for x in v('pynput').split('.')[:3]) >= (1,8,0)"
+	echo "venv OK: $VENV_DIR/bin/python3"
+fi
+
 if [ -f "$ROOT/assets/AppIcon.icns" ]; then
 	cp -f "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 else
