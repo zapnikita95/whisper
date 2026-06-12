@@ -179,7 +179,7 @@ except Exception:
 fi
 
 # Явный хоткей для .app: перебивает случайный WHISPER_MAC_HOTKEY из окружения.
-export WHISPER_MAC_HOTKEY="shift+ctrl+alt"
+export WHISPER_MAC_HOTKEY="fn"
 
 # pynput из .app: не перезапускать listener после каждой ошибки/отказа (ломает хоткей).
 if [ -z "${WHISPER_MAC_POST_TRANSCRIBE_LISTENER_KICK+x}" ]; then

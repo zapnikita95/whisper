@@ -1381,6 +1381,9 @@ _MOD_ALIASES = {
     "control": "ctrl",
     "^": "ctrl",
     "shift": "shift",
+    "fn": "fn",
+    "function": "fn",
+    "globe": "fn",
 }
 
 # Синонимы не-буквенных клавиш → один символ для токена c:X
@@ -1424,6 +1427,8 @@ def key_event_token(key) -> str | None:
     if isinstance(key, Key):
         return f"n:{key.name}"
     if isinstance(key, KeyCode):
+        if key.vk in (63, 179):
+            return "m:fn"
         if key.char:
             ch = key.char
             if ch.isprintable() and ch not in "\r":
@@ -1440,11 +1445,15 @@ def is_valid_hotkey_tokens(tokens: frozenset[str]) -> bool:
     if len(mods) < 1:
         return False
     if not others:
+        if len(mods) == 1 and mods[0] == "m:fn":
+            return True
         return len(mods) >= 2
     return len(others) >= 1
 
 
 def validate_spec_tokens(tokens: frozenset[str]) -> None:
+    if len(tokens) == 1 and "m:fn" in tokens:
+        return
     if len(tokens) < 2:
         raise ValueError("Нужно минимум две клавиши в сочетании (например cmd+alt или ctrl+`).")
     if not is_valid_hotkey_tokens(tokens):
@@ -1457,6 +1466,11 @@ def validate_spec_tokens(tokens: frozenset[str]) -> None:
 @dataclass(frozen=True)
 class HotkeySpec:
     tokens: frozenset[str]
+
+    @staticmethod
+    def default_fn() -> HotkeySpec:
+        """Fn / Globe — одна клавиша, удобный PTT на MacBook."""
+        return HotkeySpec(frozenset({"m:fn"}))
 
     @staticmethod
     def default_mac_with_portal() -> HotkeySpec:
@@ -1499,8 +1513,8 @@ def parse_hotkey_string(s: str) -> HotkeySpec:
 
 def describe_hotkey(spec: HotkeySpec) -> str:
     """Человекочитаемо для логов."""
-    mod_order = ("cmd", "ctrl", "alt", "shift")
-    mod_labels = {"cmd": "⌘", "alt": "⌥", "ctrl": "⌃", "shift": "⇧"}
+    mod_order = ("cmd", "ctrl", "alt", "shift", "fn")
+    mod_labels = {"cmd": "⌘", "alt": "⌥", "ctrl": "⌃", "shift": "⇧", "fn": "fn"}
     mods: list[str] = []
     keys: list[str] = []
     for t in spec.tokens:
@@ -1565,8 +1579,8 @@ def bind_hotkey_interactive(timeout: float = 90.0) -> HotkeySpec:
         if done.wait(timeout):
             assert out[0] is not None
             return out[0]
-    print("[Client] Таймаут привязки — остаётся ⌃+⇧+⌥ (shift+ctrl+alt).", flush=True)
-    return HotkeySpec.default_mac_with_portal()
+    print("[Client] Таймаут привязки — остаётся fn (удерживай Fn для записи).", flush=True)
+    return HotkeySpec.default_fn()
 
 
 class _InProcessCGEventTap:
@@ -1614,7 +1628,9 @@ class _InProcessCGEventTap:
             "alt":   0x80000,
             "shift": 0x20000,
             "cmd":   0x100000,
+            "fn":    0x800000,
         }
+        mods = [t[2:] for t in spec.tokens if t.startswith("m:")]
         target = 0
         reject = 0x100000  # по умолчанию отклоняем cmd
         for t in spec.tokens:
@@ -1623,7 +1639,9 @@ class _InProcessCGEventTap:
                 if k in _MAP:
                     target |= _MAP[k]
                     if k == "cmd":
-                        reject &= ~0x100000  # cmd в сочетании — не отклоняем
+                        reject &= ~0x100000
+        if mods == ["fn"]:
+            reject = 0x40000 | 0x80000 | 0x20000 | 0x100000
         return target, reject
 
     def start(self) -> bool:
@@ -1658,10 +1676,24 @@ class _InProcessCGEventTap:
 
         target = self._target_flags
         reject = self._reject_flags
+        fn_only = target == 0x800000
 
         def _tap_thread() -> None:
             try:
-                # Callback: вызывается из C-слоя PyObjC (GIL захватывается автоматически)
+                from Quartz import (
+                    kCGEventKeyDown,
+                    kCGEventKeyUp,
+                    CGEventGetIntegerValueField,
+                    kCGKeyboardEventKeycode,
+                )
+
+                def _flags_combo(flags: int) -> bool:
+                    if fn_only:
+                        fn_down = bool(flags & 0x800000)
+                        others = bool(flags & (0x40000 | 0x80000 | 0x20000 | 0x100000))
+                        return fn_down and not others
+                    return bool((flags & target) == target and (flags & reject) == 0)
+
                 def _cb(proxy, event_type, event, refcon):
                     if event_type in (
                         kCGEventTapDisabledByTimeout,
@@ -1673,14 +1705,34 @@ class _InProcessCGEventTap:
                             _mac_log("debug", "in_process_tap_reenabled type=%s", event_type)
                         return event
 
-                    if event_type != kCGEventFlagsChanged:
+                    combo = False
+                    if fn_only and event_type in (kCGEventKeyDown, kCGEventKeyUp):
+                        keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                        if keycode in (63, 179):
+                            combo = event_type == kCGEventKeyDown
+                            down = up = False
+                            with self._pressed_lock:
+                                if combo and not self._pressed:
+                                    self._pressed = True
+                                    down = True
+                                elif not combo and self._pressed:
+                                    self._pressed = False
+                                    up = True
+                            if down:
+                                try:
+                                    self._on_down()
+                                except Exception:
+                                    _MAC_LOGGER.exception("in_process_tap_on_down")
+                            elif up:
+                                try:
+                                    self._on_up()
+                                except Exception:
+                                    _MAC_LOGGER.exception("in_process_tap_on_up")
+                            return event
+                    elif event_type == kCGEventFlagsChanged:
+                        combo = _flags_combo(CGEventGetFlags(event))
+                    else:
                         return event
-
-                    flags = CGEventGetFlags(event)
-                    combo = bool(
-                        (flags & target) == target
-                        and (flags & reject) == 0
-                    )
 
                     down = up = False
                     with self._pressed_lock:
@@ -1706,6 +1758,8 @@ class _InProcessCGEventTap:
                 self._callback_ref = _cb  # защита от GC
 
                 mask = 1 << kCGEventFlagsChanged
+                if fn_only:
+                    mask |= (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp)
                 tap = CGEventTapCreate(
                     kCGHIDEventTap,
                     kCGHeadInsertEventTap,
@@ -1825,7 +1879,7 @@ class _HotkeyDaemon:
         self,
         on_down: "Callable[[], None]",
         on_up: "Callable[[], None]",
-        hotkey_spec: str = "ctrl+alt+shift",
+        hotkey_spec: str = "fn",
     ) -> None:
         self._on_down = on_down
         self._on_up = on_up
@@ -2062,18 +2116,17 @@ class _HotkeyDaemon:
 
 
 def _hotkey_spec_for_daemon(spec: "HotkeySpec") -> str:
-    """Конвертирует HotkeySpec в строку для whisper_hotkey_daemon (ctrl+alt+shift)."""
-    _mod_map = {"ctrl": "ctrl", "alt": "alt", "shift": "shift", "cmd": "cmd"}
+    """Конвертирует HotkeySpec в строку для whisper_hotkey_daemon (fn / ctrl+alt+shift)."""
+    _mod_map = {"ctrl": "ctrl", "alt": "alt", "shift": "shift", "cmd": "cmd", "fn": "fn"}
     parts: list[str] = []
     for t in spec.tokens:
         if t.startswith("m:"):
             name = t[2:]
             if name in _mod_map:
                 parts.append(_mod_map[name])
-    # Стабильный порядок: ctrl alt shift cmd
-    order = ["ctrl", "alt", "shift", "cmd"]
+    order = ["fn", "ctrl", "alt", "shift", "cmd"]
     parts.sort(key=lambda x: order.index(x) if x in order else 99)
-    return "+".join(parts) if parts else "ctrl+alt+shift"
+    return "+".join(parts) if parts else "fn"
 
 
 class WhisperClientMac:
@@ -2093,7 +2146,7 @@ class WhisperClientMac:
         self._cli_server_arg: str | None = (cli_server_arg or "").strip() or None
         self.language = language
         self.spoken_punctuation = spoken_punctuation
-        self.hotkey = hotkey or HotkeySpec.default_mac_with_portal()
+        self.hotkey = hotkey or HotkeySpec.default_fn()
         self._hotkey_label = describe_hotkey(self.hotkey)
         self.sample_rate = 16000
         self.channels = 1
@@ -2876,6 +2929,11 @@ class WhisperClientMac:
             return
         d = self._hotkey_daemon
         if d and d.is_running():
+            if isinstance(d, _HotkeyDaemon):
+                try:
+                    d.ping()
+                except Exception:
+                    pass
             return
         _mac_log("warning", "hotkey_tap_dead restarting")
         ok = self._try_start_hotkey_daemon()
@@ -5538,7 +5596,7 @@ def main() -> int:
 
     def _default_hotkey_str() -> str:
         raw = (os.environ.get("WHISPER_MAC_HOTKEY") or "").strip()
-        return raw if raw else "shift+ctrl+alt"
+        return raw if raw else "fn"
 
     def read_hotkey_from_terminal() -> HotkeySpec:
         dflt = _default_hotkey_str()
