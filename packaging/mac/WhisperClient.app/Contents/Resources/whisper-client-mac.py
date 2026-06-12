@@ -2105,7 +2105,8 @@ class WhisperClientMac:
         self._hk_combo_active = False
         self._hk_suppress = False
         self._record_thread: threading.Thread | None = None
-        self._input_stream: Any = None
+        self._rec_buffer: np.ndarray | None = None
+        self._record_started_mono = 0.0
         self._audio_chunks: list[bytes] = []
         self._busy = False
         self._kbd = KeyboardController()
@@ -2712,7 +2713,11 @@ class WhisperClientMac:
         """Остановка клиента (меню «Выход», SIGINT)."""
         self._run_stop = True
         self._stop_record.set()
-        self._close_record_stream()
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self._rec_buffer = None
         self._listener_cycle_restart.set()
         self._kick_listener_restart(force=True)
         d = self._hotkey_daemon
@@ -2724,7 +2729,6 @@ class WhisperClientMac:
 
     def _drain_main_thread_jobs(self) -> None:
         """Очередь задач для Python main (headless; запасной путь если thunk недоступен)."""
-        self._poll_record_on_main()
         while True:
             try:
                 job = self._main_thread_job_queue.get_nowait()
@@ -3553,131 +3557,62 @@ class WhisperClientMac:
         except Exception as e:
             return f"? ({e})"
 
-    def _record_max_chunks(self) -> int:
-        max_d = self._effective_max_record_seconds()
-        if max_d <= 0:
-            return 10**12
-        return int(self.sample_rate / 1024 * max_d) + 1
-
-    def _poll_record_on_main(self) -> None:
-        """Чтение с микрофона только на main thread (CoreAudio + menu bar)."""
-        if not self._recording:
-            return
-        stream = self._input_stream
-        if stream is None:
-            return
-        n_done = getattr(self, "_record_chunk_count", 0)
-        if n_done >= self._record_max_chunks():
-            return
-        try:
-            data, overflowed = stream.read(1024)
-            if overflowed:
-                _mac_log("warning", "record_overflow")
-            self._audio_chunks.append(data.tobytes())
-            self._record_chunk_count = n_done + 1
-        except Exception as e:
-            _mac_log("error", "record_poll_error %s", e)
-
-    def _open_record_stream_on_main(self) -> bool:
-        """InputStream только с main thread — иначе macOS не включает микрофон (-9986, нет индикатора)."""
-        self._close_record_stream()
-        try:
-            from Foundation import NSThread  # type: ignore[import-untyped]
-
-            on_main = NSThread.isMainThread()
-        except Exception:
-            on_main = threading.current_thread() is threading.main_thread()
-        if sys.platform == "darwin" and not on_main:
-            _mac_log("error", "record_stream_open_not_on_main")
-            return False
+    def _rec_kwargs(self) -> dict[str, Any]:
         idx = self._resolve_input_device_index()
         kwargs: dict[str, Any] = {
             "samplerate": self.sample_rate,
             "channels": self.channels,
             "dtype": np.float32,
-            "blocksize": 1024,
         }
         if idx is not None:
             kwargs["device"] = idx
-        try:
-            stream = sd.InputStream(**kwargs)
-            stream.start()
-            self._input_stream = stream
-            self._record_chunk_count = 0
-            _mac_log(
-                "info",
-                "record_stream_opened device_idx=%s device=%r sr=%s",
-                idx,
-                self._default_input_device_label(),
-                self.sample_rate,
-            )
-            return True
-        except Exception as e:
-            self._input_stream = None
-            _mac_log("error", "record_stream_open_failed %s", e)
-            mac_banner_notification(
-                "Whisper",
-                f"Микрофон не открылся: {e!s:.120}. Проверь «Конфиденциальность → Микрофон» для WhisperClient.",
-            )
-            return False
+        return kwargs
 
-    def _close_record_stream(self) -> None:
-        stream = getattr(self, "_input_stream", None)
-        self._input_stream = None
-        if stream is None:
-            return
+    def _assert_recording_on_main_thread(self) -> bool:
         try:
-            stream.stop()
-        except Exception:
-            pass
-        try:
-            stream.close()
-        except Exception:
-            pass
+            from Foundation import NSThread  # type: ignore[import-untyped]
 
-    def _record_worker(self) -> None:
-        stream = self._input_stream
-        if stream is None:
-            _mac_log("error", "record_worker_no_stream")
-            return
-        chunks = []
-        max_d = self._effective_max_record_seconds()
-        if max_d <= 0:
-            max_chunks = 10**12
-        else:
-            max_chunks = int(self.sample_rate / 1024 * max_d) + 1
-        n = 0
-        try:
-            while not self._stop_record.is_set() and n < max_chunks:
-                data, overflowed = stream.read(1024)
-                if overflowed:
-                    print("[Client] Переполнение буфера!", flush=True)
-                chunks.append(data.tobytes())
-                n += 1
-            with self._lock:
-                self._audio_chunks = chunks
-        except Exception as e:
-            print(f"[Client] Ошибка записи: {e}", file=sys.stderr, flush=True)
-            _mac_log("error", "record_worker_error %s", e)
+            return bool(NSThread.isMainThread())
+        except Exception:
+            return threading.current_thread() is threading.main_thread()
 
     def _start_recording(self) -> None:
         with self._lock:
-            # Если уже идёт запись - не начинаем новую
             if self._recording:
                 return
-            # Если обработка идёт - всё равно разрешаем новую запись (как на Windows)
-            # Старая обработка продолжит в фоне, но результат может быть проигнорирован
             self._recording = True
-        self._stop_record.clear()
-        self._audio_chunks.clear()
         self._paste_target_unix_id = None
+        self._rec_buffer = None
+        self._record_started_mono = time.monotonic()
 
-        if not self._open_record_stream_on_main():
+        if sys.platform == "darwin" and not self._assert_recording_on_main_thread():
+            _mac_log("error", "record_sd_rec_not_on_main")
             with self._lock:
                 self._recording = False
             return
 
-        self._poll_record_on_main()
+        max_d = self._effective_max_record_seconds()
+        max_frames = int(max_d * self.sample_rate) if max_d > 0 else int(600 * self.sample_rate)
+        try:
+            self._rec_buffer = sd.rec(max_frames, **self._rec_kwargs())
+            _mac_log(
+                "info",
+                "record_sd_rec_started device_idx=%s device=%r max_frames=%s",
+                self._resolve_input_device_index(),
+                self._default_input_device_label(),
+                max_frames,
+            )
+        except Exception as e:
+            self._rec_buffer = None
+            _mac_log("error", "record_sd_rec_start_failed %s", e)
+            mac_banner_notification(
+                "Whisper",
+                f"Микрофон не открылся: {e!s:.120}. Проверь «Конфиденциальность → Микрофон» для WhisperClient.",
+            )
+            with self._lock:
+                self._recording = False
+            return
+
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
         threading.Thread(
@@ -3703,46 +3638,32 @@ class WhisperClientMac:
         threading.Thread(target=_beep_async, name="whisper-beep", daemon=True).start()
         print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
 
-    def _drain_record_stream_on_main(self, extra_reads: int = 8) -> None:
-        stream = self._input_stream
-        if stream is None:
-            return
-        for _ in range(extra_reads):
-            if getattr(self, "_record_chunk_count", 0) >= self._record_max_chunks():
-                break
-            try:
-                data, overflowed = stream.read(1024)
-                if overflowed:
-                    _mac_log("warning", "record_overflow")
-                self._audio_chunks.append(data.tobytes())
-                self._record_chunk_count = getattr(self, "_record_chunk_count", 0) + 1
-            except Exception:
-                break
-
     def _stop_recording_and_process(self) -> None:
         with self._lock:
             if not self._recording:
                 return
-        self._stop_record.set()
-        self._drain_record_stream_on_main(8)
-        with self._lock:
             self._recording = False
             self._busy = True
-        self._close_record_stream()
-        chunks = self._audio_chunks[:]
-        self._audio_chunks.clear()
 
-        if not chunks:
+        elapsed = max(time.monotonic() - getattr(self, "_record_started_mono", time.monotonic()), 0.05)
+        try:
+            sd.stop()
+        except Exception as e:
+            _mac_log("debug", "sd_stop err=%s", e)
+
+        buf = self._rec_buffer
+        self._rec_buffer = None
+        if buf is None:
             print("[Client] Нет аудио.", flush=True)
-            _mac_log("warning", "record_stopped_no_chunks")
+            _mac_log("warning", "record_stopped_no_buffer")
             mac_banner_notification("Whisper", "Нет аудио — проверь микрофон и доступ.")
             self._reset_hotkey_tracker()
             with self._lock:
                 self._busy = False
             return
 
-        # Объединяем аудио
-        audio_data = np.frombuffer(b"".join(chunks), dtype=np.float32)
+        frames = min(int(elapsed * self.sample_rate) + self.sample_rate // 8, len(buf))
+        audio_data = np.asarray(buf[:frames], dtype=np.float32).reshape(-1)
         peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
         _mac_log(
             "info",
@@ -5221,7 +5142,7 @@ def _resolve_server_url(cli_server: str | None) -> str | None:
 
 
 def _self_test_microphone_main(seconds: float = 2.5) -> int:
-    """Запись с default input на main thread; exit 0 если peak > 0.002."""
+    """PTT-тест как в клиенте: sd.rec + sd.stop на main thread."""
     _macos_touch_microphone_permission_if_bundle()
     try:
         dev = sd.default.device
@@ -5230,25 +5151,23 @@ def _self_test_microphone_main(seconds: float = 2.5) -> int:
     except Exception as e:
         print(f"self_test_mic FAIL resolve_device: {e}", flush=True)
         return 1
-    chunks: list[bytes] = []
     try:
-        with sd.InputStream(
+        t0 = time.monotonic()
+        rec = sd.rec(
+            int(600 * 16000),
             samplerate=16000,
             channels=1,
             dtype=np.float32,
-            blocksize=1024,
             device=idx,
-        ) as stream:
-            stream.start()
-            t0 = time.time()
-            while time.time() - t0 < seconds:
-                data, _ = stream.read(1024)
-                chunks.append(data.tobytes())
+        )
+        time.sleep(seconds)
+        sd.stop()
+        frames = min(int((time.monotonic() - t0) * 16000) + 2000, len(rec))
+        audio = np.asarray(rec[:frames], dtype=np.float32).reshape(-1)
     except Exception as e:
-        print(f"self_test_mic FAIL InputStream: {e}", flush=True)
+        print(f"self_test_mic FAIL sd.rec: {e}", flush=True)
         _mac_log("error", "self_test_mic_fail %s", e)
         return 1
-    audio = np.frombuffer(b"".join(chunks), dtype=np.float32)
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     dur = audio.size / 16000.0 if audio.size else 0.0
     _mac_log(
@@ -5262,6 +5181,43 @@ def _self_test_microphone_main(seconds: float = 2.5) -> int:
     )
     print(
         f"self_test_mic device_idx={idx} device={name!r} peak={peak:.5f} samples={audio.size} duration={dur:.2f}s",
+        flush=True,
+    )
+    return 0 if peak > 0.002 else 1
+
+
+def _self_test_ptt_main(server_url: str, seconds: float = 2.5) -> int:
+    """Точный путь клиента: _start_recording → sleep → sd.stop (без rumps)."""
+    _macos_touch_microphone_permission_if_bundle()
+    client = WhisperClientMac(server_url, hotkey=HotkeySpec.default_mac_with_portal())
+    client._menu_bar_mode = False
+    client._start_recording()
+    if not client._recording and client._rec_buffer is None:
+        print("self_test_ptt FAIL start_recording", flush=True)
+        return 1
+    time.sleep(seconds)
+    elapsed = max(time.monotonic() - client._record_started_mono, 0.05)
+    try:
+        sd.stop()
+    except Exception:
+        pass
+    buf = client._rec_buffer
+    client._rec_buffer = None
+    if buf is None:
+        print("self_test_ptt FAIL no_buffer", flush=True)
+        return 1
+    frames = min(int(elapsed * client.sample_rate) + client.sample_rate // 8, len(buf))
+    audio = np.asarray(buf[:frames], dtype=np.float32).reshape(-1)
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    _mac_log(
+        "info",
+        "self_test_ptt peak=%.5f samples=%s device=%r",
+        peak,
+        audio.size,
+        client._default_input_device_label(),
+    )
+    print(
+        f"self_test_ptt peak={peak:.5f} samples={audio.size} device={client._default_input_device_label()!r}",
         flush=True,
     )
     return 0 if peak > 0.002 else 1
@@ -5367,6 +5323,11 @@ def main() -> int:
         "По умолчанию выкл; на macOS может ломать сочетание — не используй без необходимости.",
     )
     p.add_argument(
+        "--self-test-ptt",
+        action="store_true",
+        help="Автотест PTT (sd.rec как в клиенте при зажатии хоткея)",
+    )
+    p.add_argument(
         "--self-test-mic",
         action="store_true",
         help="Автотест микрофона (2.5 с, peak в stdout); exit 0 если слышно",
@@ -5399,6 +5360,10 @@ def main() -> int:
 
     if args.self_test_mic:
         return _self_test_microphone_main()
+
+    if args.self_test_ptt:
+        u = _resolve_server_url(args.server) or "http://127.0.0.1:1"
+        return _self_test_ptt_main(u)
 
     if args.listener_idle_recycle_sec is not None:
         v = float(args.listener_idle_recycle_sec)
