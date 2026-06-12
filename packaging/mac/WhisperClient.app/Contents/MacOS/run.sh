@@ -97,14 +97,20 @@ export WHISPER_MAC_RESOURCES="$R"
 export WHISPER_FROM_APP_BUNDLE=1
 export WHISPER_MAC_APP_PICK_PYTHON=1
 
-PY="$(pick_python_for_whisper)" || {
-	_run_log "FAIL pick_python_for_whisper (нет python3 с зависимостями)"
-	osascript <<'OSA' || true
+PY=""
+if [ "${WHISPER_MAC_BUNDLED_VENV:-}" = "1" ] && [ -n "${WHISPER_PYTHON3:-}" ] && [ -x "${WHISPER_PYTHON3}" ]; then
+	PY="$(_whisper_mac_prefer_versioned_python "${WHISPER_PYTHON3}")"
+	_run_log "picked PY=$PY (bundled venv only)"
+else
+	PY="$(pick_python_for_whisper)" || {
+		_run_log "FAIL pick_python_for_whisper (нет python3 с зависимостями)"
+		osascript <<'OSA' || true
 display dialog "Не найден подходящий python3 (нужны requests, sounddevice, numpy, soundfile, pyperclip; для Python 3.13 ещё pynput ≥ 1.8.1). Установи Python с python.org или Homebrew и выполни в Терминале: python3 -m pip install -U requests sounddevice numpy soundfile 'pynput>=1.8.1' pyperclip rumps. Либо задай WHISPER_PYTHON3 в run.sh внутри .app." buttons {"OK"} default button 1 with title "Whisper Client"
 OSA
-	exit 1
-}
-_run_log "picked PY=$PY"
+		exit 1
+	}
+	_run_log "picked PY=$PY"
+fi
 
 # Иконка 🎤 в меню-баре (rumps / NSStatusItem): при запуске из Finder процесс должен быть
 # из Python.app (GUI), а не «голый» …/bin/python3.X — иначе AppKit часто не показывает статус-айтем.

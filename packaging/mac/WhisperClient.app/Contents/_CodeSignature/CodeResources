@@ -10,7 +10,7 @@
 		</data>
 		<key>Resources/VERSION</key>
 		<data>
-		s52ylxm5AloRRI0tfugRjTUbTOI=
+		bYOj4RoUKnDs5JkbHGcG6nUaL90=
 		</data>
 		<key>Resources/__pycache__/whisper-client-mac.cpython-313.pyc</key>
 		<data>
@@ -14026,7 +14026,7 @@
 		</data>
 		<key>Resources/whisper-client-mac.py</key>
 		<data>
-		1Lh5U8j2C/3cNNgP53knSvRRpY0=
+		wLCdMavKisWpXAoV52EEE+sVatw=
 		</data>
 		<key>Resources/whisper_groq.py</key>
 		<data>
@@ -14051,6 +14051,10 @@
 		<key>Resources/whisper_mac_vocab_ui.py</key>
 		<data>
 		pdsUtt1sD7Em+SuJqurJ2ML9kWM=
+		</data>
+		<key>Resources/whisper_mic_capture.py</key>
+		<data>
+		+MfwePQl2Oln4mf/cRYZ2svBtLM=
 		</data>
 		<key>Resources/whisper_update_check.py</key>
 		<data>
@@ -14080,7 +14084,7 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			j5b75KGNRPQ7rAGB4Wun6lynrtM=
+			/RtXZBk5auXJl3Ax5ACJ6XnGDQ8=
 			</data>
 			<key>requirement</key>
 			<string>identifier run and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = Y52BT2N4L8</string>
@@ -14114,7 +14118,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			PlwYUbDbvkOqA9RguVl1pwlGpdqZPcazReyejDl1UkY=
+			JCgqQMGm3g+QhBByzD+pKhz+w4cmcllvbUGt5El5uQc=
 			</data>
 		</dict>
 		<key>Resources/__pycache__/whisper-client-mac.cpython-313.pyc</key>
@@ -38657,7 +38661,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			jcRLguFiHW1wmZuLR4bNVUsVBXxjAz1KpBFLjnOobqs=
+			osiu1nCRVuS+L9aU21Dlu19bXwm6CfFCKI04ufD+RwE=
 			</data>
 		</dict>
 		<key>Resources/whisper_groq.py</key>
@@ -38700,6 +38704,13 @@
 			<key>hash2</key>
 			<data>
 			LkGKQYrR1/uPLywxZ/xsdjVjePpz/zUfrG11DgP2DpM=
+			</data>
+		</dict>
+		<key>Resources/whisper_mic_capture.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			JsOcdDdc6uw/Tuq9G9wYIqOxFhQkQlS+pvL/K/k/8FM=
 			</data>
 		</dict>
 		<key>Resources/whisper_update_check.py</key>

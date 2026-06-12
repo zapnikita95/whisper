@@ -2107,6 +2107,8 @@ class WhisperClientMac:
         self._record_thread: threading.Thread | None = None
         self._rec_buffer: np.ndarray | None = None
         self._record_started_mono = 0.0
+        self._mic_cap_proc: subprocess.Popen[bytes] | None = None
+        self._mic_cap_wav: str | None = None
         self._audio_chunks: list[bytes] = []
         self._busy = False
         self._kbd = KeyboardController()
@@ -2713,6 +2715,16 @@ class WhisperClientMac:
         """Остановка клиента (меню «Выход», SIGINT)."""
         self._run_stop = True
         self._stop_record.set()
+        proc = self._mic_cap_proc
+        if proc is not None:
+            try:
+                proc.send_signal(signal.SIGUSR1)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        self._mic_cap_proc = None
         try:
             sd.stop()
         except Exception:
@@ -2834,21 +2846,19 @@ class WhisperClientMac:
         self._hotkey_perm_prompt_sent = True
         if os.environ.get("WHISPER_MAC_NO_PERM_PROMPT", "").strip().lower() in ("1", "true", "yes"):
             return
-        _mac_log("warning", "hotkey_permissions_missing prompting_user")
+        flag = Path.home() / ".whisper" / "mac_hotkey_perm_prompted"
+        if flag.is_file():
+            return
+        _mac_log("warning", "hotkey_permissions_missing notify_once")
         try:
-            subprocess.run(
-                [
-                    "open",
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListeningEvent",
-                ],
-                check=False,
-            )
-        except Exception:
-            _MAC_LOGGER.debug("open_listening_event_prefs", exc_info=True)
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("1", encoding="utf-8")
+        except OSError:
+            pass
         mac_banner_notification(
             "Whisper — включи перехват клавиш",
             "Системные настройки → Конфиденциальность → Мониторинг ввода: "
-            "включи Whisper Client (и Python, если есть). Поткрой .app заново.",
+            "только WhisperClient (без Python). Потом перезапусти .app.",
         )
 
     def _should_post_transcribe_listener_kick(self, *, did_paste_pipeline: bool) -> bool:
@@ -3576,6 +3586,27 @@ class WhisperClientMac:
         except Exception:
             return threading.current_thread() is threading.main_thread()
 
+    def _mic_capture_paths(self) -> tuple[str | None, str | None]:
+        r = os.environ.get("WHISPER_MAC_RESOURCES", "").strip()
+        if not r:
+            return None, None
+        cap = os.path.join(r, "whisper_mic_capture.py")
+        for py in (
+            os.path.join(r, "venv", "bin", "python3.13"),
+            os.path.join(r, "venv", "bin", "python3"),
+        ):
+            if os.path.isfile(py) and os.access(py, os.X_OK):
+                return cap if os.path.isfile(cap) else None, py
+        return cap if os.path.isfile(cap) else None, None
+
+    def _use_subprocess_mic_capture(self) -> bool:
+        if sys.platform != "darwin":
+            return False
+        if os.environ.get("WHISPER_MAC_MIC_INPROCESS", "").strip().lower() in ("1", "true", "yes"):
+            return False
+        cap, py = self._mic_capture_paths()
+        return bool(cap and py)
+
     def _start_recording(self) -> None:
         with self._lock:
             if self._recording:
@@ -3584,34 +3615,76 @@ class WhisperClientMac:
         self._paste_target_unix_id = None
         self._rec_buffer = None
         self._record_started_mono = time.monotonic()
+        self._mic_cap_proc = None
+        self._mic_cap_wav = None
 
-        if sys.platform == "darwin" and not self._assert_recording_on_main_thread():
-            _mac_log("error", "record_sd_rec_not_on_main")
-            with self._lock:
-                self._recording = False
-            return
-
-        max_d = self._effective_max_record_seconds()
-        max_frames = int(max_d * self.sample_rate) if max_d > 0 else int(600 * self.sample_rate)
-        try:
-            self._rec_buffer = sd.rec(max_frames, **self._rec_kwargs())
-            _mac_log(
-                "info",
-                "record_sd_rec_started device_idx=%s device=%r max_frames=%s",
-                self._resolve_input_device_index(),
-                self._default_input_device_label(),
-                max_frames,
-            )
-        except Exception as e:
-            self._rec_buffer = None
-            _mac_log("error", "record_sd_rec_start_failed %s", e)
-            mac_banner_notification(
-                "Whisper",
-                f"Микрофон не открылся: {e!s:.120}. Проверь «Конфиденциальность → Микрофон» для WhisperClient.",
-            )
-            with self._lock:
-                self._recording = False
-            return
+        if self._use_subprocess_mic_capture():
+            cap_py, py = self._mic_capture_paths()
+            assert cap_py and py
+            fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="whisper_cap_")
+            os.close(fd)
+            self._mic_cap_wav = wav_path
+            args = [py, cap_py, "ptt", wav_path]
+            idx = self._resolve_input_device_index()
+            if idx is not None:
+                args.append(str(idx))
+            env = os.environ.copy()
+            env.setdefault("WHISPER_FROM_APP_BUNDLE", "1")
+            try:
+                self._mic_cap_proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=os.path.dirname(cap_py),
+                    env=env,
+                    start_new_session=True,
+                )
+                _mac_log(
+                    "info",
+                    "record_subprocess_started pid=%s device_idx=%s wav=%s",
+                    self._mic_cap_proc.pid,
+                    idx,
+                    wav_path,
+                )
+            except Exception as e:
+                self._mic_cap_proc = None
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+                self._mic_cap_wav = None
+                _mac_log("error", "record_subprocess_start_failed %s", e)
+                mac_banner_notification("Whisper", f"Микрофон: не запустился захват: {e!s:.100}")
+                with self._lock:
+                    self._recording = False
+                return
+        else:
+            if sys.platform == "darwin" and not self._assert_recording_on_main_thread():
+                _mac_log("error", "record_sd_rec_not_on_main")
+                with self._lock:
+                    self._recording = False
+                return
+            max_d = self._effective_max_record_seconds()
+            max_frames = int(max_d * self.sample_rate) if max_d > 0 else int(600 * self.sample_rate)
+            try:
+                self._rec_buffer = sd.rec(max_frames, **self._rec_kwargs())
+                _mac_log(
+                    "info",
+                    "record_sd_rec_started device_idx=%s device=%r max_frames=%s",
+                    self._resolve_input_device_index(),
+                    self._default_input_device_label(),
+                    max_frames,
+                )
+            except Exception as e:
+                self._rec_buffer = None
+                _mac_log("error", "record_sd_rec_start_failed %s", e)
+                mac_banner_notification(
+                    "Whisper",
+                    f"Микрофон не открылся: {e!s:.120}. Проверь «Конфиденциальность → Микрофон» для WhisperClient.",
+                )
+                with self._lock:
+                    self._recording = False
+                return
 
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
@@ -3638,6 +3711,70 @@ class WhisperClientMac:
         threading.Thread(target=_beep_async, name="whisper-beep", daemon=True).start()
         print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
 
+    def _finish_recording_get_audio(self) -> tuple[np.ndarray | None, float]:
+        """Остановить захват и вернуть (audio, peak)."""
+        proc = self._mic_cap_proc
+        wav_path = self._mic_cap_wav
+        self._mic_cap_proc = None
+        self._mic_cap_wav = None
+
+        if proc is not None and wav_path:
+            peak = 0.0
+            try:
+                proc.send_signal(signal.SIGUSR1)
+            except Exception as e:
+                _mac_log("warning", "record_subprocess_sigusr1 err=%s", e)
+            try:
+                out_b, err_b = proc.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out_b, err_b = proc.communicate(timeout=5)
+            out = (out_b or b"").decode("utf-8", errors="replace").strip()
+            err = (err_b or b"").decode("utf-8", errors="replace").strip()
+            if err:
+                _mac_log("debug", "record_subprocess_stderr %s", err[:400])
+            if out:
+                try:
+                    meta = json.loads(out.splitlines()[-1])
+                    peak = float(meta.get("peak") or 0.0)
+                    _mac_log(
+                        "info",
+                        "record_subprocess_done peak=%.5f samples=%s device=%r",
+                        peak,
+                        meta.get("samples"),
+                        meta.get("device"),
+                    )
+                except Exception:
+                    _mac_log("warning", "record_subprocess_meta_parse fail out=%r", out[:200])
+            try:
+                audio_data, _sr = sf.read(wav_path, dtype="float32")
+                audio_data = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+                if peak <= 0.0 and audio_data.size:
+                    peak = float(np.max(np.abs(audio_data)))
+            except Exception as e:
+                _mac_log("error", "record_subprocess_read_wav %s", e)
+                audio_data = None
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+            return audio_data, peak
+
+        elapsed = max(time.monotonic() - getattr(self, "_record_started_mono", time.monotonic()), 0.05)
+        try:
+            sd.stop()
+        except Exception as e:
+            _mac_log("debug", "sd_stop err=%s", e)
+        buf = self._rec_buffer
+        self._rec_buffer = None
+        if buf is None:
+            return None, 0.0
+        frames = min(int(elapsed * self.sample_rate) + self.sample_rate // 8, len(buf))
+        audio_data = np.asarray(buf[:frames], dtype=np.float32).reshape(-1)
+        peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
+        return audio_data, peak
+
     def _stop_recording_and_process(self) -> None:
         with self._lock:
             if not self._recording:
@@ -3645,26 +3782,16 @@ class WhisperClientMac:
             self._recording = False
             self._busy = True
 
-        elapsed = max(time.monotonic() - getattr(self, "_record_started_mono", time.monotonic()), 0.05)
-        try:
-            sd.stop()
-        except Exception as e:
-            _mac_log("debug", "sd_stop err=%s", e)
-
-        buf = self._rec_buffer
-        self._rec_buffer = None
-        if buf is None:
+        audio_data, peak = self._finish_recording_get_audio()
+        if audio_data is None or audio_data.size == 0:
             print("[Client] Нет аудио.", flush=True)
-            _mac_log("warning", "record_stopped_no_buffer")
-            mac_banner_notification("Whisper", "Нет аудио — проверь микрофон и доступ.")
+            _mac_log("warning", "record_stopped_no_audio")
+            mac_banner_notification("Whisper", "Нет аудио — проверь микрофон и доступ WhisperClient.")
             self._reset_hotkey_tracker()
             with self._lock:
                 self._busy = False
             return
 
-        frames = min(int(elapsed * self.sample_rate) + self.sample_rate // 8, len(buf))
-        audio_data = np.asarray(buf[:frames], dtype=np.float32).reshape(-1)
-        peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
         _mac_log(
             "info",
             "record_stopped samples=%s peak=%.5f duration=%.2fs",
@@ -3684,7 +3811,7 @@ class WhisperClientMac:
             _mac_log("warning", "record_silent peak=%.5f device=%r", peak, self._default_input_device_label())
             mac_banner_notification(
                 "Whisper",
-                "Запись почти пустая — проверь микрофон в «Системные настройки → Звук → Вход».",
+                "Запись пустая — в «Конфиденциальность → Микрофон» оставь только WhisperClient, убери дубли Python.",
             )
 
         # Цель вставки: frontmost в момент отпускания хоткея (после долгой записи/Groq актуальнее, чем только на старте).
