@@ -3911,12 +3911,8 @@ if rumps is not None:
             self.client = client
             self.client._menu_bar_ref = self
             self._menu_dirty = False
-            self._last_history_mtime = 0.0
-            self._last_pending_mtime = 0.0
             self._last_pending_count = 0
-            self._mi_version = rumps.MenuItem(f"Версия {self._app_version}", callback=None)
-            self._mi_server = rumps.MenuItem(self._server_title(), callback=None)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             # После initializeStatusBar() в rumps.App.run(), иначе клики по иконке часто «мёртвые».
             rumps.events.before_start.register(_rumps_apply_accessory_activation_policy)
             # Запрашиваем разрешение на уведомления из контекста работающего NSApp.
@@ -3932,6 +3928,12 @@ if rumps is not None:
                     "для стабильной работы убери WHISPER_MAC_LISTENER_IDLE_RECYCLE_SEC и не передавай --listener-idle-recycle-sec",
                     _ir,
                 )
+
+        def _safe_recompose_menu(self) -> None:
+            try:
+                self.menu = self._compose_menu()
+            except Exception:
+                _MAC_LOGGER.exception("menu_recompose_failed")
 
         def _server_title(self) -> str:
             u = self.client.server_url
@@ -3997,10 +3999,7 @@ if rumps is not None:
                     )
                     self.client._reload_mac_prefs_from_disk()
                     mac_banner_notification("Whisper", f"Сервер найден автоматически: {url_new}")
-                    try:
-                        self._mi_server.title = self._server_title()
-                    except Exception:
-                        pass
+                    self._menu_dirty = True
                 except Exception as e:
                     _mac_log("warning", "autoprobe err=%s", e)
 
@@ -4100,7 +4099,7 @@ if rumps is not None:
             self.client._merge_save_mac_prefs(server_host=hs, server_port=pt, server_url=url)
             mac_banner_notification("Whisper", f"Сервер сохранён: {url}")
             self.client._reload_mac_prefs_from_disk()
-            self._mi_server.title = self._server_title()
+            self._menu_dirty = True
 
         def _edit_server_url_menu(self, _sender) -> None:
             self._edit_server_url_menu_impl()
@@ -4124,14 +4123,14 @@ if rumps is not None:
                     "Whisper",
                     "Настройки сервера сброшены — подставится URL из run.sh / авто-поиск.",
                 )
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
                 return
             if not s.startswith(("http://", "https://")):
                 rumps.alert("Сервер", "Нужен URL вида http://IP:порт или https://…")
                 return
             self.client._merge_save_mac_prefs(server_url=s)
             mac_banner_notification("Whisper", f"Сервер: {s}")
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
 
         def _clear_server_url_menu(self, _sender) -> None:
             self.client._merge_save_mac_prefs(server_url=None, server_host=None, server_port=None)
@@ -4139,12 +4138,10 @@ if rumps is not None:
                 "Whisper",
                 "Сервер (URL / IP / порт) в ~/.whisper/mac_client_prefs.json сброшен.",
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
 
         def _compose_menu(self) -> list:
             self.client._reload_mac_prefs_from_disk()
-            self._mi_version.title = f"Версия {self._app_version}"
-            self._mi_server.title = self._server_title()
             _menu_timeouts = [
                 rumps.MenuItem(
                     "По умолчанию (сброс файла настроек)",
@@ -4197,9 +4194,10 @@ if rumps is not None:
                 ("Макс. длина записи", self._max_record_submenu_items()),
             ]
             pending_total = len(load_mac_pending_transcriptions(limit=500))
+            self._last_pending_count = pending_total
             out: list = [
-                self._mi_version,
-                self._mi_server,
+                rumps.MenuItem(f"Версия {self._app_version}", callback=None),
+                rumps.MenuItem(self._server_title(), callback=None),
             ]
             if pending_total > 0:
                 out.append(
@@ -4279,7 +4277,7 @@ if rumps is not None:
                 if rid:
                     remove_mac_pending_transcription(rid)
             mac_banner_notification("Whisper", "Очередь отправки очищена.")
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
 
         def _open_pending_folder_menu(self, _sender) -> None:
             d = _mac_pending_audio_dir()
@@ -4330,7 +4328,7 @@ if rumps is not None:
         def _paste_mode_set_factory(self, mode: str):
             def _cb(_sender) -> None:
                 self.client._merge_save_mac_prefs(paste_mode=mode)
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
 
             return _cb
 
@@ -4357,7 +4355,7 @@ if rumps is not None:
         def _transcribe_backend_set_factory(self, mode: str):
             def _cb(_sender) -> None:
                 self.client._merge_save_mac_prefs(transcribe_backend=mode)
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
 
             return _cb
 
@@ -4402,7 +4400,7 @@ if rumps is not None:
             try:
                 add_term(term)
                 mac_banner_notification("Whisper", f"Термин добавлен в словарь: {term}")
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
             except Exception as e:
                 rumps.alert("Словарь", f"Не удалось сохранить: {e}")
 
@@ -4443,7 +4441,7 @@ if rumps is not None:
                 return
             s = raw.strip()
             self.client._merge_save_mac_prefs(groq_api_key=s if s else "")
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             if s:
                 mac_banner_notification(
                     "Whisper",
@@ -4454,7 +4452,7 @@ if rumps is not None:
 
         def _groq_key_clear_menu(self, _sender) -> None:
             self.client._merge_save_mac_prefs(groq_api_key=None)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             mac_banner_notification("Whisper", "Ключ Groq удалён из настроек клиента.")
 
         def _groq_proxy_url_menu(self, _sender) -> None:
@@ -4466,7 +4464,7 @@ if rumps is not None:
                 return
             s = raw.strip().rstrip("/")
             self.client._merge_save_mac_prefs(groq_proxy_url=s if s else "")
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             mac_banner_notification(
                 "Whisper",
                 "Groq прокси URL сохранён (или очищен).",
@@ -4487,7 +4485,7 @@ if rumps is not None:
         def _groq_proxy_toggle_menu(self, _sender) -> None:
             enabled = not self.client._effective_groq_proxy_enabled()
             self.client._merge_save_mac_prefs(groq_proxy_enabled=enabled)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             if enabled:
                 mac_banner_notification("Whisper", "Groq прокси включен.")
             else:
@@ -4499,7 +4497,7 @@ if rumps is not None:
                 groq_proxy_url="https://whisper-groq-proxy-production.up.railway.app",
                 groq_proxy_secret=None,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             mac_banner_notification(
                 "Whisper",
                 "Выбран базовый прокси. При необходимости добавь секрет прокси.",
@@ -4514,12 +4512,12 @@ if rumps is not None:
                 return
             s = raw.strip()
             self.client._merge_save_mac_prefs(groq_proxy_secret=s if s else "")
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             mac_banner_notification("Whisper", "Секрет прокси сохранён (или очищен).")
 
         def _groq_proxy_clear_menu(self, _sender) -> None:
             self.client._merge_save_mac_prefs(groq_proxy_url=None, groq_proxy_secret=None)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             mac_banner_notification("Whisper", "URL и секрет Groq-прокси сброшены.")
 
         def _max_record_label_match(self, cur: float, val: float) -> bool:
@@ -4548,7 +4546,7 @@ if rumps is not None:
         def _max_record_set_factory(self, val: float):
             def _cb(_sender) -> None:
                 self.client._merge_save_mac_prefs(max_record_seconds=val)
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
 
             return _cb
 
@@ -4560,7 +4558,7 @@ if rumps is not None:
         def _toggle_skip_health(self, _sender) -> None:
             nxt = not self.client._effective_skip_health_check()
             self.client._merge_save_mac_prefs(skip_health_check=nxt)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
 
         def _apply_status_bar_menu_fix(self) -> None:
             """macOS 11+: повесить NSMenu на NSStatusBarButton — иначе клик по иконке часто молчит."""
@@ -4695,7 +4693,7 @@ if rumps is not None:
                 transcribe_timeout=None,
                 transcribe_connect_timeout=None,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert(
                 "Таймауты",
                 "Сброшены. Снова действуют значения по умолчанию и переменные окружения.",
@@ -4707,7 +4705,7 @@ if rumps is not None:
                 transcribe_connect_timeout=30.0,
                 transcribe_timeout=480.0,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert("Таймауты", "Сохранено: быстрый профиль (ответ до 8 мин).")
 
         def _timeouts_preset_normal(self, _sender) -> None:
@@ -4716,7 +4714,7 @@ if rumps is not None:
                 transcribe_connect_timeout=60.0,
                 transcribe_timeout=900.0,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert("Таймауты", "Сохранено: нормальный профиль (ответ до 15 мин).")
 
         def _timeouts_preset_long(self, _sender) -> None:
@@ -4725,7 +4723,7 @@ if rumps is not None:
                 transcribe_connect_timeout=90.0,
                 transcribe_timeout=1800.0,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert("Таймауты", "Сохранено: долгий профиль (ответ до 30 мин).")
 
         def _timeouts_custom(self, _sender) -> None:
@@ -4753,12 +4751,12 @@ if rumps is not None:
                 transcribe_connect_timeout=cv,
                 transcribe_timeout=rv,
             )
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert("Таймауты", f"Сохранено: {hv:.0f} / {cv:.0f} / {rv:.0f} с")
 
         def _speaker_threshold_reset(self, _sender) -> None:
             self.client._merge_save_mac_prefs(speaker_threshold=None)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert(
                 "Порог эталона",
                 "Сброшен — используется порог при запуске и WHISPER_SPEAKER_THRESHOLD.",
@@ -4767,7 +4765,7 @@ if rumps is not None:
         def _speaker_threshold_set_factory(self, val: float):
             def _cb(_s) -> None:
                 self.client._merge_save_mac_prefs(speaker_threshold=val)
-                self.menu = self._compose_menu()
+                self._safe_recompose_menu()
                 rumps.alert(
                     "Порог эталона",
                     f"Сохранено {val:.2f} (~/.whisper/mac_client_prefs.json).",
@@ -4800,7 +4798,7 @@ if rumps is not None:
                 rumps.alert("Ошибка", "Ожидается число от 0.45 до 0.99.")
                 return
             self.client._merge_save_mac_prefs(speaker_threshold=v)
-            self.menu = self._compose_menu()
+            self._safe_recompose_menu()
             rumps.alert("Порог эталона", f"Сохранено {v:.3f}")
 
         def _startup_update_check_once(self) -> None:
@@ -4915,37 +4913,15 @@ if rumps is not None:
         def _drain_main_thread_jobs_tick(self, _sender) -> None:
             self.client._drain_main_thread_jobs()
 
-        @rumps.timer(12.0)
-        def _startup_update_check_delayed(self, sender) -> None:
-            """Проверка обновлений на главном RunLoop (UN-уведомления с кнопкой — только с main)."""
-            try:
-                sender.stop()
-            except Exception:
-                pass
-            self._startup_update_check_once()
-
         @rumps.timer(0.5)
         def _tick(self, _sender) -> None:
             if self.client._run_stop:
                 rumps.quit_application()
                 return
-            self._mi_server.title = self._server_title()
-            history_mtime = _mac_json_store_mtime(_mac_transcription_history_path())
-            pending_mtime = _mac_json_store_mtime(_mac_pending_index_path())
-            menu_dirty = getattr(self, "_menu_dirty", False)
-            if (
-                menu_dirty
-                or history_mtime != self._last_history_mtime
-                or pending_mtime != self._last_pending_mtime
-            ):
-                pending_count = len(load_mac_pending_transcriptions(limit=500))
+            if getattr(self, "_menu_dirty", False):
                 self._menu_dirty = False
-                self._last_history_mtime = history_mtime
-                self._last_pending_mtime = pending_mtime
-                self._last_pending_count = pending_count
-                self.menu = self._compose_menu()
-            else:
-                pending_count = self._last_pending_count
+                self._safe_recompose_menu()
+            pending_count = self._last_pending_count
             if not self.client._using_daemon:
                 self.client._maybe_recover_stale_listener()
             if not self._emoji_mode:
