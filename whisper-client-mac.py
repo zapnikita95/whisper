@@ -2093,6 +2093,7 @@ class WhisperClientMac:
         self._hk_combo_active = False
         self._hk_suppress = False
         self._record_thread: threading.Thread | None = None
+        self._input_stream: Any = None
         self._audio_chunks: list[bytes] = []
         self._busy = False
         self._kbd = KeyboardController()
@@ -2698,6 +2699,8 @@ class WhisperClientMac:
     def request_shutdown(self) -> None:
         """Остановка клиента (меню «Выход», SIGINT)."""
         self._run_stop = True
+        self._stop_record.set()
+        self._close_record_stream()
         self._listener_cycle_restart.set()
         self._kick_listener_restart(force=True)
         d = self._hotkey_daemon
@@ -3516,7 +3519,70 @@ class WhisperClientMac:
             return True
         return False
 
+    def _default_input_device_label(self) -> str:
+        try:
+            dev = sd.default.device
+            idx = dev[0] if isinstance(dev, (list, tuple)) else dev
+            return str(sd.query_devices(idx).get("name", idx))
+        except Exception as e:
+            return f"? ({e})"
+
+    def _open_record_stream_on_main(self) -> bool:
+        """InputStream только с main thread — иначе macOS не включает микрофон (-9986, нет индикатора)."""
+        self._close_record_stream()
+        try:
+            from Foundation import NSThread  # type: ignore[import-untyped]
+
+            on_main = NSThread.isMainThread()
+        except Exception:
+            on_main = threading.current_thread() is threading.main_thread()
+        if sys.platform == "darwin" and not on_main:
+            _mac_log("error", "record_stream_open_not_on_main")
+            return False
+        try:
+            stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=np.float32,
+                blocksize=1024,
+            )
+            stream.start()
+            self._input_stream = stream
+            _mac_log(
+                "info",
+                "record_stream_opened device=%r sr=%s",
+                self._default_input_device_label(),
+                self.sample_rate,
+            )
+            return True
+        except Exception as e:
+            self._input_stream = None
+            _mac_log("error", "record_stream_open_failed %s", e)
+            mac_banner_notification(
+                "Whisper",
+                f"Микрофон не открылся: {e!s:.120}. Проверь «Конфиденциальность → Микрофон» для WhisperClient.",
+            )
+            return False
+
+    def _close_record_stream(self) -> None:
+        stream = getattr(self, "_input_stream", None)
+        self._input_stream = None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
     def _record_worker(self) -> None:
+        stream = self._input_stream
+        if stream is None:
+            _mac_log("error", "record_worker_no_stream")
+            return
         chunks = []
         max_d = self._effective_max_record_seconds()
         if max_d <= 0:
@@ -3525,18 +3591,12 @@ class WhisperClientMac:
             max_chunks = int(self.sample_rate / 1024 * max_d) + 1
         n = 0
         try:
-            with sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype=np.float32,
-                blocksize=1024,
-            ) as stream:
-                while not self._stop_record.is_set() and n < max_chunks:
-                    data, overflowed = stream.read(1024)
-                    if overflowed:
-                        print("[Client] Переполнение буфера!", flush=True)
-                    chunks.append(data.tobytes())
-                    n += 1
+            while not self._stop_record.is_set() and n < max_chunks:
+                data, overflowed = stream.read(1024)
+                if overflowed:
+                    print("[Client] Переполнение буфера!", flush=True)
+                chunks.append(data.tobytes())
+                n += 1
             with self._lock:
                 self._audio_chunks = chunks
         except Exception as e:
@@ -3555,7 +3615,11 @@ class WhisperClientMac:
         self._audio_chunks.clear()
         self._paste_target_unix_id = None
 
-        # Микрофон первым — osascript в снимке PID больше не блокирует открытие входа (NSWorkspace — мгновенно).
+        if not self._open_record_stream_on_main():
+            with self._lock:
+                self._recording = False
+            return
+
         self._record_thread = threading.Thread(
             target=self._record_worker,
             name="whisper-record",
@@ -3597,11 +3661,13 @@ class WhisperClientMac:
         if self._record_thread is not None:
             self._record_thread.join(timeout=5.0)
             self._record_thread = None
+        self._close_record_stream()
         chunks = self._audio_chunks[:]
         self._audio_chunks.clear()
 
         if not chunks:
             print("[Client] Нет аудио.", flush=True)
+            _mac_log("warning", "record_stopped_no_chunks")
             mac_banner_notification("Whisper", "Нет аудио — проверь микрофон и доступ.")
             self._reset_hotkey_tracker()
             with self._lock:
@@ -3610,6 +3676,14 @@ class WhisperClientMac:
 
         # Объединяем аудио
         audio_data = np.frombuffer(b"".join(chunks), dtype=np.float32)
+        peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
+        _mac_log(
+            "info",
+            "record_stopped samples=%s peak=%.5f duration=%.2fs",
+            audio_data.size,
+            peak,
+            audio_data.size / float(self.sample_rate) if self.sample_rate else 0.0,
+        )
         min_samples = int(0.25 * self.sample_rate)
         if audio_data.size < min_samples:
             print("[Client] Запись слишком короткая.", flush=True)
@@ -3618,6 +3692,12 @@ class WhisperClientMac:
             with self._lock:
                 self._busy = False
             return
+        if peak < 0.002:
+            _mac_log("warning", "record_silent peak=%.5f device=%r", peak, self._default_input_device_label())
+            mac_banner_notification(
+                "Whisper",
+                "Запись почти пустая — проверь микрофон в «Системные настройки → Звук → Вход».",
+            )
 
         # Цель вставки: frontmost в момент отпускания хоткея (после долгой записи/Groq актуальнее, чем только на старте).
         paste_stop = self._snapshot_frontmost_unix_pid()
