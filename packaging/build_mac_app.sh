@@ -23,7 +23,13 @@ WHISPER_STUB_ARCH_FLAGS="${WHISPER_STUB_ARCH_FLAGS:-$AH_ARCH_FLAGS}"
 
 echo "Сборка $APP … (MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+BUNDLE_ID="$(tr -d ' \n\r' <"$MAC/BUNDLE_ID" 2>/dev/null || echo com.zapnikita95.WhisperClient)"
+BUILD_NUMBER="$(tr -d ' \n\r' <"$MAC/BUILD_NUMBER" 2>/dev/null || echo 1)"
+APP_VERSION="$(tr -d ' \n\r' <"$ROOT/packaging/VERSION" 2>/dev/null || echo 1.0.0)"
 cp -f "$MAC/Info.plist.template" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist" 2>/dev/null || true
 cp -f "$ROOT/whisper-client-mac.py" "$APP/Contents/Resources/"
 cp -f "$ROOT/whisper_groq.py" "$APP/Contents/Resources/"
 cp -f "$ROOT/whisper_vocab.py" "$APP/Contents/Resources/"
@@ -41,8 +47,11 @@ cp -f "$MAC/whisper_mic_capture.py" "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/whisper_mic_capture.py"
 cp -f "$MAC/kill_whisper_client.command" "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/kill_whisper_client.command"
+cp -f "$MAC/BUNDLE_ID" "$APP/Contents/Resources/BUNDLE_ID"
+cp -f "$MAC/testflight/TESTFLIGHT.md" "$APP/Contents/Resources/TESTFLIGHT.md" 2>/dev/null || true
 cp -f "$MAC/reset_whisper_client_privacy.command" "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/reset_whisper_client_privacy.command"
+cp -f "$MAC/build_mas_pkg.sh" "$APP/Contents/Resources/build_mas_pkg.sh" 2>/dev/null || true
 cp -f "$MAC/run.sh" "$APP/Contents/MacOS/run.sh"
 cp -f "$MAC/pick_python_for_whisper.sh" "$APP/Contents/MacOS/pick_python_for_whisper.sh"
 chmod +x "$APP/Contents/MacOS/run.sh"
@@ -108,12 +117,18 @@ find "$APP" -name '*.cstemp*' -delete 2>/dev/null || true
 
 if [ -n "${WHISPER_MAC_CODESIGN_IDENTITY:-}" ]; then
 	echo "Подпись codesign: ${WHISPER_MAC_CODESIGN_IDENTITY}"
+	ENT_DEV="$MAC/entitlements/WhisperClient.DeveloperID.plist"
+	sign_ent=()
+	if [ -f "$ENT_DEV" ]; then
+		sign_ent=(--entitlements "$ENT_DEV")
+	fi
 	if codesign --force --deep --timestamp --options runtime \
+		"${sign_ent[@]}" \
 		--sign "${WHISPER_MAC_CODESIGN_IDENTITY}" "$APP"; then
 		:
 	else
 		echo "Предупреждение: подпись с --options runtime не удалась — пробую без hardened runtime."
-		codesign --force --deep --timestamp --sign "${WHISPER_MAC_CODESIGN_IDENTITY}" "$APP"
+		codesign --force --deep --timestamp "${sign_ent[@]}" --sign "${WHISPER_MAC_CODESIGN_IDENTITY}" "$APP"
 	fi
 else
 	codesign --force --deep --sign - "$APP" 2>/dev/null || true
@@ -129,6 +144,6 @@ echo "ВАЖНО (macOS Privacy): без WHISPER_MAC_CODESIGN_IDENTITY ad-hoc п
 echo "микрофона / мониторинга ввода могут не подходить (в Console: Failed to match … kTCCServiceListenEvent / Microphone)."
 echo "Один раз запусти:  packaging/mac/reset_whisper_client_privacy.command"
 echo "или в Терминале:"
-echo "  tccutil reset Microphone local.whisper.client"
-echo "  tccutil reset ListenEvent local.whisper.client"
+echo "  tccutil reset Microphone ${BUNDLE_ID}"
+echo "  tccutil reset ListenEvent ${BUNDLE_ID}"
 echo "Потом снова открой .app и включи переключатели в Системных настройках."

@@ -350,7 +350,8 @@ def ingest_macos_python_crash_reports_into_log() -> None:
     def _is_whisper_related(snippet: str) -> bool:
         s = snippet.lower()
         return (
-            "local.whisper.client" in snippet
+            "com.zapnikita95.WhisperClient" in snippet
+            or "local.whisper.client" in snippet
             or "whisper-client-mac.py" in snippet
             or "whisperclient.app" in s
             or "/whisper/whisper-client-mac" in s

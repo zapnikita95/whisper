@@ -5,28 +5,34 @@
     <key>CFBundleExecutable</key>
     <string>WhisperClient</string>
     <key>CFBundleIdentifier</key>
-    <string>local.whisper.client</string>
+    <string>com.zapnikita95.WhisperClient</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleName</key>
+    <string>WhisperClient</string>
+    <key>CFBundleDisplayName</key>
     <string>Whisper Client</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.25</string>
+    <string>1.3.0</string>
     <key>CFBundleVersion</key>
-    <string>14</string>
+    <string>15</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
 
     <key>NSMicrophoneUsageDescription</key>
-    <string>Whisper Client использует микрофон для записи голоса.</string>
+    <string>Whisper Client использует микрофон для записи голоса и распознавания речи.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Whisper Client использует Apple Events для вставки текста.</string>
+    <string>Whisper Client вставляет распознанный текст в активное приложение.</string>
     <key>NSUserNotificationsUsageDescription</key>
-    <string>Whisper Client показывает уведомления.</string>
+    <string>Whisper Client показывает статус записи и результат распознавания.</string>
 
     <key>NSAppSleepDisabled</key>
     <true/>
@@ -41,7 +47,6 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 
-    <!-- Не вшивать $HOME/.venv конкретного разработчика — у коллеги путь другой и Finder подмешает мусор в PATH. -->
     <key>LSEnvironment</key>
     <dict>
         <key>PATH</key>
