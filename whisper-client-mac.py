@@ -436,12 +436,24 @@ def _macos_touch_microphone_permission_if_bundle() -> None:
     if not os.environ.get("WHISPER_FROM_APP_BUNDLE"):
         return
     try:
-        with sd.InputStream(
-            samplerate=16000,
-            channels=1,
-            dtype="float32",
-            blocksize=256,
-        ):
+        idx = None
+        try:
+            dev = sd.default.device
+            if hasattr(dev, "__getitem__"):
+                idx = int(dev[0])
+            else:
+                idx = int(dev)
+        except Exception:
+            pass
+        kwargs: dict[str, Any] = {
+            "samplerate": 16000,
+            "channels": 1,
+            "dtype": "float32",
+            "blocksize": 256,
+        }
+        if idx is not None:
+            kwargs["device"] = idx
+        with sd.InputStream(**kwargs):
             pass
     except OSError as e:
         _mac_log(
@@ -2712,6 +2724,7 @@ class WhisperClientMac:
 
     def _drain_main_thread_jobs(self) -> None:
         """Очередь задач для Python main (headless; запасной путь если thunk недоступен)."""
+        self._poll_record_on_main()
         while True:
             try:
                 job = self._main_thread_job_queue.get_nowait()
@@ -2742,8 +2755,9 @@ class WhisperClientMac:
         if self._menu_bar_mode and _WhisperMainJobThunk is not None:
             try:
                 thunk = _WhisperMainJobThunk.alloc().init()
+                wait = fn in (self._start_recording, self._stop_recording_and_process)
                 thunk.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "apply:", {"fn": fn}, False
+                    "apply:", {"fn": fn}, wait
                 )
                 return
             except Exception:
@@ -3519,13 +3533,50 @@ class WhisperClientMac:
             return True
         return False
 
-    def _default_input_device_label(self) -> str:
+    def _resolve_input_device_index(self) -> int | None:
+        """Индекс входа (sounddevice._InputOutputPair не isinstance tuple)."""
         try:
             dev = sd.default.device
-            idx = dev[0] if isinstance(dev, (list, tuple)) else dev
+            if hasattr(dev, "__getitem__"):
+                return int(dev[0])
+            return int(dev)
+        except Exception as e:
+            _mac_log("warning", "resolve_input_device_failed %s", e)
+            return None
+
+    def _default_input_device_label(self) -> str:
+        try:
+            idx = self._resolve_input_device_index()
+            if idx is None:
+                return "default"
             return str(sd.query_devices(idx).get("name", idx))
         except Exception as e:
             return f"? ({e})"
+
+    def _record_max_chunks(self) -> int:
+        max_d = self._effective_max_record_seconds()
+        if max_d <= 0:
+            return 10**12
+        return int(self.sample_rate / 1024 * max_d) + 1
+
+    def _poll_record_on_main(self) -> None:
+        """Чтение с микрофона только на main thread (CoreAudio + menu bar)."""
+        if not self._recording:
+            return
+        stream = self._input_stream
+        if stream is None:
+            return
+        n_done = getattr(self, "_record_chunk_count", 0)
+        if n_done >= self._record_max_chunks():
+            return
+        try:
+            data, overflowed = stream.read(1024)
+            if overflowed:
+                _mac_log("warning", "record_overflow")
+            self._audio_chunks.append(data.tobytes())
+            self._record_chunk_count = n_done + 1
+        except Exception as e:
+            _mac_log("error", "record_poll_error %s", e)
 
     def _open_record_stream_on_main(self) -> bool:
         """InputStream только с main thread — иначе macOS не включает микрофон (-9986, нет индикатора)."""
@@ -3539,18 +3590,24 @@ class WhisperClientMac:
         if sys.platform == "darwin" and not on_main:
             _mac_log("error", "record_stream_open_not_on_main")
             return False
+        idx = self._resolve_input_device_index()
+        kwargs: dict[str, Any] = {
+            "samplerate": self.sample_rate,
+            "channels": self.channels,
+            "dtype": np.float32,
+            "blocksize": 1024,
+        }
+        if idx is not None:
+            kwargs["device"] = idx
         try:
-            stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype=np.float32,
-                blocksize=1024,
-            )
+            stream = sd.InputStream(**kwargs)
             stream.start()
             self._input_stream = stream
+            self._record_chunk_count = 0
             _mac_log(
                 "info",
-                "record_stream_opened device=%r sr=%s",
+                "record_stream_opened device_idx=%s device=%r sr=%s",
+                idx,
                 self._default_input_device_label(),
                 self.sample_rate,
             )
@@ -3620,12 +3677,7 @@ class WhisperClientMac:
                 self._recording = False
             return
 
-        self._record_thread = threading.Thread(
-            target=self._record_worker,
-            name="whisper-record",
-            daemon=True,
-        )
-        self._record_thread.start()
+        self._poll_record_on_main()
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
         threading.Thread(
@@ -3651,16 +3703,31 @@ class WhisperClientMac:
         threading.Thread(target=_beep_async, name="whisper-beep", daemon=True).start()
         print(f"[Запись] Зажато {self._hotkey_label} — говори…", flush=True)
 
+    def _drain_record_stream_on_main(self, extra_reads: int = 8) -> None:
+        stream = self._input_stream
+        if stream is None:
+            return
+        for _ in range(extra_reads):
+            if getattr(self, "_record_chunk_count", 0) >= self._record_max_chunks():
+                break
+            try:
+                data, overflowed = stream.read(1024)
+                if overflowed:
+                    _mac_log("warning", "record_overflow")
+                self._audio_chunks.append(data.tobytes())
+                self._record_chunk_count = getattr(self, "_record_chunk_count", 0) + 1
+            except Exception:
+                break
+
     def _stop_recording_and_process(self) -> None:
         with self._lock:
             if not self._recording:
                 return
+        self._stop_record.set()
+        self._drain_record_stream_on_main(8)
+        with self._lock:
             self._recording = False
             self._busy = True
-        self._stop_record.set()
-        if self._record_thread is not None:
-            self._record_thread.join(timeout=5.0)
-            self._record_thread = None
         self._close_record_stream()
         chunks = self._audio_chunks[:]
         self._audio_chunks.clear()
@@ -5153,6 +5220,53 @@ def _resolve_server_url(cli_server: str | None) -> str | None:
     return _resolve_server_url_tail(cli_server)
 
 
+def _self_test_microphone_main(seconds: float = 2.5) -> int:
+    """Запись с default input на main thread; exit 0 если peak > 0.002."""
+    _macos_touch_microphone_permission_if_bundle()
+    try:
+        dev = sd.default.device
+        idx = int(dev[0]) if hasattr(dev, "__getitem__") else int(dev)
+        name = str(sd.query_devices(idx).get("name", idx))
+    except Exception as e:
+        print(f"self_test_mic FAIL resolve_device: {e}", flush=True)
+        return 1
+    chunks: list[bytes] = []
+    try:
+        with sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            dtype=np.float32,
+            blocksize=1024,
+            device=idx,
+        ) as stream:
+            stream.start()
+            t0 = time.time()
+            while time.time() - t0 < seconds:
+                data, _ = stream.read(1024)
+                chunks.append(data.tobytes())
+    except Exception as e:
+        print(f"self_test_mic FAIL InputStream: {e}", flush=True)
+        _mac_log("error", "self_test_mic_fail %s", e)
+        return 1
+    audio = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    dur = audio.size / 16000.0 if audio.size else 0.0
+    _mac_log(
+        "info",
+        "self_test_mic device_idx=%s name=%r peak=%.5f samples=%s duration=%.2fs",
+        idx,
+        name,
+        peak,
+        audio.size,
+        dur,
+    )
+    print(
+        f"self_test_mic device_idx={idx} device={name!r} peak={peak:.5f} samples={audio.size} duration={dur:.2f}s",
+        flush=True,
+    )
+    return 0 if peak > 0.002 else 1
+
+
 def main() -> int:
     _dotenv_loaded = _load_whisper_mac_env_files()
     log_path = configure_whisper_mac_logging()
@@ -5253,6 +5367,11 @@ def main() -> int:
         "По умолчанию выкл; на macOS может ломать сочетание — не используй без необходимости.",
     )
     p.add_argument(
+        "--self-test-mic",
+        action="store_true",
+        help="Автотест микрофона (2.5 с, peak в stdout); exit 0 если слышно",
+    )
+    p.add_argument(
         "--enroll-speaker",
         metavar="WAV",
         default=None,
@@ -5277,6 +5396,9 @@ def main() -> int:
             "лишние argv (часто от Finder/Cocoa), игнорируем: %r",
             _unknown_argv,
         )
+
+    if args.self_test_mic:
+        return _self_test_microphone_main()
 
     if args.listener_idle_recycle_sec is not None:
         v = float(args.listener_idle_recycle_sec)
