@@ -44,11 +44,27 @@ R="${R//$'\r'/}"
 [ -n "$R" ] || _ah_die_resources "FAIL cd Resources MACOS_DIR=$MACOS_DIR"
 [ -f "$R/whisper-client-mac.py" ] || _ah_die_resources "FAIL missing $R/whisper-client-mac.py"
 
-# Вшитый venv внутри .app — работает из /Applications без репозитория и без глобального pip.
-if [ -x "$R/venv/bin/python3" ]; then
-	export WHISPER_PYTHON3="$R/venv/bin/python3"
+# Вшитый venv — Contents/Frameworks (MAS: WhisperRuntime.framework, DMG: Frameworks/venv).
+FW="$(cd "$MACOS_DIR/../Frameworks" 2>/dev/null && pwd)" || FW=""
+FW="${FW//$'\r'/}"
+_PY=""
+for _c in \
+	"$FW/WhisperRuntime.framework/Resources/venv/bin/python3" \
+	"$FW/venv/bin/python3" \
+	"$R/venv/bin/python3"; do
+	if [ -x "$_c" ]; then
+		_PY="$_c"
+		break
+	fi
+done
+if [ -n "$_PY" ]; then
+	export WHISPER_PYTHON3="$_PY"
 	export WHISPER_MAC_BUNDLED_VENV=1
 	_run_log "bundled venv python=$WHISPER_PYTHON3"
+	if [ -n "$FW" ] && [ -d "$FW/Python.framework/Versions/3.13" ]; then
+		export PYTHONHOME="$FW/Python.framework/Versions/3.13"
+		_run_log "PYTHONHOME=$PYTHONHOME"
+	fi
 fi
 
 # DMG vs локальная сборка (почему «из packaging/mac работает, из /Applications — нет»):

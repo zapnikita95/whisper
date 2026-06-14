@@ -8,7 +8,7 @@ APP="$MAC/WhisperClient.app"
 # запуск этого скрипта (в т.ч. из Cursor) подписывает без ручного export.
 # build_signed_app.sh выставляет WHISPER_CODESIGN_PREPARE_MODE=always — подпись даже без env-файла (GUI-пароль).
 PREP_MODE="${WHISPER_CODESIGN_PREPARE_MODE:-auto}"
-if [ "$PREP_MODE" = "always" ] || [ -f "$MAC/whisper_codesign_local.env" ]; then
+if [ "$PREP_MODE" = "always" ] || { [ "${WHISPER_MAS_BUILD:-}" != "1" ] && [ -f "$MAC/whisper_codesign_local.env" ]; }; then
 	# shellcheck disable=SC1091
 	source "$MAC/whisper_codesign_prepare.sh"
 	echo "Подпись: WHISPER_MAC_CODESIGN_IDENTITY=${WHISPER_MAC_CODESIGN_IDENTITY}"
@@ -22,7 +22,7 @@ AH_ARCH_FLAGS="-arch arm64 -arch x86_64"
 WHISPER_STUB_ARCH_FLAGS="${WHISPER_STUB_ARCH_FLAGS:-$AH_ARCH_FLAGS}"
 
 echo "Сборка $APP … (MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET)"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 BUNDLE_ID="$(tr -d ' \n\r' <"$MAC/BUNDLE_ID" 2>/dev/null || echo com.zapnikita95.WhisperClient)"
 BUILD_NUMBER="$(tr -d ' \n\r' <"$MAC/BUILD_NUMBER" 2>/dev/null || echo 1)"
 APP_VERSION="$(tr -d ' \n\r' <"$ROOT/packaging/VERSION" 2>/dev/null || echo 1.0.0)"
@@ -79,8 +79,9 @@ else
 	echo "Предупреждение: не собран whisper_hotkey_daemon — hotkey через pynput (fallback)."
 fi
 
-# Вшитый venv — .app из /Applications не зависит от репозитория и глобального pip.
-VENV_DIR="$APP/Contents/Resources/venv"
+# Вшитый venv — Mach-O в Contents/Frameworks (не Resources: иначе MAS 90238).
+VENV_DIR="$APP/Contents/Frameworks/venv"
+rm -rf "$APP/Contents/Resources/venv" 2>/dev/null || true
 BUILD_PY="${WHISPER_BUNDLE_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13}"
 if [ "${WHISPER_SKIP_BUNDLE_VENV:-}" != "1" ]; then
 	echo "Вшиваю Python venv в .app (зависимости Mac-клиента)…"
@@ -93,7 +94,11 @@ if [ "${WHISPER_SKIP_BUNDLE_VENV:-}" != "1" ]; then
 	fi
 	if [ "${WHISPER_REFRESH_BUNDLE_VENV:-}" = "1" ] || [ ! -x "$VENV_DIR/bin/python3" ]; then
 		rm -rf "$VENV_DIR"
-		"$BUILD_PY" -m venv "$VENV_DIR"
+		VENV_ARGS=()
+		if [ "${WHISPER_MAS_BUILD:-}" = "1" ]; then
+			VENV_ARGS+=(--copies)
+		fi
+		"$BUILD_PY" -m venv "${VENV_ARGS[@]}" "$VENV_DIR"
 		"$VENV_DIR/bin/python3" -m pip install -U pip wheel
 		"$VENV_DIR/bin/python3" -m pip install -r "$ROOT/packaging/requirements-mac-client.txt"
 		"$VENV_DIR/bin/python3" -m pip uninstall -y typing >/dev/null 2>&1 || true
@@ -115,7 +120,9 @@ fi
 # Прерванный codesign оставляет *.cstemp — без этого следующая подпись падает с «invalid … format».
 find "$APP" -name '*.cstemp*' -delete 2>/dev/null || true
 
-if [ -n "${WHISPER_MAC_CODESIGN_IDENTITY:-}" ]; then
+if [ "${WHISPER_MAS_BUILD:-}" = "1" ]; then
+	echo "MAS build: без codesign (единая подпись через exportArchive)."
+elif [ -n "${WHISPER_MAC_CODESIGN_IDENTITY:-}" ]; then
 	echo "Подпись codesign: ${WHISPER_MAC_CODESIGN_IDENTITY}"
 	ENT_DEV="$MAC/entitlements/WhisperClient.DeveloperID.plist"
 	sign_ent=()

@@ -11,6 +11,7 @@
 assets/волга_files/
 assets/search.json
 .venv/
+packaging/mac/WhisperClient.app/Contents/Frameworks/venv/
 packaging/mac/WhisperClient.app/Contents/Resources/venv/
 __pycache__/
 test_sample.mp3
@@ -27,3 +28,10 @@ assets/AppIcon.iconset/
 # Локальная подпись (личность / эксперименты)
 packaging/mac/whisper_codesign_local.env
 packaging/mac/whisper_notary_local.env
+# MAS/TestFlight артефакты — не в репо
+WhisperClient-mas.pkg
+WhisperClient-macOS.dmg
+*.pkg
+packaging/mac/WhisperClient.app/Contents/Frameworks/WhisperRuntime.framework/
+packaging/mac/WhisperClient.app/Contents/Frameworks/Python.framework/
+packaging/mac/WhisperClient.app/Contents/embedded.provisionprofile

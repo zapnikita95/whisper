@@ -3650,10 +3650,16 @@ class WhisperClientMac:
         if not r:
             return None, None
         cap = os.path.join(r, "whisper_mic_capture.py")
-        for py in (
+        fw = os.path.join(os.path.dirname(r), "Frameworks")
+        py_candidates = (
+            os.path.join(fw, "WhisperRuntime.framework", "Resources", "venv", "bin", "python3.13"),
+            os.path.join(fw, "WhisperRuntime.framework", "Resources", "venv", "bin", "python3"),
+            os.path.join(fw, "venv", "bin", "python3.13"),
+            os.path.join(fw, "venv", "bin", "python3"),
             os.path.join(r, "venv", "bin", "python3.13"),
             os.path.join(r, "venv", "bin", "python3"),
-        ):
+        )
+        for py in py_candidates:
             if os.path.isfile(py) and os.access(py, os.X_OK):
                 return cap if os.path.isfile(cap) else None, py
         return cap if os.path.isfile(cap) else None, None
