@@ -264,18 +264,45 @@ def _run_enroll_speaker_worker(log, notify) -> None:
 
 
 def _load_tray_image():
-    from PIL import Image
+    from PIL import Image, ImageDraw
 
     if getattr(sys, "frozen", False):
         base = Path(sys._MEIPASS) / "assets"
     else:
         base = ROOT / "assets"
-    for name in ("app_icon.ico", "hotkey_icon.ico"):
+    for name in ("hotkey_icon.ico", "app_icon.ico"):
         ico = base / name
         if ico.is_file():
-            return Image.open(ico)
-    img = Image.new("RGB", (64, 64), color=(32, 110, 75))
+            try:
+                img = Image.open(ico).convert("RGBA")
+                return img.resize((64, 64), Image.Resampling.LANCZOS)
+            except OSError:
+                continue
+
+    # Bright fallback — visible in tray overflow (pystray/PIL ICO load often fails in frozen exe).
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((2, 2, 62, 62), fill=(34, 160, 100, 255), outline=(255, 255, 255, 220), width=3)
+    draw.rectangle((28, 18, 36, 34), fill=(255, 255, 255, 255))
+    draw.ellipse((22, 34, 42, 50), fill=(255, 255, 255, 255))
     return img
+
+
+def _is_settings_argv() -> bool:
+    return any(a.lower() in ("--settings", "-s", "/settings") for a in sys.argv[1:])
+
+
+def _show_settings_on_start_pref() -> bool:
+    v = os.environ.get("WHISPER_HOTKEY_NO_SETTINGS_ON_START", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return False
+    return bool(_load_prefs().get("show_settings_on_start", True))
+
+
+def _set_show_settings_on_start(enabled: bool) -> None:
+    p = _load_prefs()
+    p["show_settings_on_start"] = bool(enabled)
+    _save_prefs(p)
 
 
 def _acquire_single_instance() -> bool:
@@ -290,7 +317,84 @@ def _acquire_single_instance() -> bool:
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
+def run_settings_only() -> int:
+    """Start Menu shortcut: settings without tray icon / without blocking main instance."""
+    from whisper_file_log import configure, log_dir
+
+    log = configure("whisper.hotkey", "whisper_hotkey.log")
+    log.info("Whisper Hotkey --settings (standalone)")
+
+    try:
+        from whisper_version import get_version as _ver
+    except ImportError:
+        def _ver() -> str:
+            return "dev"
+
+    hp = _load_prefs()
+
+    def paste(m: str) -> None:
+        p = _load_prefs()
+        p["paste_mode"] = m
+        _save_prefs(p)
+        _notify("Text output", "Restart Whisper Hotkey to apply paste mode.", False, force=True)
+
+    def logs() -> None:
+        d = log_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(d))  # type: ignore[attr-defined]
+        except OSError:
+            subprocess.run(["explorer", str(d)], check=False)
+
+    def tray_menu_hint() -> None:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Groq, models, vocabulary: run Whisper Hotkey from Start menu.\n"
+                "If the tray icon is missing (common when running as Admin), "
+                "use this Settings shortcut anytime.",
+                "Whisper Hotkey",
+                0x40,
+            )
+        except Exception:
+            pass
+
+    from whisper_hotkey_settings_win import launch_settings_window
+
+    launch_settings_window(
+        version=_ver(),
+        paste_mode=str(hp.get("paste_mode", "auto")),
+        show_on_start=_show_settings_on_start_pref(),
+        on_paste_mode=paste,
+        on_history_file=lambda: open_history_file_standalone(),
+        on_logs=logs,
+        on_updates=lambda: _notify("Updates", "Run Whisper Hotkey and use Check for updates.", False, force=True),
+        on_quit=lambda: None,
+        on_show_tray_menu=tray_menu_hint,
+        on_toggle_show_on_start=_set_show_settings_on_start,
+        standalone=True,
+        blocking=True,
+    )
+    return 0
+
+
+def open_history_file_standalone() -> None:
+    try:
+        from whisper_hotkey_history import HISTORY_PATH
+
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not HISTORY_PATH.is_file():
+            HISTORY_PATH.write_text("[]", encoding="utf-8")
+        os.startfile(str(HISTORY_PATH))  # type: ignore[attr-defined]
+    except Exception as e:
+        _notify("History", str(e)[:200], True)
+
+
 def main() -> int:
+    if _is_settings_argv():
+        return run_settings_only()
     if not _acquire_single_instance():
         try:
             import ctypes
@@ -342,7 +446,7 @@ def main() -> int:
         else:
             _notify(
                 "Whisper Hotkey",
-                f"Running (v{_ver()}). Click tray icon for Settings & History. Ctrl+Win = record.",
+                f"Running as Admin (v{_ver()}). Tray icon may be hidden — settings window will open.",
                 False,
                 force=True,
             )
@@ -464,12 +568,14 @@ def main() -> int:
         launch_settings_window(
             version=_ver(),
             paste_mode=str(hp.get("paste_mode", "auto")),
+            show_on_start=_show_settings_on_start_pref(),
             on_paste_mode=lambda m: set_paste_mode(icon, m),
             on_history_file=lambda: open_history_file(icon, None),
             on_logs=lambda: open_log_folder(icon, None),
             on_updates=lambda: hotkey_check_for_updates(icon, None),
             on_quit=lambda: on_quit(icon, None),
             on_show_tray_menu=lambda: threading.Thread(target=icon._menu, daemon=True).start(),
+            on_toggle_show_on_start=_set_show_settings_on_start,
         )
 
     def show_tray_menu(icon: pystray.Icon, item: object = None) -> None:
@@ -1159,9 +1265,23 @@ def main() -> int:
     )
 
     def on_ready(ic: pystray.Icon) -> None:
+        try:
+            ic.visible = True
+            log.info("Tray icon visible=True")
+        except Exception:
+            log.exception("Tray icon visible failed")
         threading.Thread(target=run_hotkey, name="whisper-hotkey", daemon=True).start()
+        if not silent_start and _show_settings_on_start_pref():
+            threading.Timer(1.2, lambda: open_settings_ui(ic)).start()
 
-    icon.run(setup=on_ready)
+    try:
+        icon.run(setup=on_ready)
+    except Exception:
+        log.exception("pystray icon.run failed — starting hotkey without tray")
+        threading.Thread(target=run_hotkey, name="whisper-hotkey", daemon=True).start()
+        if not silent_start:
+            threading.Timer(1.0, lambda: open_settings_ui(icon)).start()
+        return 0
     return 0
 
 

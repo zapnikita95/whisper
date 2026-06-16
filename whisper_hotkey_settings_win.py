@@ -1,4 +1,4 @@
-"""Tk settings window for Whisper Hotkey (left-click tray icon — like Mac menu bar)."""
+"""Tk settings window for Whisper Hotkey — no tray icon required."""
 from __future__ import annotations
 
 import threading
@@ -10,27 +10,22 @@ _window_lock = threading.Lock()
 _window_thread: threading.Thread | None = None
 
 
-def _run_in_thread(fn: Callable[[], None]) -> None:
-    threading.Thread(target=fn, name="whisper-hotkey-ui", daemon=True).start()
-
-
 def launch_settings_window(
     *,
     version: str,
     paste_mode: str,
+    show_on_start: bool,
     on_paste_mode: Callable[[str], None],
     on_history_file: Callable[[], None],
     on_logs: Callable[[], None],
     on_updates: Callable[[], None],
     on_quit: Callable[[], None],
     on_show_tray_menu: Callable[[], None],
+    on_toggle_show_on_start: Callable[[bool], None] | None = None,
+    standalone: bool = False,
+    blocking: bool = False,
 ) -> None:
-    """Open settings UI in a background thread (safe from pystray)."""
-    global _window_thread
-    with _window_lock:
-        if _window_thread is not None and _window_thread.is_alive():
-            # Second click: poke existing window via a one-shot flag is hard; open another Toplevel is ok.
-            pass
+    """Open settings UI. Use blocking=True for --settings (no tray process)."""
 
     def worker() -> None:
         global _window_thread
@@ -38,14 +33,10 @@ def launch_settings_window(
             from whisper_hotkey_history import load_history, preview_title
 
             root = tk.Tk()
-            root.title(f"Whisper Hotkey — settings")
-            root.geometry("480x620")
-            root.minsize(420, 520)
+            root.title("Whisper Hotkey — settings")
+            root.geometry("500x640")
+            root.minsize(440, 540)
 
-            try:
-                root.iconbitmap(default="")  # avoid default python icon if possible
-            except tk.TclError:
-                pass
             try:
                 root.attributes("-topmost", True)
             except tk.TclError:
@@ -59,7 +50,15 @@ def launch_settings_window(
                 frm,
                 text=f"v{version}  ·  Hold Ctrl+Win to record",
                 foreground="#444",
-            ).pack(anchor=tk.W, pady=(2, 10))
+            ).pack(anchor=tk.W, pady=(2, 6))
+
+            ttk.Label(
+                frm,
+                text="Settings live here (and in Start → Whisper Hotkey Settings). "
+                "Tray icon may be hidden when running as Administrator.",
+                foreground="#666",
+                wraplength=460,
+            ).pack(anchor=tk.W, pady=(0, 10))
 
             ttk.Label(
                 frm,
@@ -80,6 +79,18 @@ def launch_settings_window(
                     anchor=tk.W, pady=1
                 )
 
+            if on_toggle_show_on_start is not None:
+                show_var = tk.BooleanVar(value=show_on_start)
+                def _toggle_show() -> None:
+                    on_toggle_show_on_start(bool(show_var.get()))
+
+                ttk.Checkbutton(
+                    frm,
+                    text="Open this window when Whisper Hotkey starts",
+                    variable=show_var,
+                    command=_toggle_show,
+                ).pack(anchor=tk.W, pady=(8, 0))
+
             ttk.Separator(frm, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
             btn_row = ttk.Frame(frm)
@@ -95,7 +106,6 @@ def launch_settings_window(
             )
             hist = scrolledtext.ScrolledText(frm, height=10, wrap=tk.WORD, font=("Segoe UI", 9))
             hist.pack(fill=tk.BOTH, expand=True)
-            hist.configure(state=tk.NORMAL)
             entries = load_history(limit=25)
             if entries:
                 for e in entries:
@@ -128,23 +138,31 @@ def launch_settings_window(
                 text="More: Groq, models, vocabulary, voice profile…",
                 command=lambda: on_show_tray_menu(),
             ).pack(fill=tk.X, pady=2)
-            ttk.Label(
-                frm,
-                text="Right-click the tray icon for the full menu (same as Mac menubar).",
-                foreground="#666",
-                wraplength=440,
-            ).pack(anchor=tk.W, pady=(8, 0))
 
             quit_row = ttk.Frame(frm)
             quit_row.pack(fill=tk.X, pady=(14, 0))
-            ttk.Button(quit_row, text="Quit Whisper Hotkey", command=lambda: on_quit()).pack(side=tk.RIGHT)
+            quit_label = "Close" if standalone else "Quit Whisper Hotkey"
+            ttk.Button(quit_row, text=quit_label, command=lambda: on_quit()).pack(side=tk.RIGHT)
 
-            root.protocol("WM_DELETE_WINDOW", root.destroy)
+            def _close() -> None:
+                on_quit()
+                try:
+                    root.destroy()
+                except tk.TclError:
+                    pass
+
+            root.protocol("WM_DELETE_WINDOW", _close)
             root.mainloop()
         finally:
             with _window_lock:
                 _window_thread = None
 
+    if blocking:
+        worker()
+        return
+
     with _window_lock:
+        if _window_thread is not None and _window_thread.is_alive():
+            pass
         _window_thread = threading.Thread(target=worker, name="whisper-settings-win", daemon=True)
         _window_thread.start()
