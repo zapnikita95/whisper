@@ -3,7 +3,7 @@
 
 #define MyAppName "Whisper Hotkey"
 #ifndef MyAppVersion
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.2.17"
 #endif
 #define MyAppPublisher "Whisper"
 #define MyAppExeName "WhisperHotkey.exe"
@@ -14,6 +14,7 @@ AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+SetupIconFile=..\..\assets\app_icon.ico
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=..\..\dist\release

@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_all
 
 _pylib = Path(sysconfig.get_paths()["purelib"])
 datas = [("packaging\\VERSION", "packaging")]
-_icon = Path("assets/server_icon.ico")
+_icon = Path("assets/app_icon.ico")
 if _icon.is_file():
     datas.append((str(_icon), "assets"))
 
@@ -21,6 +21,9 @@ binaries: list = []
 hiddenimports = [
     "whisper_server",
     "whisper_models",
+    "whisper_model_hub",
+    "whisper_system_profile",
+    "whisper_server_gui_models_tab",
     "whisper_file_log",
     "whisper_nvidia_path",
     "faster_whisper",

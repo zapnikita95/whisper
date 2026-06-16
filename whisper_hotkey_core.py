@@ -215,6 +215,38 @@ def _filter_hallucinations(text: str) -> str:
     return text
 
 
+def _collapse_exact_duplicate(text: str) -> str:
+    """Whisper и двойной paste иногда дают один и тот же абзац два раза подряд."""
+    t = text.strip()
+    if len(t) < 2:
+        return t
+    n = len(t)
+    if n % 2 == 0 and t[: n // 2] == t[n // 2 :]:
+        return t[: n // 2].strip()
+    # Повтор блока без пробела между копиями: «…подставляются.Так, это…»
+    half = n // 2
+    for shift in range(-3, 4):
+        cut = half + shift
+        if cut <= 0 or cut >= n:
+            continue
+        if t[:cut] == t[cut:]:
+            return t[:cut].strip()
+    return t
+
+
+def _join_segment_texts(segments) -> str:
+    parts: list[str] = []
+    for seg in segments:
+        piece = seg.text.strip()
+        if not piece:
+            continue
+        if parts and piece == parts[-1]:
+            continue
+        parts.append(piece)
+    joined = " ".join(parts).strip()
+    return _collapse_exact_duplicate(_filter_hallucinations(joined))
+
+
 def _win32_paste_once() -> None:
     """Один Ctrl+V через user32.keybd_event — без дублей от библиотеки keyboard."""
     VK_CONTROL = 0x11
@@ -260,6 +292,8 @@ class WhisperHotkey:
 
         speaker_threshold: float | None = None,
 
+        paste_mode: str = "auto",
+
     ):
 
         self.model_name = model
@@ -304,11 +338,17 @@ class WhisperHotkey:
 
         self._insert_lock = threading.Lock()
 
+        self._last_insert_text = ""
+
+        self._last_insert_mono = 0.0
+
         self._mic_fail_toast_ok = True
 
         self._speaker_verify = speaker_verify
 
         self._speaker_threshold = speaker_threshold
+
+        self._paste_mode = paste_mode if paste_mode in ("auto", "clipboard", "history_only") else "auto"
 
         self._transcribe_timeout_sec = _transcribe_timeout_sec_default()
 
@@ -1083,6 +1123,16 @@ class WhisperHotkey:
 
                     if text and not self._cancel_processing.is_set():
 
+                        orig_len = len(text)
+
+                        text = _collapse_exact_duplicate(text.strip())
+
+                        if len(text) != orig_len:
+
+                            log.info("transcribe_deduped chars %d -> %d", orig_len, len(text))
+
+                        log.info("transcribe_ok chars=%d preview=%r", len(text), text[:120])
+
                         self._insert_text(text)
 
                         preview = (text[:220] + "…") if len(text) > 220 else text
@@ -1171,21 +1221,14 @@ class WhisperHotkey:
                 _kwargs: dict[str, Any] = {
                     "language": self.language,
                     "beam_size": 5,
+                    "condition_on_previous_text": False,
                 }
                 ip = (initial_prompt or "").strip()
                 if ip:
                     _kwargs["initial_prompt"] = ip
                 segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
-                # Собираем ВСЕ сегменты (генератор нужно полностью прочитать)
-                text_parts = []
-                for seg in segments:
-                    text = seg.text.strip()
-                    if text:
-                        text_parts.append(text)
-
-                result = " ".join(text_parts).strip()
-                result = _filter_hallucinations(result)
+                result = _join_segment_texts(segments)
 
                 if info.language:
 
@@ -1213,17 +1256,54 @@ class WhisperHotkey:
 
         if not text:
 
-            print("[Whisper] Пустой текст, пропуск.", flush=True)
+            print("[Whisper] Empty text, skipping.", flush=True)
+
+            return
+
+        text = _collapse_exact_duplicate(text.strip())
+
+        try:
+            from whisper_hotkey_history import append_history
+
+            append_history(text)
+        except Exception:
+            log.debug("history append failed", exc_info=True)
+
+        mode = self._paste_mode
+        if mode == "history_only":
+            print("[Whisper] paste_mode=history_only — saved to history only.", flush=True)
+            log.info("paste_mode=history_only chars=%d", len(text))
+            return
+
+        now = time.monotonic()
+
+        if text == self._last_insert_text and now - self._last_insert_mono < 5.0:
+
+            log.warning(
+
+                "insert_skipped duplicate paste (%.1f s since last)",
+
+                now - self._last_insert_mono,
+
+            )
 
             return
 
         with self._insert_lock:
 
-            print(f"[Whisper] Вставляю текст ({len(text)} символов): {text}", flush=True)
+            print(f"[Whisper] Output text ({len(text)} chars): {text}", flush=True)
+
+            log.info("insert_text chars=%d mode=%s", len(text), mode)
 
             pyperclip.copy(text)
 
-            time.sleep(0.25)  # буфер обмена должен успеть обновиться
+            if mode == "clipboard":
+                print("[Whisper] paste_mode=clipboard — copied to clipboard only.", flush=True)
+                self._last_insert_text = text
+                self._last_insert_mono = time.monotonic()
+                return
+
+            time.sleep(0.25)
 
             try:
 
@@ -1242,13 +1322,16 @@ class WhisperHotkey:
 
                 time.sleep(0.05)
 
-                print("[Whisper] Текст вставлен.", flush=True)
+                print("[Whisper] Text pasted.", flush=True)
+
+                self._last_insert_text = text
+
+                self._last_insert_mono = time.monotonic()
 
             except Exception:
-                print("[Whisper] Вставка не удалась, текст в буфере обмена.", flush=True)
-                print("[Whisper] Нажми Ctrl+V вручную.", flush=True)
-                log.warning("Вставка через Ctrl+V не удалась")
-                self._emit_toast("Вставка текста", "Ctrl+V не сработал — вставь вручную из буфера.", True)
+                print("[Whisper] Paste failed — text is in the clipboard.", flush=True)
+                log.warning("Ctrl+V paste failed")
+                self._emit_toast("Paste text", "Ctrl+V failed — paste manually from clipboard.", True)
 
 
 
