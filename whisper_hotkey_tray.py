@@ -342,7 +342,7 @@ def main() -> int:
         else:
             _notify(
                 "Whisper Hotkey",
-                f"Running in background (v{_ver()}). Ctrl+Win — record.",
+                f"Running (v{_ver()}). Click tray icon for Settings & History. Ctrl+Win = record.",
                 False,
                 force=True,
             )
@@ -455,6 +455,25 @@ def main() -> int:
         log.info("Выход по команде трея")
         icon.stop()
         os._exit(0)
+
+    def open_settings_ui(icon: pystray.Icon, item: object = None) -> None:
+        """Left-click tray icon (default action) — Mac-like settings window."""
+        from whisper_hotkey_settings_win import launch_settings_window
+
+        hp = _load_prefs()
+        launch_settings_window(
+            version=_ver(),
+            paste_mode=str(hp.get("paste_mode", "auto")),
+            on_paste_mode=lambda m: set_paste_mode(icon, m),
+            on_history_file=lambda: open_history_file(icon, None),
+            on_logs=lambda: open_log_folder(icon, None),
+            on_updates=lambda: hotkey_check_for_updates(icon, None),
+            on_quit=lambda: on_quit(icon, None),
+            on_show_tray_menu=lambda: threading.Thread(target=icon._menu, daemon=True).start(),
+        )
+
+    def show_tray_menu(icon: pystray.Icon, item: object = None) -> None:
+        threading.Thread(target=icon._menu, daemon=True).start()
 
     def model_submenu():
         items = []
@@ -1110,7 +1129,9 @@ def main() -> int:
         return f"Text output: {labels.get(pm, pm)} (restart)"
 
     menu = pystray.Menu(
+        Item("Open settings…", open_settings_ui, default=True),
         Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
+        Item("Tray menu (Groq, models…)…", show_tray_menu),
         Item(notif_label, toggle_notifications),
         Item(spk_label, toggle_speaker_verify),
         Item("Record voice profile (~45 s)…", start_enroll_speaker),
@@ -1133,7 +1154,7 @@ def main() -> int:
     icon = pystray.Icon(
         "whisper_hotkey",
         image,
-        "Whisper Hotkey — Ctrl+Win",
+        "Whisper Hotkey — click icon for settings · Ctrl+Win record",
         menu,
     )
 

@@ -62,6 +62,7 @@ jobs:
             "${ICON_ARGS[@]}" \
             --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray \
             --hidden-import whisper_hotkey_history \
+            --hidden-import whisper_hotkey_settings_win \
             --hidden-import whisper_groq --hidden-import whisper_vocab --hidden-import whisper_update_check \
             --hidden-import whisper_models --hidden-import whisper_model_hub --hidden-import whisper_system_profile \
             --hidden-import whisper_file_log \
