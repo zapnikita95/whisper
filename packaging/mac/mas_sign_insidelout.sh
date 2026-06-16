@@ -33,10 +33,16 @@ IDENT="${WHISPER_MAS_SIGN_IDENTITY:-$(_pick_identity || true)}"
 }
 echo "MAS inside-out sign: $IDENT"
 
-# .so/.dylib только в WhisperRuntime (venv); stdlib Python.framework подпишет exportArchive
-while IFS= read -r -d '' _f; do
-	codesign --force --sign "$IDENT" --options runtime --timestamp "$_f"
-done < <(find "$FW" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 2>/dev/null)
+_sign_nested_so() {
+	local root="$1"
+	[ -d "$root" ] || return 0
+	find "$root" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 2>/dev/null | \
+		xargs -0 -P 8 -I {} codesign --force --sign "$IDENT" --options runtime "{}"
+}
+
+# .so/.dylib в WhisperRuntime (venv) и lib-dynload (stdlib) — до обёртки Python.framework.
+_sign_nested_so "$FW"
+_sign_nested_so "$APP/Contents/Frameworks/Python.framework/Versions/3.13/lib/python3.13/lib-dynload"
 
 PYBIN="$APP/Contents/Frameworks/Python.framework/Versions/3.13/Python"
 PYFW_BIN="$APP/Contents/Frameworks/Python.framework/Versions/3.13/bin"
@@ -58,16 +64,15 @@ done
 	codesign --force --sign "$IDENT" --options runtime --timestamp \
 	--identifier "$PYFW_ID" --entitlements "$ENT_HELPER" "$APP/Contents/Frameworks/Python.framework"
 
-for _py in python3.13 python3 python; do
-	_f="$FW/Resources/venv/bin/$_py"
-	[ -f "$_f" ] && _is_macho "$_f" && \
-		codesign --force --sign "$IDENT" --options runtime --timestamp \
-			--identifier "${BUNDLE_ID}.python" --entitlements "$ENT_HELPER" "$_f"
-done
+# whisper_python — Mach-O без sandbox (не в списке 409; наследует контейнер .app).
+WP="$APP/Contents/MacOS/whisper_python"
+[ -f "$WP" ] && _is_macho "$WP" && \
+	codesign --force --sign "$IDENT" --options runtime --timestamp \
+		--identifier "${BUNDLE_ID}.python" "$WP"
 
-codesign --force --sign "$IDENT" --options runtime --timestamp \
-	--identifier "$RUNTIME_ID" --entitlements "$ENT_HELPER" "$FW/WhisperRuntime"
-codesign --force --sign "$IDENT" --options runtime --timestamp \
+# venv/bin/* и WhisperRuntime — shell, не подписывать с sandbox (409: не Mach-O).
+# Печать framework — sandbox на обёртку (Info.plist есть).
+[ -d "$FW" ] && codesign --force --sign "$IDENT" --options runtime --timestamp \
 	--identifier "$RUNTIME_ID" --entitlements "$ENT_HELPER" "$FW"
 
 for _b in whisper_hotkey_daemon whisper_notify; do

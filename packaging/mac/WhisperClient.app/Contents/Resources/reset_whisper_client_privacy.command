@@ -1,18 +1,21 @@
 #!/bin/bash
-# После packaging/build_mac_app.sh с ad-hoc codesign подпись .app меняется → TCC не совпадает со старыми
-# разрешениями (в логах: Failed to match existing code requirement … kTCCServiceMicrophone).
-# Запусти этот скрипт и снова выдай микрофон / мониторинг ввода для Whisper Client.
+# После смены подписи / bundle ID сброс TCC (микрофон, мониторинг ввода).
 set -euo pipefail
-cd "$(dirname "$0")" || exit 1
-BID="local.whisper.client"
-echo "Сброс разрешений для $BID …"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/BUNDLE_ID" ]; then
+	BID="$(tr -d ' \n\r' <"$SCRIPT_DIR/BUNDLE_ID")"
+elif [ -f "$SCRIPT_DIR/../Info.plist" ]; then
+	BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SCRIPT_DIR/../Info.plist" 2>/dev/null || true)"
+fi
+BID="${BID:-com.zapnikita95.WhisperClient}"
+echo "Bundle ID: $BID"
 for svc in Microphone ListenEvent Accessibility AppleEvents; do
 	if tccutil reset "$svc" "$BID" 2>/dev/null; then
-		echo "  OK: $svc"
+		echo "  tccutil reset $svc $BID — OK"
 	else
-		echo "  (пропуск или нет записей: $svc)"
+		echo "  tccutil reset $svc $BID — пропуск (нужен Full Disk Access для Terminal?)"
 	fi
 done
 echo ""
 echo "Теперь запусти WhisperClient.app заново и включи переключатели в «Конфиденциальность и безопасность»."
-read -r -p "Enter — закрыть " _
+echo "Старые записи local.whisper.client и Python можно удалить из списков вручную."

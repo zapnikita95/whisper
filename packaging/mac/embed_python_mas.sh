@@ -37,6 +37,11 @@ rsync -a \
 	--exclude='config-3.13-darwin' \
 	"$SRC/lib/python3.13/" "$DEST/lib/python3.13/"
 
+# Тестовые C-расширения stdlib не нужны в MAS и раздувают 90238.
+find "$DEST/lib/python3.13/lib-dynload" -type f \( \
+	-name '*test*.so' -o -name 'xxlimited*.so' -o -name 'xxsubtype*.so' \
+\) -delete 2>/dev/null || true
+
 mkdir -p "$DEST_FW/Versions"
 ln -sf "3.13" "$DEST_FW/Versions/Current"
 ln -sf "Versions/Current/Python" "$DEST_FW/Python"
