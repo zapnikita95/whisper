@@ -141,6 +141,7 @@ except ImportError:
 try:
     from whisper_groq import (
         post_groq_audio_transcription,
+        resolve_auto_vram_backend_order,
         resolve_groq_api_key,
         resolve_transcribe_backend_mode,
         transcribe_backend_order,
@@ -775,6 +776,7 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 "groq",
                 "server_then_groq",
                 "groq_then_server",
+                "auto_vram",
             ):
                 continue
             if k == "groq_api_key":
@@ -2357,7 +2359,12 @@ class WhisperClientMac:
         )
 
     def _effective_transcribe_backend_order(self) -> list[str]:
-        return transcribe_backend_order(self._effective_transcribe_backend_mode())
+        mode = self._effective_transcribe_backend_mode()
+        if mode == "auto_vram":
+            return resolve_auto_vram_backend_order(
+                log_info=lambda *a, **k: _mac_log("info", *a, **k),
+            )
+        return transcribe_backend_order(mode)
 
     def _server_health_check_or_raise(self) -> None:
         if self._effective_skip_health_check():
@@ -4595,6 +4602,7 @@ if rumps is not None:
         def _transcribe_backend_submenu_items(self) -> list:
             cur = self.client._effective_transcribe_backend_mode()
             specs = [
+                ("auto_vram", "Авто: GPU если хватает VRAM, иначе Groq"),
                 ("server", "Только мой сервер"),
                 ("groq", "Только Groq (large v3)"),
                 ("server_then_groq", "Сервер → Groq"),

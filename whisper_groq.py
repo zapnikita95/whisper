@@ -17,7 +17,9 @@ FALLBACK_GROQ_MODEL = "whisper-large-v3-turbo"
 # WHISPER_GROQ_PROXY_URL=https://xxx.up.railway.app
 # WHISPER_GROQ_PROXY_SECRET=… (если на прокси задан PROXY_SHARED_SECRET)
 
-ALLOWED_TRANSCRIBE_MODES = frozenset({"server", "groq", "server_then_groq", "groq_then_server"})
+ALLOWED_TRANSCRIBE_MODES = frozenset(
+    {"server", "groq", "server_then_groq", "groq_then_server", "auto_vram"}
+)
 
 
 def _clean_groq_key(raw: str | None) -> str | None:
@@ -156,9 +158,34 @@ def load_whisper_dotenv_files() -> list[Path]:
 
 
 def hotkey_prefs_path() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "whisper_hotkey_prefs.json"
-    return Path(__file__).resolve().parent / "whisper_hotkey_prefs.json"
+    try:
+        from whisper_file_log import user_data_dir
+
+        return user_data_dir("WhisperHotkey") / "whisper_hotkey_prefs.json"
+    except ImportError:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "whisper_hotkey_prefs.json"
+        return Path(__file__).resolve().parent / "whisper_hotkey_prefs.json"
+
+
+def load_hotkey_prefs() -> dict:
+    p = hotkey_prefs_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def save_hotkey_prefs(data: dict) -> None:
+    p = hotkey_prefs_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def read_hotkey_groq_proxy_url_pref() -> str | None:
@@ -226,17 +253,91 @@ def read_hotkey_groq_api_key_pref() -> str | None:
 
 
 def read_hotkey_transcribe_backend_pref() -> str | None:
-    p = hotkey_prefs_path()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(data, dict):
-        return None
+    data = load_hotkey_prefs()
     v = data.get("transcribe_backend")
     if isinstance(v, str) and v.strip():
         return v.strip()
     return None
+
+
+def read_hotkey_model_key_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("model_key")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
+
+
+def read_hotkey_auto_vram_margin_pref() -> float | None:
+    data = load_hotkey_prefs()
+    v = data.get("auto_vram_margin_gb")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def groq_is_configured() -> bool:
+    if groq_api_key_from_env() or read_hotkey_groq_api_key_pref():
+        return True
+    proxy_enabled = read_hotkey_groq_proxy_enabled_pref()
+    if proxy_enabled is False:
+        return False
+    return bool(resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()))
+
+
+def resolve_auto_vram_backend_order(
+    model_key: str | None = None,
+    *,
+    margin_gb: float | None = None,
+    log_info: Callable[..., None] | None = None,
+) -> list[str]:
+    """Перед каждой расшифровкой: достаточно свободной VRAM → локально, иначе Groq."""
+    from whisper_models import SPEC_BY_KEY
+    from whisper_system_profile import nvidia_free_vram_gb, nvidia_vram_snapshot
+
+    key = (model_key or read_hotkey_model_key_pref() or "large-v3").strip() or "large-v3"
+    spec = SPEC_BY_KEY.get(key) or SPEC_BY_KEY["large-v3"]
+    margin = margin_gb
+    if margin is None:
+        margin = read_hotkey_auto_vram_margin_pref()
+    if margin is None:
+        raw = (os.environ.get("WHISPER_AUTO_VRAM_MARGIN_GB") or "0.8").strip()
+        try:
+            margin = float(raw)
+        except ValueError:
+            margin = 0.8
+    needed = max(0.5, spec.min_vram_gb + margin)
+    snap = nvidia_vram_snapshot()
+    free = snap.get("vram_free_gb")
+    if free is not None and float(free) >= needed:
+        if log_info:
+            log_info(
+                "auto_vram local model=%s free=%.2f needed=%.2f",
+                key,
+                float(free),
+                needed,
+            )
+        return ["server"]
+    if groq_is_configured():
+        if log_info:
+            log_info(
+                "auto_vram groq model=%s free=%s needed=%.2f",
+                key,
+                free,
+                needed,
+            )
+        return ["groq"]
+    if log_info:
+        log_info(
+            "auto_vram fallback_local model=%s free=%s needed=%.2f groq_unconfigured",
+            key,
+            free,
+            needed,
+        )
+    return ["server"]
 
 
 def resolve_transcribe_backend_mode(pref: str | None, *env_names: str) -> str:
@@ -259,13 +360,18 @@ def transcribe_backend_order(mode: str) -> list[str]:
     return ["groq", "server"]
 
 
-def hotkey_transcribe_backend_order() -> list[str]:
+def hotkey_transcribe_backend_order(
+    *,
+    log_info: Callable[..., None] | None = None,
+) -> list[str]:
     pref = read_hotkey_transcribe_backend_pref()
     mode = resolve_transcribe_backend_mode(
         pref,
         "WHISPER_TRANSCRIBE_BACKEND",
         "WHISPER_MAC_TRANSCRIBE_BACKEND",
     )
+    if mode == "auto_vram":
+        return resolve_auto_vram_backend_order(log_info=log_info)
     return transcribe_backend_order(mode)
 
 

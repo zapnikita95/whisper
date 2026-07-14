@@ -945,7 +945,7 @@ class WhisperHotkey:
 
                 from whisper_groq import hotkey_transcribe_backend_order
 
-                order = hotkey_transcribe_backend_order()
+                order = hotkey_transcribe_backend_order(log_info=log.info)
 
                 log.info("transcribe route=%s", order)
 

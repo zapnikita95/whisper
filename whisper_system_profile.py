@@ -72,28 +72,56 @@ def _ram_gb() -> float:
         return 8.0
 
 
-def _nvidia_gpu() -> tuple[bool, str | None, float | None]:
+def _nvidia_smi_first_gpu(query: str) -> str | None:
     try:
         r = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=8,
         )
         if r.returncode != 0 or not (r.stdout or "").strip():
-            return False, None, None
-        line = (r.stdout or "").strip().splitlines()[0]
-        parts = [p.strip() for p in line.split(",")]
-        name = parts[0] if parts else None
-        vram_mb = float(parts[1]) if len(parts) > 1 else None
-        vram_gb = round(vram_mb / 1024, 1) if vram_mb is not None else None
-        return True, name, vram_gb
+            return None
+        return (r.stdout or "").strip().splitlines()[0].strip()
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def _nvidia_gpu() -> tuple[bool, str | None, float | None]:
+    line = _nvidia_smi_first_gpu("name,memory.total")
+    if not line:
         return False, None, None
+    parts = [p.strip() for p in line.split(",")]
+    name = parts[0] if parts else None
+    try:
+        vram_mb = float(parts[1]) if len(parts) > 1 else None
+    except ValueError:
+        vram_mb = None
+    vram_gb = round(vram_mb / 1024, 1) if vram_mb is not None else None
+    return True, name, vram_gb
+
+
+def nvidia_free_vram_gb() -> float | None:
+    """Свободная VRAM первой NVIDIA GPU (ГБ), или None если nvidia-smi недоступен."""
+    raw = _nvidia_smi_first_gpu("memory.free")
+    if raw is None:
+        return None
+    try:
+        return round(float(raw) / 1024, 2)
+    except ValueError:
+        return None
+
+
+def nvidia_vram_snapshot() -> dict[str, Any]:
+    """Имя GPU, всего и свободно VRAM — для UI и авто-режима."""
+    has_gpu, name, total_gb = _nvidia_gpu()
+    free_gb = nvidia_free_vram_gb() if has_gpu else None
+    return {
+        "has_nvidia_gpu": has_gpu,
+        "gpu_name": name,
+        "vram_total_gb": total_gb,
+        "vram_free_gb": free_gb,
+    }
 
 
 def _cuda_available() -> bool:

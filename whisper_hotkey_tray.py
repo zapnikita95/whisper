@@ -43,9 +43,10 @@ except ImportError:
     pass
 
 from whisper_file_log import user_data_dir
+from whisper_groq import hotkey_prefs_path, load_hotkey_prefs, save_hotkey_prefs
 
 USER_DATA = user_data_dir("WhisperHotkey")
-PREFS_PATH = USER_DATA / "whisper_hotkey_prefs.json"
+PREFS_PATH = hotkey_prefs_path()
 OLD_PREFS = ROOT / "whisper_hotkey_gui_prefs.json"
 LEGACY_PREFS = ROOT / "whisper_hotkey_prefs.json"
 
@@ -74,15 +75,14 @@ _migrate_legacy_prefs()
 
 
 def _load_prefs() -> dict:
-    try:
-        return json.loads(PREFS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
+    data = load_hotkey_prefs()
+    if data:
+        return data
     try:
         if OLD_PREFS.is_file():
-            data = json.loads(OLD_PREFS.read_text(encoding="utf-8"))
+            legacy = json.loads(OLD_PREFS.read_text(encoding="utf-8"))
             merged = {
-                "model_key": data.get("model_key", "large-v3"),
+                "model_key": legacy.get("model_key", "large-v3"),
                 "notifications": True,
                 "speaker_verify": False,
             }
@@ -90,15 +90,18 @@ def _load_prefs() -> dict:
             return merged
     except (OSError, json.JSONDecodeError, TypeError):
         pass
-    return {"model_key": "large-v3", "notifications": True, "speaker_verify": False, "paste_mode": "auto"}
+    return {
+        "model_key": "large-v3",
+        "notifications": True,
+        "speaker_verify": False,
+        "paste_mode": "auto",
+        "transcribe_backend": "auto_vram",
+    }
 
 
 def _save_prefs(data: dict) -> None:
-    try:
-        _ensure_user_data_dir()
-        PREFS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    _ensure_user_data_dir()
+    save_hotkey_prefs(data)
 
 
 def _notifications_enabled() -> bool:
@@ -576,6 +579,7 @@ def main() -> int:
             on_quit=lambda: on_quit(icon, None),
             on_show_tray_menu=lambda: threading.Thread(target=icon._menu, daemon=True).start(),
             on_toggle_show_on_start=_set_show_settings_on_start,
+            on_prefs_saved=lambda: icon.update_menu(),
         )
 
     def show_tray_menu(icon: pystray.Icon, item: object = None) -> None:
@@ -1199,6 +1203,7 @@ def main() -> int:
             "WHISPER_MAC_TRANSCRIBE_BACKEND",
         )
         specs = [
+            ("auto_vram", "Auto: GPU if VRAM free, else Groq"),
             ("server", "Local GPU only"),
             ("groq", "Groq only (large v3)"),
             ("server_then_groq", "GPU → Groq"),
