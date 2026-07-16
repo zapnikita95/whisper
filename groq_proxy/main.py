@@ -44,19 +44,22 @@ def transcribe(
     authorization: str | None = Header(default=None),
     x_whisper_groq_proxy_secret: str | None = Header(default=None, alias="X-Whisper-Groq-Proxy-Secret"),
 ) -> Response:
-    if SHARED and (x_whisper_groq_proxy_secret or "").strip() != SHARED:
-        raise HTTPException(status_code=401, detail="Invalid or missing proxy secret")
-
     auth = (authorization or "").strip()
-    if not auth.lower().startswith("bearer "):
+    has_client_bearer = auth.lower().startswith("bearer ")
+    # Секрет обязателен только когда клиент хочет серверный GROQ_API_KEY на прокси.
+    # Свой Bearer gsk_… можно слать без секрета (квота клиента).
+    if SHARED and not has_client_bearer:
+        if (x_whisper_groq_proxy_secret or "").strip() != SHARED:
+            raise HTTPException(status_code=401, detail="Invalid or missing proxy secret")
+
+    if not has_client_bearer:
         if not SERVER_KEY:
             raise HTTPException(
                 status_code=401,
                 detail="Proxy: set GROQ_API_KEY or send Authorization: Bearer from client",
             )
         auth = f"Bearer {SERVER_KEY}"
-    else:
-        pass  # клиентский ключ → в Groq как есть
+    # иначе клиентский ключ → в Groq как есть
 
     raw = file.file.read()
     if not raw:

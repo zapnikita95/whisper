@@ -43,7 +43,12 @@ except ImportError:
     pass
 
 from whisper_file_log import user_data_dir
-from whisper_groq import hotkey_prefs_path, load_hotkey_prefs, save_hotkey_prefs
+from whisper_groq import (
+    ensure_hotkey_default_prefs,
+    hotkey_prefs_path,
+    load_hotkey_prefs,
+    save_hotkey_prefs,
+)
 
 USER_DATA = user_data_dir("WhisperHotkey")
 PREFS_PATH = hotkey_prefs_path()
@@ -61,9 +66,11 @@ def _ensure_user_data_dir() -> None:
 def _migrate_legacy_prefs() -> None:
     if PREFS_PATH.is_file():
         return
-    for legacy in (LEGACY_PREFS, OLD_PREFS):
+    candidates = [LEGACY_PREFS, OLD_PREFS]
+    # dist\WhisperHotkey\whisper_hotkey_prefs.json если раньше писали рядом с exe
+    for legacy in candidates:
         try:
-            if legacy.is_file():
+            if legacy.is_file() and legacy.resolve() != PREFS_PATH.resolve():
                 PREFS_PATH.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
                 return
         except OSError:
@@ -72,6 +79,7 @@ def _migrate_legacy_prefs() -> None:
 
 _ensure_user_data_dir()
 _migrate_legacy_prefs()
+ensure_hotkey_default_prefs()
 
 
 def _load_prefs() -> dict:
@@ -85,18 +93,14 @@ def _load_prefs() -> dict:
                 "model_key": legacy.get("model_key", "large-v3"),
                 "notifications": True,
                 "speaker_verify": False,
+                "paste_mode": "auto",
+                "transcribe_backend": "auto_vram",
             }
             _save_prefs(merged)
             return merged
     except (OSError, json.JSONDecodeError, TypeError):
         pass
-    return {
-        "model_key": "large-v3",
-        "notifications": True,
-        "speaker_verify": False,
-        "paste_mode": "auto",
-        "transcribe_backend": "auto_vram",
-    }
+    return ensure_hotkey_default_prefs()
 
 
 def _save_prefs(data: dict) -> None:
@@ -504,10 +508,17 @@ def main() -> int:
         p = _load_prefs()
         p["transcribe_backend"] = mode
         _save_prefs(p)
-        log.info("В prefs transcribe_backend=%s (нужен перезапуск, если не переопределяет env)", mode)
+        log.info("prefs transcribe_backend=%s (применяется сразу)", mode)
+        labels = {
+            "auto_vram": "Авто: GPU или Groq",
+            "server": "Только локальный GPU",
+            "groq": "Только Groq",
+            "server_then_groq": "GPU → Groq",
+            "groq_then_server": "Groq → GPU",
+        }
         _notify(
-            "Transcription",
-            "Restart Whisper Hotkey to apply backend (unless WHISPER_TRANSCRIBE_BACKEND is set in env).",
+            "Транскрипция",
+            f"Режим: {labels.get(mode, mode)}. Уже активно — перезапуск не нужен.",
             False,
             force=True,
         )
@@ -724,8 +735,10 @@ def main() -> int:
 
     def use_default_proxy(icon: pystray.Icon, item: object) -> None:
         p = _load_prefs()
+        from whisper_groq import DEFAULT_GROQ_PROXY_URL
+
         p["groq_proxy_enabled"] = True
-        p["groq_proxy_url"] = "https://whisper-groq-proxy-production.up.railway.app"
+        p["groq_proxy_url"] = DEFAULT_GROQ_PROXY_URL
         p.pop("groq_proxy_secret", None)
         _save_prefs(p)
         _notify(
@@ -1203,16 +1216,16 @@ def main() -> int:
             "WHISPER_MAC_TRANSCRIBE_BACKEND",
         )
         specs = [
-            ("auto_vram", "Auto: GPU if VRAM free, else Groq"),
-            ("server", "Local GPU only"),
-            ("groq", "Groq only (large v3)"),
+            ("auto_vram", "Авто: GPU если хватает VRAM, иначе Groq"),
+            ("server", "Только локальный GPU"),
+            ("groq", "Только Groq (large v3)"),
             ("server_then_groq", "GPU → Groq"),
             ("groq_then_server", "Groq → GPU"),
         ]
-        items = []
+        cur_label = dict(specs).get(cur, cur or "по умолчанию")
+        items = [Item(f"Сейчас: {cur_label}", None, enabled=False)]
         for mode, label in specs:
-            mark = "✓ " if cur == mode else ""
-            short = label if len(label) <= 48 else label[:45] + "…"
+            mark = "✓ " if cur == mode else "   "
 
             def make_pick(m: str):
                 def pick(icon: pystray.Icon, item: object) -> None:
@@ -1220,7 +1233,7 @@ def main() -> int:
 
                 return pick
 
-            items.append(Item(f"{mark}{short}", make_pick(mode)))
+            items.append(Item(f"{mark}{label}", make_pick(mode)))
         return pystray.Menu(*items)
 
     def notif_label(item: object) -> str:
@@ -1240,25 +1253,25 @@ def main() -> int:
         return f"Text output: {labels.get(pm, pm)} (restart)"
 
     menu = pystray.Menu(
-        Item("Open settings…", open_settings_ui, default=True),
+        Item("Открыть настройки…", open_settings_ui, default=True),
         Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
-        Item("Tray menu (Groq, models…)…", show_tray_menu),
+        Item("Меню трея (словарь…)…", show_tray_menu),
         Item(notif_label, toggle_notifications),
         Item(spk_label, toggle_speaker_verify),
-        Item("Record voice profile (~45 s)…", start_enroll_speaker),
+        Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
         Item(paste_label, paste_mode_submenu()),
-        Item("Model → (restart)", model_submenu()),
-        Item("Transcription → (restart)", transcribe_backend_submenu()),
-        Item("Voice threshold →", speaker_threshold_submenu()),
-        Item("Transcribe timeout (sec)…", edit_transcribe_timeout),
-        Item("Max hold recording (sec)…", edit_max_hold),
-        Item("Vocabulary →", vocab_submenu()),
-        Item("History →", history_submenu()),
+        Item("Модель → (перезапуск)", model_submenu()),
+        Item("Транскрипция →", transcribe_backend_submenu()),
+        Item("Порог голоса →", speaker_threshold_submenu()),
+        Item("Таймаут распознавания (сек)…", edit_transcribe_timeout),
+        Item("Макс. длина записи (сек)…", edit_max_hold),
+        Item("Словарь →", vocab_submenu()),
+        Item("История →", history_submenu()),
         Item("Groq API →", groq_api_submenu()),
-        Item("Check for updates…", hotkey_check_for_updates),
-        Item("Log folder", open_log_folder),
-        Item("Hugging Face model cache", open_hf_cache),
-        Item("Quit", on_quit),
+        Item("Проверить обновления…", hotkey_check_for_updates),
+        Item("Папка логов", open_log_folder),
+        Item("Кэш моделей Hugging Face", open_hf_cache),
+        Item("Выход", on_quit),
     )
 
     image = _load_tray_image()

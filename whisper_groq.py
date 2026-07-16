@@ -12,6 +12,7 @@ import requests
 GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_GROQ_MODEL = "whisper-large-v3"
 FALLBACK_GROQ_MODEL = "whisper-large-v3-turbo"
+DEFAULT_GROQ_PROXY_URL = "https://whisper-groq-proxy-production.up.railway.app"
 
 # Прокси (Railway/VPS), если api.groq.com с клиентской сети недоступен:
 # WHISPER_GROQ_PROXY_URL=https://xxx.up.railway.app
@@ -171,7 +172,8 @@ def hotkey_prefs_path() -> Path:
 def load_hotkey_prefs() -> dict:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig: PowerShell Set-Content -Encoding UTF8 часто пишет BOM → иначе JSON ломается.
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
             return data
     except (OSError, json.JSONDecodeError, TypeError):
@@ -188,10 +190,31 @@ def save_hotkey_prefs(data: dict) -> None:
         pass
 
 
+def ensure_hotkey_default_prefs() -> dict:
+    """Первый запуск Windows Hotkey: режим auto_vram (как удобный старт на Mac)."""
+    data = load_hotkey_prefs()
+    changed = False
+    if not isinstance(data.get("transcribe_backend"), str) or not str(data.get("transcribe_backend")).strip():
+        data["transcribe_backend"] = "auto_vram"
+        changed = True
+    if "model_key" not in data:
+        data["model_key"] = "large-v3"
+        changed = True
+    if "notifications" not in data:
+        data["notifications"] = True
+        changed = True
+    if "paste_mode" not in data:
+        data["paste_mode"] = "auto"
+        changed = True
+    if changed:
+        save_hotkey_prefs(data)
+    return data
+
+
 def read_hotkey_groq_proxy_url_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -205,7 +228,7 @@ def read_hotkey_groq_proxy_url_pref() -> str | None:
 def read_hotkey_groq_proxy_secret_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -219,7 +242,7 @@ def read_hotkey_groq_proxy_secret_pref() -> str | None:
 def read_hotkey_groq_proxy_enabled_pref() -> bool | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -241,7 +264,7 @@ def read_hotkey_groq_proxy_enabled_pref() -> bool | None:
 def read_hotkey_groq_api_key_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -347,7 +370,7 @@ def resolve_transcribe_backend_mode(pref: str | None, *env_names: str) -> str:
         v = (os.environ.get(name) or "").strip().lower()
         if v in ALLOWED_TRANSCRIBE_MODES:
             return v
-    return "server"
+    return "auto_vram"
 
 
 def transcribe_backend_order(mode: str) -> list[str]:

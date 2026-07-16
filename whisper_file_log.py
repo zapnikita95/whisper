@@ -33,16 +33,19 @@ def app_root() -> Path:
 
 
 def user_data_dir(app_name: str = "WhisperHotkey") -> Path:
-    """Каталог для prefs и прочих записываемых данных пользователя."""
+    """Каталог для prefs и прочих записываемых данных пользователя.
+
+    На Windows всегда %LOCALAPPDATA%\\<app> — и для Program Files, и для portable dist,
+    чтобы настройки (Groq / режим транскрипции) не терялись и не расходились с логом.
+    """
     env = os.environ.get("WHISPER_USER_DATA_DIR", "").strip()
     if env:
         return Path(env)
-    root = app_root()
-    if sys.platform == "win32" and _is_windows_program_files_tree(root):
+    if sys.platform == "win32":
         la = os.environ.get("LOCALAPPDATA", "").strip()
         if la:
             return Path(la) / app_name
-    return root
+    return app_root()
 
 
 def log_dir() -> Path:
@@ -94,13 +97,10 @@ def _writable_log_root_candidates(logger_name: str) -> list[Path]:
     candidates: list[Path] = []
     if sys.platform == "win32":
         user_dir = user_data_dir(app_name)
-        restricted = _is_windows_program_files_tree(root)
-        if restricted:
-            candidates.append(user_dir)
-        else:
+        # Сначала user data (как prefs), потом рядом с exe — единый каталог на Win.
+        candidates.append(user_dir)
+        if root != user_dir:
             candidates.append(root)
-            if user_dir != root:
-                candidates.append(user_dir)
     else:
         candidates.append(root)
     safe = logger_name.replace(".", "_")
