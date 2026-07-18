@@ -2621,33 +2621,43 @@ class WhisperClientMac:
                         result["text"] = replaced
                     else:
                         result["text"] = raw_text
-                    # AI Modes (after punct/vocab)
+                    # AI Modes + voice prefixes + auto context
                     try:
                         from whisper_ai_modes import (
                             AiModeProRequired,
                             apply_ai_mode,
-                            normalize_ai_mode,
+                            clamp_mode_for_plan,
+                            mode_label,
                             resolve_cloud_plan_for_gate,
+                            resolve_effective_mode,
                         )
 
-                        mode = normalize_ai_mode(
-                            self._pref_ai_mode
-                            if getattr(self, "_pref_ai_mode", None)
-                            else None
-                        )
-                        if mode != "raw" and (result.get("text") or "").strip():
-                            has_byok = bool(self._effective_groq_api_key())
-                            local_stt_ok = backend == "server"
-                            plan = (
-                                None
-                                if (has_byok or local_stt_ok)
-                                else resolve_cloud_plan_for_gate(
-                                    pref_cloud_token=self._pref_cloud_token,
-                                    pref_proxy_url=self._effective_groq_proxy_url() or None,
-                                )
+                        has_byok = bool(self._effective_groq_api_key())
+                        local_stt_ok = backend == "server"
+                        plan = (
+                            None
+                            if (has_byok or local_stt_ok)
+                            else resolve_cloud_plan_for_gate(
+                                pref_cloud_token=self._pref_cloud_token,
+                                pref_proxy_url=self._effective_groq_proxy_url() or None,
                             )
+                        )
+                        allow_auto = bool(has_byok or local_stt_ok or (plan or "") == "pro")
+                        cleaned, mode = resolve_effective_mode(
+                            result.get("text") or "",
+                            app_name=vocab_app,
+                            pref_mode=getattr(self, "_pref_ai_mode", None) or "auto",
+                            allow_auto_context=True,
+                            free_fallback="polish" if allow_auto else "raw",
+                        )
+                        mode = clamp_mode_for_plan(
+                            mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
+                        )
+                        result["text"] = cleaned
+                        if mode != "raw" and cleaned.strip():
+                            _mac_log("info", "ai_mode_apply mode=%s", mode_label(mode))
                             result["text"] = apply_ai_mode(
-                                result["text"],
+                                cleaned,
                                 mode,
                                 cloud_plan=plan,
                                 has_byok=has_byok,
@@ -2827,6 +2837,28 @@ class WhisperClientMac:
         finally:
             self._reset_hotkey_tracker()
             self._reset_native_hotkey_tap_state()
+        try:
+            from whisper_learn import schedule_learn_from_clipboard, suggest_add_vocab
+            from whisper_ai_modes import resolve_cloud_plan_for_gate
+
+            has_byok = bool(self._effective_groq_api_key())
+            # Mac often uses Groq/cloud; treat local server route as unlocked when prefs say server-first
+            plan = (
+                None
+                if has_byok
+                else resolve_cloud_plan_for_gate(
+                    pref_cloud_token=self._pref_cloud_token,
+                    pref_proxy_url=self._effective_groq_proxy_url() or None,
+                )
+            )
+            learn_ok = bool(has_byok or (plan or "") == "pro")
+
+            def _on_sug(frm: str, to: str) -> None:
+                mac_banner_notification("Словарь", suggest_add_vocab(frm, to, auto_add=True))
+
+            schedule_learn_from_clipboard(out, allowed=learn_ok, on_suggest=_on_sug)
+        except Exception as e:
+            _mac_log("debug", "learn_schedule_err err=%s", e)
         if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
             prev = out[:130] + ("…" if len(out) > 130 else "")
             if paste_ok:
@@ -3404,26 +3436,11 @@ class WhisperClientMac:
             return False
 
     def _current_app_name(self) -> str | None:
-        """Имя активного приложения (Slack/Cursor/Gmail/…) для per-app vocab-профиля."""
-        if sys.platform != "darwin":
-            return None
+        """Имя активного приложения для vocab + auto AI mode."""
         try:
-            from AppKit import NSWorkspace  # type: ignore[import-untyped]
+            from whisper_app_context import frontmost_app
 
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if app is None:
-                return None
-            name = str(app.localizedName() or "").strip()
-            if not name:
-                try:
-                    bid = str(app.bundleIdentifier() or "").strip()
-                    if bid:
-                        name = bid.rsplit(".", 1)[-1]
-                except Exception:
-                    return None
-            if name.lower().startswith("python"):
-                return None
-            return name or None
+            return frontmost_app()
         except Exception as e:
             _mac_log("debug", "current_app_name_err err=%s", e)
             return None
@@ -3881,6 +3898,17 @@ class WhisperClientMac:
 
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
+        try:
+            from whisper_app_context import frontmost_app, suggest_ai_mode
+            from whisper_ai_modes import mode_label, normalize_ai_mode
+            from whisper_hud import hud_show
+
+            app = frontmost_app() or self._current_app_name()
+            pref = normalize_ai_mode(getattr(self, "_pref_ai_mode", None))
+            mode = suggest_ai_mode(app) if pref == "auto" else pref
+            hud_show(app=app, mode=mode_label(mode))
+        except Exception as e:
+            _mac_log("debug", "hud_show_err err=%s", e)
         threading.Thread(
             target=self._preflight_route_warning,
             name="whisper-route-preflight",
@@ -3969,6 +3997,12 @@ class WhisperClientMac:
         return audio_data, peak
 
     def _stop_recording_and_process(self) -> None:
+        try:
+            from whisper_hud import hud_hide
+
+            hud_hide()
+        except Exception:
+            pass
         with self._lock:
             if not self._recording:
                 return
@@ -4810,11 +4844,12 @@ if rumps is not None:
             rumps.alert("Словарь — текущая подсказка", msg)
 
         def _ai_mode_submenu_items(self) -> list:
-            from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode
+            from whisper_ai_modes import ALLOWED_AI_MODE_PREFS, mode_label, normalize_ai_mode
 
             cur = normalize_ai_mode(self.client._pref_ai_mode)
             items = []
             for mode in (
+                "auto",
                 "raw",
                 "polish",
                 "email",
@@ -4823,7 +4858,7 @@ if rumps is not None:
                 "translate_en",
                 "translate_ru",
             ):
-                if mode not in ALLOWED_AI_MODES:
+                if mode not in ALLOWED_AI_MODE_PREFS:
                     continue
                 mark = "✓ " if cur == mode else "   "
                 label = mark + mode_label(mode)

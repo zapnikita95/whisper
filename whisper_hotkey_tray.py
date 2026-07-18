@@ -1195,7 +1195,7 @@ def main() -> int:
         )
 
     def ai_mode_submenu():
-        from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode, read_hotkey_ai_mode_pref
+        from whisper_ai_modes import ALLOWED_AI_MODE_PREFS, mode_label, normalize_ai_mode, read_hotkey_ai_mode_pref
         from whisper_groq import load_hotkey_prefs, save_hotkey_prefs
 
         cur = read_hotkey_ai_mode_pref()
@@ -1209,6 +1209,7 @@ def main() -> int:
 
         items = []
         for mode in (
+            "auto",
             "raw",
             "polish",
             "email",
@@ -1217,7 +1218,7 @@ def main() -> int:
             "translate_en",
             "translate_ru",
         ):
-            if mode not in ALLOWED_AI_MODES:
+            if mode not in ALLOWED_AI_MODE_PREFS:
                 continue
             mark = "✓ " if cur == mode else "   "
             items.append(

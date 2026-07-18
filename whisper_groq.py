@@ -207,6 +207,9 @@ def ensure_hotkey_default_prefs() -> dict:
     if "paste_mode" not in data:
         data["paste_mode"] = "auto"
         changed = True
+    if not isinstance(data.get("ai_mode"), str) or not str(data.get("ai_mode")).strip():
+        data["ai_mode"] = "auto"
+        changed = True
     if not isinstance(data.get("groq_proxy_url"), str) or not str(data.get("groq_proxy_url")).strip():
         data["groq_proxy_url"] = DEFAULT_GROQ_PROXY_URL
         data["groq_proxy_enabled"] = True

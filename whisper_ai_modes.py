@@ -10,6 +10,8 @@ import requests
 ALLOWED_AI_MODES = frozenset(
     {"raw", "polish", "email", "chat", "code", "translate_en", "translate_ru"}
 )
+# Prefs may also store "auto" (context from frontmost app).
+ALLOWED_AI_MODE_PREFS = ALLOWED_AI_MODES | {"auto"}
 FREE_CLOUD_AI_MODES = frozenset({"raw", "polish"})
 PRO_AI_MODES = ALLOWED_AI_MODES
 
@@ -43,6 +45,7 @@ _MODE_SYSTEM: dict[str, str] = {
 }
 
 _MODE_LABELS_RU: dict[str, str] = {
+    "auto": "Авто (по приложению)",
     "raw": "Как есть (без AI)",
     "polish": "Зачистка",
     "email": "Письмо",
@@ -65,12 +68,15 @@ class AiModeProRequired(RuntimeError):
 
 
 def normalize_ai_mode(raw: str | None) -> str:
-    m = (raw or "raw").strip().lower()
-    return m if m in ALLOWED_AI_MODES else "raw"
+    m = (raw or "auto").strip().lower()
+    if m in ALLOWED_AI_MODE_PREFS:
+        return m
+    return "auto"
 
 
 def mode_label(mode: str) -> str:
-    return _MODE_LABELS_RU.get(normalize_ai_mode(mode), mode)
+    m = normalize_ai_mode(mode)
+    return _MODE_LABELS_RU.get(m, m)
 
 
 def cloud_plan_allows_mode(
@@ -80,7 +86,9 @@ def cloud_plan_allows_mode(
     has_byok: bool,
     local_stt_ok: bool = False,
 ) -> bool:
-    mode = normalize_ai_mode(mode)
+    if mode == "auto":
+        return True
+    mode = mode if mode in ALLOWED_AI_MODES else "raw"
     if mode == "raw":
         return True
     if has_byok or local_stt_ok:
@@ -95,10 +103,75 @@ def read_hotkey_ai_mode_pref() -> str:
         from whisper_groq import load_hotkey_prefs
 
         v = load_hotkey_prefs().get("ai_mode")
-        if isinstance(v, str):
+        if isinstance(v, str) and v.strip():
             return normalize_ai_mode(v)
     except Exception:
         pass
+    return "auto"
+
+
+# (regex, mode) — longer phrases first
+_VOICE_PREFIXES: list[tuple[str, str]] = [
+    (r"^(?:переведи\s+на\s+английск\w*|translate\s+to\s+english|translate\s+into\s+english)\s+", "translate_en"),
+    (r"^(?:переведи\s+на\s+русск\w*|translate\s+to\s+russian|translate\s+into\s+russian)\s+", "translate_ru"),
+    (r"^(?:переведи|translate)\s+", "translate_en"),
+    (r"^(?:как\s+код|как\s+code|code\s*[:\-]?)\s+", "code"),
+    (r"^(?:письмо|email|e-mail)\s+", "email"),
+    (r"^(?:чат|chat|сообщение)\s+", "chat"),
+    (r"^(?:зачистка|polish|почисти)\s+", "polish"),
+    (r"^(?:просто|как\s+есть|raw)\s+", "raw"),
+]
+
+
+def strip_voice_prefix(text: str) -> tuple[str, str | None]:
+    """Return (text_without_prefix, mode_or_None)."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return t, None
+    for pat, mode in _VOICE_PREFIXES:
+        m = re.match(pat, t, flags=re.IGNORECASE | re.UNICODE)
+        if m:
+            rest = t[m.end() :].strip()
+            return rest, mode
+    return t, None
+
+
+def resolve_effective_mode(
+    text: str,
+    *,
+    app_name: str | None,
+    pref_mode: str | None = None,
+    allow_auto_context: bool = True,
+    free_fallback: str = "polish",
+) -> tuple[str, str]:
+    """Strip voice prefix + resolve mode. Returns (clean_text, mode)."""
+    clean, prefix_mode = strip_voice_prefix(text)
+    if prefix_mode:
+        return clean, prefix_mode
+    pref = normalize_ai_mode(pref_mode)
+    if pref != "auto" and pref in ALLOWED_AI_MODES:
+        return clean, pref
+    if allow_auto_context:
+        from whisper_app_context import suggest_ai_mode
+
+        return clean, suggest_ai_mode(app_name, free_fallback=free_fallback)
+    return clean, "raw"
+
+
+def clamp_mode_for_plan(
+    mode: str,
+    plan: str | None,
+    *,
+    has_byok: bool,
+    local_stt_ok: bool = False,
+) -> str:
+    """If mode not allowed, fall back to polish then raw."""
+    if cloud_plan_allows_mode(mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok):
+        return mode if mode in ALLOWED_AI_MODES else "raw"
+    if cloud_plan_allows_mode("polish", plan, has_byok=has_byok, local_stt_ok=local_stt_ok):
+        return "polish"
     return "raw"
 
 

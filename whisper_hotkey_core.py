@@ -499,27 +499,11 @@ class WhisperHotkey:
 
 
     def _current_app_name(self) -> str | None:
-        """Имя активного приложения (для per-app профиля словаря). Только Windows."""
-        if sys.platform != "win32":
-            return None
+        """Имя активного приложения (процесс / окно) для vocab + auto AI mode."""
         try:
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            hwnd = user32.GetForegroundWindow()
-            if not hwnd:
-                return None
-            length = user32.GetWindowTextLengthW(hwnd) or 0
-            if length <= 0:
-                return None
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = (buf.value or "").strip()
-            if not title:
-                return None
-            for sep in (" — ", " - ", " – "):
-                if sep in title:
-                    title = title.split(sep)[-1].strip()
-                    break
-            return title or None
+            from whisper_app_context import frontmost_app
+
+            return frontmost_app()
         except Exception as e:
             log.debug("current_app_name_err: %s", e)
             return None
@@ -727,6 +711,18 @@ class WhisperHotkey:
 
         _play_record_start_sound()
 
+        try:
+            from whisper_app_context import frontmost_app, suggest_ai_mode
+            from whisper_ai_modes import mode_label, read_hotkey_ai_mode_pref
+            from whisper_hud import hud_show
+
+            _app = frontmost_app()
+            _pref = read_hotkey_ai_mode_pref()
+            _mode = suggest_ai_mode(_app) if _pref == "auto" else _pref
+            hud_show(app=_app, mode=mode_label(_mode))
+        except Exception:
+            log.debug("hud_show failed", exc_info=True)
+
         print("[Запись] Зажато Ctrl+Win — говори…", flush=True)
 
         self._emit_status("Запись… (отпусти Ctrl+Win)")
@@ -738,6 +734,12 @@ class WhisperHotkey:
 
 
     def _stop_hold_recording_and_process(self) -> None:
+
+        try:
+            from whisper_hud import hud_hide
+            hud_hide()
+        except Exception:
+            pass
 
         with self._lock:
 
@@ -1079,8 +1081,11 @@ class WhisperHotkey:
                             from whisper_ai_modes import (
                                 AiModeProRequired,
                                 apply_ai_mode,
+                                clamp_mode_for_plan,
+                                mode_label,
                                 read_hotkey_ai_mode_pref,
                                 resolve_cloud_plan_for_gate,
+                                resolve_effective_mode,
                             )
                             from whisper_groq import (
                                 groq_api_key_from_env,
@@ -1090,17 +1095,32 @@ class WhisperHotkey:
                                 read_hotkey_groq_proxy_secret_pref,
                                 read_hotkey_groq_proxy_url_pref,
                             )
-                            mode = read_hotkey_ai_mode_pref()
-                            if mode != "raw":
-                                has_byok = bool(
-                                    groq_api_key_from_env() or read_hotkey_groq_api_key_pref()
-                                )
-                                local_stt_ok = backend == "server"
-                                plan = None if has_byok else resolve_cloud_plan_for_gate(
+                            has_byok = bool(
+                                groq_api_key_from_env() or read_hotkey_groq_api_key_pref()
+                            )
+                            local_stt_ok = backend == "server"
+                            plan = (
+                                None
+                                if (has_byok or local_stt_ok)
+                                else resolve_cloud_plan_for_gate(
                                     pref_cloud_token=read_hotkey_cloud_token_pref(),
                                     pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
                                 )
-                                self._emit_status(f"AI Mode: {mode}…")
+                            )
+                            allow_auto = bool(has_byok or local_stt_ok or (plan or "") == "pro")
+                            text, mode = resolve_effective_mode(
+                                text,
+                                app_name=vocab_app,
+                                pref_mode=read_hotkey_ai_mode_pref(),
+                                allow_auto_context=allow_auto or True,
+                                free_fallback="polish" if allow_auto else "raw",
+                            )
+                            # Free Cloud: clamp email/chat/code down to polish/raw
+                            mode = clamp_mode_for_plan(
+                                mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
+                            )
+                            if mode != "raw":
+                                self._emit_status(f"AI Mode: {mode_label(mode)}…")
                                 text = apply_ai_mode(
                                     text,
                                     mode,
@@ -1134,6 +1154,42 @@ class WhisperHotkey:
                         log.info("transcribe_ok chars=%d preview=%r", len(text), text[:120])
 
                         self._insert_text(text)
+                        try:
+                            from whisper_learn import schedule_learn_from_clipboard, suggest_add_vocab
+                            from whisper_groq import (
+                                groq_api_key_from_env,
+                                read_hotkey_cloud_token_pref,
+                                read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_url_pref,
+                            )
+                            from whisper_ai_modes import resolve_cloud_plan_for_gate
+
+                            _byok = bool(groq_api_key_from_env() or read_hotkey_groq_api_key_pref())
+                            _local = backend == "server"
+                            _plan = (
+                                None
+                                if (_byok or _local)
+                                else resolve_cloud_plan_for_gate(
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                )
+                            )
+                            _learn_ok = bool(_byok or _local or (_plan or "") == "pro")
+
+                            def _on_sug(frm: str, to: str) -> None:
+                                self._emit_toast(
+                                    "Словарь",
+                                    suggest_add_vocab(frm, to, auto_add=True),
+                                    False,
+                                )
+
+                            schedule_learn_from_clipboard(
+                                text,
+                                allowed=_learn_ok,
+                                on_suggest=_on_sug,
+                            )
+                        except Exception:
+                            log.debug("learn schedule failed", exc_info=True)
 
                         preview = (text[:220] + "…") if len(text) > 220 else text
 

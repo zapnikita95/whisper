@@ -509,15 +509,15 @@ def launch_settings_window(
             )
             ttk.Label(
                 frm,
-                text="Free Cloud: «как есть» и зачистка. Письмо/чат/код/перевод — Pro, BYOK или локальный GPU.",
+                text="Авто — режим по активному приложению (Slack→чат, Cursor→код). Голосом: «письмо …», «как код …».",
                 foreground="#666",
                 wraplength=500,
             ).pack(anchor=tk.W, pady=(0, 4))
             try:
-                from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode
+                from whisper_ai_modes import ALLOWED_AI_MODE_PREFS, mode_label, normalize_ai_mode
 
                 cur_ai = normalize_ai_mode(
-                    prefs.get("ai_mode") if isinstance(prefs.get("ai_mode"), str) else "raw"
+                    prefs.get("ai_mode") if isinstance(prefs.get("ai_mode"), str) else "auto"
                 )
                 ai_var = tk.StringVar(value=cur_ai)
                 ai_status = ttk.Label(frm, text="", foreground="#555")
@@ -529,6 +529,7 @@ def launch_settings_window(
                     ai_status.configure(text=f"Сейчас: {mode_label(m)}")
 
                 for mode in (
+                    "auto",
                     "raw",
                     "polish",
                     "email",
@@ -537,7 +538,7 @@ def launch_settings_window(
                     "translate_en",
                     "translate_ru",
                 ):
-                    if mode not in ALLOWED_AI_MODES:
+                    if mode not in ALLOWED_AI_MODE_PREFS:
                         continue
                     ttk.Radiobutton(
                         frm,
