@@ -502,6 +502,54 @@ def launch_settings_window(
             ttk.Button(cloud_row, text="Оформить Pro…", command=_cloud_checkout).pack(side=tk.LEFT)
             _refresh_cloud()
 
+            # —— AI Modes ——
+            ttk.Separator(frm, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+            ttk.Label(frm, text="AI Mode (после распознавания)", font=("Segoe UI", 10, "bold")).pack(
+                anchor=tk.W
+            )
+            ttk.Label(
+                frm,
+                text="Free Cloud: «как есть» и зачистка. Письмо/чат/код/перевод — Pro, BYOK или локальный GPU.",
+                foreground="#666",
+                wraplength=500,
+            ).pack(anchor=tk.W, pady=(0, 4))
+            try:
+                from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode
+
+                cur_ai = normalize_ai_mode(
+                    prefs.get("ai_mode") if isinstance(prefs.get("ai_mode"), str) else "raw"
+                )
+                ai_var = tk.StringVar(value=cur_ai)
+                ai_status = ttk.Label(frm, text="", foreground="#555")
+                ai_status.pack(anchor=tk.W)
+
+                def _apply_ai() -> None:
+                    m = normalize_ai_mode(ai_var.get())
+                    _merge_save(ai_mode=m)
+                    ai_status.configure(text=f"Сейчас: {mode_label(m)}")
+
+                for mode in (
+                    "raw",
+                    "polish",
+                    "email",
+                    "chat",
+                    "code",
+                    "translate_en",
+                    "translate_ru",
+                ):
+                    if mode not in ALLOWED_AI_MODES:
+                        continue
+                    ttk.Radiobutton(
+                        frm,
+                        text=mode_label(mode),
+                        variable=ai_var,
+                        value=mode,
+                        command=_apply_ai,
+                    ).pack(anchor=tk.W, pady=1)
+                _apply_ai()
+            except Exception as e:
+                ttk.Label(frm, text=f"AI Modes недоступны: {e}", foreground="#c60").pack(anchor=tk.W)
+
             # —— Voice ——
             ttk.Separator(frm, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
             ttk.Label(frm, text="Голосовой профиль", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)

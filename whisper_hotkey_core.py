@@ -34,6 +34,7 @@ from collections.abc import Callable
 from typing import Any
 
 from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+from whisper_text_post import apply_spoken_punctuation, finalize_transcript
 from whisper_vocab import (
     apply_replacements as vocab_apply_replacements,
     build_initial_prompt as vocab_build_initial_prompt,
@@ -141,61 +142,8 @@ def _play_record_start_sound() -> None:
 
 
 
-def apply_spoken_punctuation(text: str) -> str:
 
-    """
-
-    Заменяет произнесённые названия знаков на сами знаки (русский текст от Whisper).
-
-    Порядок: сначала многословные фразы.
-
-    """
-
-    if not text:
-
-        return text
-
-    t = text
-
-    pairs: list[tuple[str, str]] = [
-
-        (r"восклицательный\s+знак", "!"),
-
-        (r"вопросительный\s+знак", "?"),
-
-        (r"запятая", ","),
-
-        (r"точка", "."),
-
-        (r"тире", "—"),
-
-    ]
-
-    flags = re.IGNORECASE
-
-    for pattern, repl in pairs:
-
-        t = re.sub(rf"(?iu)\b(?:{pattern})\b", repl, t)
-
-    # пробелы вокруг знаков
-
-    t = re.sub(r"\s*,\s*", ", ", t)
-
-    t = re.sub(r"\s*\.\s*", ". ", t)
-
-    t = re.sub(r"\s*!\s*", "! ", t)
-
-    t = re.sub(r"\s*\?\s*", "? ", t)
-
-    t = re.sub(r"\s*—\s*", " — ", t)
-
-    t = re.sub(r"\s{2,}", " ", t).strip()
-
-    return t
-
-
-
-
+# apply_spoken_punctuation: re-exported from whisper_text_post
 
 # Фразы-галлюцинации, которые Whisper выдаёт на тишину или шум
 _HALLUCINATIONS: set[str] = {
@@ -1121,11 +1069,57 @@ class WhisperHotkey:
 
                 if text:
 
-                    if self.spoken_punctuation:
-
-                        text = apply_spoken_punctuation(text)
-
-                    text = self._apply_vocab_replacements_local(text, vocab_app)
+                    text = finalize_transcript(
+                        text,
+                        spoken_punctuation=self.spoken_punctuation,
+                        app_name=vocab_app,
+                    )
+                    if text:
+                        try:
+                            from whisper_ai_modes import (
+                                AiModeProRequired,
+                                apply_ai_mode,
+                                read_hotkey_ai_mode_pref,
+                                resolve_cloud_plan_for_gate,
+                            )
+                            from whisper_groq import (
+                                groq_api_key_from_env,
+                                read_hotkey_cloud_token_pref,
+                                read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_enabled_pref,
+                                read_hotkey_groq_proxy_secret_pref,
+                                read_hotkey_groq_proxy_url_pref,
+                            )
+                            mode = read_hotkey_ai_mode_pref()
+                            if mode != "raw":
+                                has_byok = bool(
+                                    groq_api_key_from_env() or read_hotkey_groq_api_key_pref()
+                                )
+                                local_stt_ok = backend == "server"
+                                plan = None if has_byok else resolve_cloud_plan_for_gate(
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                )
+                                self._emit_status(f"AI Mode: {mode}…")
+                                text = apply_ai_mode(
+                                    text,
+                                    mode,
+                                    cloud_plan=plan,
+                                    has_byok=has_byok,
+                                    local_stt_ok=local_stt_ok,
+                                    pref_api_key=read_hotkey_groq_api_key_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                    pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                                    pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    log_error=log.error,
+                                )
+                        except AiModeProRequired as e:
+                            log.warning("ai_mode_pro_required: %s", e)
+                            self._emit_toast("Whisper Cloud Pro", str(e)[:200], True)
+                        except Exception as e:
+                            log.exception("ai_mode_failed")
+                            self._emit_toast("AI Mode", str(e)[:180], True)
 
                     if text and not self._cancel_processing.is_set():
 

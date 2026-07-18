@@ -688,6 +688,7 @@ _MAC_CLIENT_PREF_STR_KEYS = frozenset(
         "groq_proxy_secret",
         "cloud_token",
         "cloud_device_id",
+        "ai_mode",
         "server_url",
         "server_host",
     }
@@ -785,6 +786,14 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 "groq_then_server",
                 "auto_vram",
             ):
+                continue
+            if k == "ai_mode":
+                from whisper_ai_modes import normalize_ai_mode
+
+                if not s:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = normalize_ai_mode(s)
                 continue
             if k == "groq_api_key":
                 if not s:
@@ -2212,6 +2221,7 @@ class WhisperClientMac:
         self._pref_groq_proxy_enabled: bool | None = None
         self._pref_cloud_token: str | None = None
         self._pref_cloud_device_id: str | None = None
+        self._pref_ai_mode: str | None = None
         self._pref_server_url: str | None = None
         self._pref_server_host: str | None = None
         self._pref_server_port: int | None = None
@@ -2257,6 +2267,8 @@ class WhisperClientMac:
         self._pref_cloud_device_id = (
             cd.strip() if isinstance(cd, str) and len(cd.strip()) >= 8 else None
         )
+        am = p.get("ai_mode")
+        self._pref_ai_mode = am.strip() if isinstance(am, str) and am.strip() else None
         su = p.get("server_url")
         self._pref_server_url = (
             su.strip().rstrip("/")
@@ -2596,9 +2608,65 @@ class WhisperClientMac:
                 raw_text = (result.get("text") or "").strip()
                 result["_mac_raw_transcript"] = raw_text
                 if raw_text:
-                    replaced = self._apply_vocab_replacements(raw_text, vocab_app)
+                    from whisper_text_post import finalize_transcript
+
+                    # Server may already apply spoken_punctuation; re-apply is idempotent for symbols.
+                    # Groq path never did — finalize covers both.
+                    replaced = finalize_transcript(
+                        raw_text,
+                        spoken_punctuation=self.spoken_punctuation,
+                        app_name=vocab_app,
+                    )
                     if replaced != raw_text:
                         result["text"] = replaced
+                    else:
+                        result["text"] = raw_text
+                    # AI Modes (after punct/vocab)
+                    try:
+                        from whisper_ai_modes import (
+                            AiModeProRequired,
+                            apply_ai_mode,
+                            normalize_ai_mode,
+                            resolve_cloud_plan_for_gate,
+                        )
+
+                        mode = normalize_ai_mode(
+                            self._pref_ai_mode
+                            if getattr(self, "_pref_ai_mode", None)
+                            else None
+                        )
+                        if mode != "raw" and (result.get("text") or "").strip():
+                            has_byok = bool(self._effective_groq_api_key())
+                            local_stt_ok = backend == "server"
+                            plan = (
+                                None
+                                if (has_byok or local_stt_ok)
+                                else resolve_cloud_plan_for_gate(
+                                    pref_cloud_token=self._pref_cloud_token,
+                                    pref_proxy_url=self._effective_groq_proxy_url() or None,
+                                )
+                            )
+                            result["text"] = apply_ai_mode(
+                                result["text"],
+                                mode,
+                                cloud_plan=plan,
+                                has_byok=has_byok,
+                                local_stt_ok=local_stt_ok,
+                                pref_api_key=self._pref_groq_api_key,
+                                pref_proxy_url=self._effective_groq_proxy_url(),
+                                pref_proxy_secret=self._pref_groq_proxy_secret,
+                                pref_proxy_enabled=self._effective_groq_proxy_enabled(),
+                                pref_cloud_token=self._pref_cloud_token,
+                                log_error=lambda m, *a: _mac_log("error", m, *a),
+                            )
+                    except AiModeProRequired as e:
+                        _mac_log("warning", "ai_mode_pro_required err=%s", e)
+                        try:
+                            mac_banner_notification("Whisper Cloud Pro", str(e)[:180])
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        _mac_log("warning", "ai_mode_failed err=%s", e)
                 text = (result.get("text") or "").strip()
                 if text:
                     _mac_log(
@@ -4509,6 +4577,7 @@ if rumps is not None:
                 rumps.separator,
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
                 ("Словарь", self._vocab_submenu_items()),
+                ("AI Mode", self._ai_mode_submenu_items()),
                 ("Whisper Cloud", self._cloud_submenu_items()),
                 ("Groq API", self._groq_api_submenu_items()),
                 ("Режим текста", self._paste_mode_submenu_items()),
@@ -4739,6 +4808,36 @@ if rumps is not None:
                 f"Файл словаря: {vocab_file_path()}"
             )
             rumps.alert("Словарь — текущая подсказка", msg)
+
+        def _ai_mode_submenu_items(self) -> list:
+            from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode
+
+            cur = normalize_ai_mode(self.client._pref_ai_mode)
+            items = []
+            for mode in (
+                "raw",
+                "polish",
+                "email",
+                "chat",
+                "code",
+                "translate_en",
+                "translate_ru",
+            ):
+                if mode not in ALLOWED_AI_MODES:
+                    continue
+                mark = "✓ " if cur == mode else "   "
+                label = mark + mode_label(mode)
+
+                def _make(m: str):
+                    def _cb(_sender, mode=m) -> None:
+                        self.client._merge_save_mac_prefs(ai_mode=mode)
+                        self._safe_recompose_menu()
+                        mac_banner_notification("AI Mode", mode_label(mode))
+
+                    return _cb
+
+                items.append(rumps.MenuItem(label, callback=_make(mode)))
+            return items
 
         def _cloud_submenu_items(self) -> list:
             return [

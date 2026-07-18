@@ -14,6 +14,7 @@
 | POST | `/v1/checkout` | Stripe Checkout URL |
 | POST | `/v1/stripe/webhook` | Stripe webhooks |
 | POST | `/v1/admin/grant-pro` | Ручной Pro (`X-Whisper-Cloud-Admin-Secret`) |
+| POST | `/openai/v1/chat/completions` | AI Modes (без метринга минут) |
 | POST | `/openai/v1/audio/transcriptions` | STT (как Groq) |
 
 ## Режимы авторизации на `/transcriptions`

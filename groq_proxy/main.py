@@ -28,6 +28,7 @@ import db
 from audio_meta import estimate_audio_seconds
 
 GROQ_TRANSCRIPTIONS = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
 SERVER_KEY = (os.environ.get("GROQ_API_KEY") or os.environ.get("WHISPER_GROQ_API_KEY") or "").strip()
 ADMIN_SECRET = (os.environ.get("WHISPER_CLOUD_ADMIN_SECRET") or "").strip()
 
@@ -224,6 +225,86 @@ def _quota_402(remaining: float) -> JSONResponse:
     )
 
 
+def _resolve_upstream_auth(
+    authorization: str | None,
+    x_whisper_groq_proxy_secret: str | None,
+    x_whisper_cloud_token: str | None,
+    *,
+    meter: bool,
+) -> tuple[str, str | None]:
+    """Return (groq Authorization header value, cloud_token_to_meter_or_None)."""
+    bearer = cloud_auth.extract_bearer(authorization)
+    ops = cloud_auth.is_ops_secret(x_whisper_groq_proxy_secret)
+    cloud_hdr = (x_whisper_cloud_token or "").strip()
+    cloud_tok = cloud_hdr if cloud_auth.is_cloud_token(cloud_hdr) else (
+        bearer if cloud_auth.is_cloud_token(bearer) else ""
+    )
+    byok = bearer if cloud_auth.is_groq_key(bearer) else None
+
+    if byok:
+        return f"Bearer {byok}", None
+    if cloud_tok:
+        if not SERVER_KEY:
+            raise HTTPException(status_code=503, detail="Proxy GROQ_API_KEY not configured")
+        return f"Bearer {SERVER_KEY}", (cloud_tok if meter else None)
+    if ops:
+        if not SERVER_KEY:
+            raise HTTPException(status_code=503, detail="Proxy GROQ_API_KEY not configured")
+        return f"Bearer {SERVER_KEY}", None
+    if cloud_auth.SHARED:
+        raise HTTPException(
+            status_code=401,
+            detail="Need X-Whisper-Cloud-Token (wsk_…), BYOK Bearer gsk_…, or proxy secret",
+        )
+    if not SERVER_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Proxy: set GROQ_API_KEY or send Authorization: Bearer from client",
+        )
+    raise HTTPException(
+        status_code=401,
+        detail="Register via POST /v1/devices/register and send X-Whisper-Cloud-Token",
+    )
+
+
+@app.post("/openai/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_whisper_groq_proxy_secret: str | None = Header(
+        default=None, alias="X-Whisper-Groq-Proxy-Secret"
+    ),
+    x_whisper_cloud_token: str | None = Header(default=None, alias="X-Whisper-Cloud-Token"),
+) -> Response:
+    """Proxy Groq chat. Auth like STT; no minute metering (plan: chat free of STT quota)."""
+    groq_auth, _ = _resolve_upstream_auth(
+        authorization,
+        x_whisper_groq_proxy_secret,
+        x_whisper_cloud_token,
+        meter=False,
+    )
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty body")
+    ct_in = request.headers.get("content-type") or "application/json"
+    try:
+        r = requests.post(
+            GROQ_CHAT,
+            headers={
+                "Authorization": groq_auth,
+                "Accept": "application/json",
+                "Content-Type": ct_in,
+                "User-Agent": "WhisperGroqProxy/2.0",
+            },
+            data=raw,
+            timeout=(30.0, 120.0),
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Groq chat upstream: {e}") from e
+    ct_out = r.headers.get("content-type", "application/json")
+    return Response(content=r.content, status_code=r.status_code, media_type=ct_out)
+
+
 @app.post("/openai/v1/audio/transcriptions")
 def transcribe(
     file: UploadFile = File(..., description="WAV и т.д., как у Groq"),
@@ -237,50 +318,12 @@ def transcribe(
     ),
     x_whisper_cloud_token: str | None = Header(default=None, alias="X-Whisper-Cloud-Token"),
 ) -> Response:
-    bearer = cloud_auth.extract_bearer(authorization)
-    ops = cloud_auth.is_ops_secret(x_whisper_groq_proxy_secret)
-    cloud_hdr = (x_whisper_cloud_token or "").strip()
-    cloud_tok = cloud_hdr if cloud_auth.is_cloud_token(cloud_hdr) else (
-        bearer if cloud_auth.is_cloud_token(bearer) else ""
+    groq_auth, meter_token = _resolve_upstream_auth(
+        authorization,
+        x_whisper_groq_proxy_secret,
+        x_whisper_cloud_token,
+        meter=True,
     )
-    byok = bearer if cloud_auth.is_groq_key(bearer) else None
-
-    # Auth modes:
-    # 1) BYOK gsk_… → pass through, no metering
-    # 2) Cloud wsk_… → meter + SERVER_KEY
-    # 3) Ops PROXY_SHARED_SECRET → SERVER_KEY, no metering
-    # 4) Legacy: no bearer but shared secret already checked; or empty SHARED + SERVER_KEY
-    #    requires cloud token for public metering (when SHARED set, secret alone still ops)
-
-    meter_token: str | None = None
-    if byok:
-        groq_auth = f"Bearer {byok}"
-    elif cloud_tok:
-        meter_token = cloud_tok
-        if not SERVER_KEY:
-            raise HTTPException(status_code=503, detail="Proxy GROQ_API_KEY not configured")
-        groq_auth = f"Bearer {SERVER_KEY}"
-    elif ops:
-        if not SERVER_KEY:
-            raise HTTPException(status_code=503, detail="Proxy GROQ_API_KEY not configured")
-        groq_auth = f"Bearer {SERVER_KEY}"
-    elif cloud_auth.SHARED:
-        # Shared secret configured: require secret or cloud/BYOK (already failed above)
-        raise HTTPException(
-            status_code=401,
-            detail="Need X-Whisper-Cloud-Token (wsk_…), BYOK Bearer gsk_…, or proxy secret",
-        )
-    else:
-        # No shared secret: require cloud token for hosted key
-        if not SERVER_KEY:
-            raise HTTPException(
-                status_code=401,
-                detail="Proxy: set GROQ_API_KEY or send Authorization: Bearer from client",
-            )
-        raise HTTPException(
-            status_code=401,
-            detail="Register via POST /v1/devices/register and send X-Whisper-Cloud-Token",
-        )
 
     raw = file.file.read()
     if not raw:

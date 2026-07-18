@@ -399,23 +399,8 @@ async def transcribe(
             text = " ".join(text_parts).strip()
 
             if spoken_punctuation and text:
-                import re
-
-                pairs = [
-                    (r"восклицательный\s+знак", "!"),
-                    (r"вопросительный\s+знак", "?"),
-                    (r"запятая", ","),
-                    (r"точка", "."),
-                    (r"тире", "—"),
-                ]
-                for pattern, repl in pairs:
-                    text = re.sub(rf"(?iu)\b(?:{pattern})\b", repl, text)
-                text = re.sub(r"\s*,\s*", ", ", text)
-                text = re.sub(r"\s*\.\s*", ". ", text)
-                text = re.sub(r"\s*!\s*", "! ", text)
-                text = re.sub(r"\s*\?\s*", "? ", text)
-                text = re.sub(r"\s*—\s*", " — ", text)
-                text = re.sub(r"\s{2,}", " ", text).strip()
+                from whisper_text_post import apply_spoken_punctuation
+                text = apply_spoken_punctuation(text)
 
             return {
                 "text": text,

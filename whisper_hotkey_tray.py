@@ -1194,6 +1194,40 @@ def main() -> int:
             Item("Показать подсказку словаря", vocab_show_prompt),
         )
 
+    def ai_mode_submenu():
+        from whisper_ai_modes import ALLOWED_AI_MODES, mode_label, normalize_ai_mode, read_hotkey_ai_mode_pref
+        from whisper_groq import load_hotkey_prefs, save_hotkey_prefs
+
+        cur = read_hotkey_ai_mode_pref()
+
+        def set_mode(icon: pystray.Icon, mode: str) -> None:
+            p = load_hotkey_prefs()
+            p["ai_mode"] = normalize_ai_mode(mode)
+            save_hotkey_prefs(p)
+            _notify("AI Mode", mode_label(mode), False, force=True)
+            icon.update_menu()
+
+        items = []
+        for mode in (
+            "raw",
+            "polish",
+            "email",
+            "chat",
+            "code",
+            "translate_en",
+            "translate_ru",
+        ):
+            if mode not in ALLOWED_AI_MODES:
+                continue
+            mark = "✓ " if cur == mode else "   "
+            items.append(
+                Item(
+                    mark + mode_label(mode),
+                    lambda icon, item, m=mode: set_mode(icon, m),
+                )
+            )
+        return pystray.Menu(*items)
+
     def cloud_submenu():
         def cloud_status(icon: pystray.Icon, item: object = None) -> None:
             try:
@@ -1347,6 +1381,7 @@ def main() -> int:
         Item("Макс. длина записи (сек)…", edit_max_hold),
         Item("Словарь →", vocab_submenu()),
         Item("История →", history_submenu()),
+        Item("AI Mode →", ai_mode_submenu()),
         Item("Whisper Cloud →", cloud_submenu()),
         Item("Groq API →", groq_api_submenu()),
         Item("Проверить обновления…", hotkey_check_for_updates),
