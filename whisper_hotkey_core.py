@@ -1015,9 +1015,13 @@ class WhisperHotkey:
 
                             from whisper_groq import (
 
+                                CloudQuotaExceeded,
+
                                 groq_http_timeout_tuple,
 
                                 post_groq_audio_transcription,
+
+                                read_hotkey_cloud_token_pref,
 
                                 read_hotkey_groq_api_key_pref,
                                 read_hotkey_groq_proxy_enabled_pref,
@@ -1060,6 +1064,8 @@ class WhisperHotkey:
 
                                     pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
                                     pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
 
                                     prompt=vocab_prompt or None,
 

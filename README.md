@@ -1,5 +1,8 @@
 # Распознавание речи (RU / EN)
 
+**Сайт / скачать / тарифы:** [zapnikita95.github.io/whisper](https://zapnikita95.github.io/whisper) (папка [`website/`](website/)).  
+**Whisper Cloud:** 30 мин/мес облака без своего ключа — см. [`groq_proxy/README.md`](groq_proxy/README.md). Локальный GPU и BYOK Groq — бесплатно навсегда.
+
 Стек: **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** — те же веса Whisper, но инференс через CTranslate2: обычно быстрее и заметно экономнее по VRAM, чем `openai-whisper` на PyTorch.
 
 ## Рекомендация под ~5 ГБ VRAM

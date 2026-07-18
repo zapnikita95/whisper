@@ -47,7 +47,8 @@ def resolve_groq_proxy_url(pref_stored: str | None = None) -> str:
     ):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip().rstrip("/")
-    return ""
+    # Cloud по умолчанию: публичный Railway-прокси (freemium минуты).
+    return DEFAULT_GROQ_PROXY_URL.rstrip("/")
 
 
 def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
@@ -206,9 +207,163 @@ def ensure_hotkey_default_prefs() -> dict:
     if "paste_mode" not in data:
         data["paste_mode"] = "auto"
         changed = True
+    if not isinstance(data.get("groq_proxy_url"), str) or not str(data.get("groq_proxy_url")).strip():
+        data["groq_proxy_url"] = DEFAULT_GROQ_PROXY_URL
+        data["groq_proxy_enabled"] = True
+        changed = True
     if changed:
         save_hotkey_prefs(data)
     return data
+
+
+class CloudQuotaExceeded(RuntimeError):
+    """HTTP 402: free Cloud minutes exhausted."""
+
+    def __init__(self, message: str, *, remaining_seconds: float = 0.0, body: dict | None = None):
+        super().__init__(message)
+        self.remaining_seconds = float(remaining_seconds)
+        self.body = body or {}
+
+
+def _uuid4() -> str:
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+def read_hotkey_cloud_token_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("cloud_token")
+    if isinstance(v, str) and v.strip().startswith("wsk_"):
+        return v.strip()
+    return None
+
+
+def read_hotkey_cloud_device_id_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("cloud_device_id")
+    if isinstance(v, str) and len(v.strip()) >= 8:
+        return v.strip()
+    return None
+
+
+def resolve_cloud_token(pref_stored: str | None = None) -> str:
+    for candidate in (
+        os.environ.get("WHISPER_CLOUD_TOKEN"),
+        os.environ.get("WHISPER_GROQ_CLOUD_TOKEN"),
+        pref_stored,
+        read_hotkey_cloud_token_pref(),
+    ):
+        if isinstance(candidate, str) and candidate.strip().startswith("wsk_"):
+            return candidate.strip()
+    return ""
+
+
+def ensure_cloud_device_id(*, pref_get: dict | None = None, pref_save: Callable[[dict], None] | None = None) -> str:
+    """Stable anonymous device id in hotkey prefs (or provided dict)."""
+    if pref_get is not None:
+        existing = pref_get.get("cloud_device_id")
+        if isinstance(existing, str) and len(existing.strip()) >= 8:
+            return existing.strip()
+        did = _uuid4()
+        pref_get["cloud_device_id"] = did
+        if pref_save:
+            pref_save(pref_get)
+        return did
+    existing = read_hotkey_cloud_device_id_pref()
+    if existing:
+        return existing
+    did = _uuid4()
+    data = load_hotkey_prefs()
+    data["cloud_device_id"] = did
+    save_hotkey_prefs(data)
+    return did
+
+
+def register_cloud_device(
+    proxy_base: str,
+    *,
+    device_id: str | None = None,
+    timeout: float = 30.0,
+) -> dict:
+    """POST /v1/devices/register → {token, plan, remaining_…}."""
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    did = (device_id or ensure_cloud_device_id()).strip()
+    r = requests.post(
+        f"{base}/v1/devices/register",
+        json={"device_id": did},
+        headers={"Accept": "application/json", "User-Agent": "WhisperClient/1.0"},
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_register_http_{r.status_code}:{(r.text or '')[:300]}")
+    out = r.json()
+    if not isinstance(out, dict) or not str(out.get("token", "")).startswith("wsk_"):
+        raise RuntimeError("cloud_register_bad_response")
+    return out
+
+
+def fetch_cloud_me(proxy_base: str, token: str, *, timeout: float = 20.0) -> dict:
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    r = requests.get(
+        f"{base}/v1/me",
+        headers={
+            "Accept": "application/json",
+            "X-Whisper-Cloud-Token": token,
+            "User-Agent": "WhisperClient/1.0",
+        },
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_me_http_{r.status_code}:{(r.text or '')[:300]}")
+    out = r.json()
+    if not isinstance(out, dict):
+        raise RuntimeError("cloud_me_bad_response")
+    return out
+
+
+def create_cloud_checkout(proxy_base: str, token: str, *, timeout: float = 30.0) -> dict:
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    r = requests.post(
+        f"{base}/v1/checkout",
+        headers={
+            "Accept": "application/json",
+            "X-Whisper-Cloud-Token": token,
+            "User-Agent": "WhisperClient/1.0",
+        },
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_checkout_http_{r.status_code}:{(r.text or '')[:400]}")
+    out = r.json()
+    if not isinstance(out, dict):
+        raise RuntimeError("cloud_checkout_bad_response")
+    return out
+
+
+def ensure_cloud_token_for_proxy(
+    proxy_base: str,
+    *,
+    pref_token: str | None = None,
+    device_id: str | None = None,
+    persist_hotkey: bool = True,
+    on_registered: Callable[[str, dict], None] | None = None,
+) -> str:
+    """Return wsk_…; register + persist if missing."""
+    tok = resolve_cloud_token(pref_token)
+    if tok:
+        return tok
+    did = (device_id or "").strip() or ensure_cloud_device_id()
+    snap = register_cloud_device(proxy_base, device_id=did)
+    token = str(snap["token"])
+    if persist_hotkey:
+        data = load_hotkey_prefs()
+        data["cloud_token"] = token
+        data["cloud_device_id"] = str(snap.get("device_id") or did)
+        save_hotkey_prefs(data)
+    if on_registered:
+        on_registered(token, snap)
+    return token
 
 
 def read_hotkey_groq_proxy_url_pref() -> str | None:
@@ -408,6 +563,7 @@ def post_groq_audio_transcription(
     pref_proxy_url: str | None = None,
     pref_proxy_secret: str | None = None,
     pref_proxy_enabled: bool | None = None,
+    pref_cloud_token: str | None = None,
     prompt: str | None = None,
 ) -> dict[str, Any]:
     proxy_enabled = resolve_groq_proxy_enabled(pref_proxy_enabled)
@@ -449,6 +605,26 @@ def post_groq_audio_transcription(
         headers["Authorization"] = f"Bearer {key}"
     elif not use_proxy:
         raise ValueError("Внутренняя ошибка: нет ключа для прямого запроса к Groq.")
+
+    cloud_token = ""
+    if use_proxy and not passthrough_auth and not (key and passthrough_auth):
+        # Hosted Cloud: register anonymous device unless BYOK passthrough or ops secret alone.
+        # Ops secret still works without token; for public users we auto-register.
+        if not proxy_secret or resolve_cloud_token(pref_cloud_token):
+            try:
+                cloud_token = ensure_cloud_token_for_proxy(
+                    proxy_base,
+                    pref_token=pref_cloud_token,
+                )
+                headers["X-Whisper-Cloud-Token"] = cloud_token
+            except Exception as e:
+                if not proxy_secret:
+                    raise RuntimeError(
+                        f"Не удалось зарегистрировать Whisper Cloud: {e}. "
+                        "Проверь интернет или вставь токен wsk_… в настройках Cloud."
+                    ) from e
+                if log_error:
+                    log_error("cloud_register_skipped_using_proxy_secret err=%s", e)
 
     prompt_str = (prompt or "").strip()
 
@@ -497,6 +673,24 @@ def post_groq_audio_transcription(
         if log_error:
             log_error("groq_transcribe_403_retry model=%s -> %s", primary, FALLBACK_GROQ_MODEL)
         resp = _post(FALLBACK_GROQ_MODEL, auth_key=auth_key)
+    if resp.status_code == 402:
+        detail = (resp.text or "")[:500]
+        remaining = 0.0
+        body: dict[str, Any] = {}
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                remaining = float(body.get("remaining_seconds") or 0)
+        except Exception:
+            body = {}
+        if log_error:
+            log_error("cloud_quota_exceeded remaining=%s body=%r", remaining, detail)
+        raise CloudQuotaExceeded(
+            "Минуты Whisper Cloud на этот месяц закончились. "
+            "Оформи Pro в настройках Cloud или используй локальный GPU / свой ключ Groq.",
+            remaining_seconds=remaining,
+            body=body if isinstance(body, dict) else {},
+        )
     if resp.status_code >= 400:
         detail = (resp.text or "")[:400]
         if log_error:

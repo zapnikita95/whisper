@@ -66,6 +66,9 @@ def launch_settings_window(
             from whisper_groq import (
                 DEFAULT_GROQ_PROXY_URL,
                 ensure_hotkey_default_prefs,
+                create_cloud_checkout,
+                ensure_cloud_token_for_proxy,
+                fetch_cloud_me,
                 groq_api_key_from_env,
                 groq_is_configured,
                 load_hotkey_prefs,
@@ -392,6 +395,112 @@ def launch_settings_window(
                     foreground="#c60",
                     wraplength=500,
                 ).pack(anchor=tk.W, pady=(6, 0))
+
+            # —— Whisper Cloud ——
+            ttk.Separator(frm, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+            ttk.Label(frm, text="Whisper Cloud (подписка)", font=("Segoe UI", 10, "bold")).pack(
+                anchor=tk.W
+            )
+            ttk.Label(
+                frm,
+                text="Free: 30 мин/мес облака без своего ключа. Local GPU и свой Groq — бесплатно навсегда.",
+                foreground="#666",
+                wraplength=500,
+            ).pack(anchor=tk.W, pady=(0, 4))
+            cloud_status = ttk.Label(frm, text="", foreground="#555", wraplength=500)
+            cloud_status.pack(anchor=tk.W, pady=(0, 6))
+
+            def _cloud_status_text() -> str:
+                p = load_hotkey_prefs()
+                tok = p.get("cloud_token") if isinstance(p.get("cloud_token"), str) else ""
+                if not tok.startswith("wsk_"):
+                    return "Cloud: не зарегистрирован — нажми «Зарегистрировать»"
+                try:
+                    base = resolve_groq_proxy_url(
+                        p.get("groq_proxy_url") if isinstance(p.get("groq_proxy_url"), str) else None
+                    ) or DEFAULT_GROQ_PROXY_URL
+                    me = fetch_cloud_me(base, tok)
+                    return (
+                        f"Cloud {me.get('plan')}: осталось {me.get('remaining_minutes')} мин "
+                        f"· период {me.get('period')}"
+                    )
+                except Exception as e:
+                    return f"Cloud токен есть, статус недоступен: {e}"
+
+            def _refresh_cloud() -> None:
+                cloud_status.configure(text=_cloud_status_text())
+
+            def _cloud_register() -> None:
+                try:
+                    base = resolve_groq_proxy_url(
+                        load_hotkey_prefs().get("groq_proxy_url")
+                        if isinstance(load_hotkey_prefs().get("groq_proxy_url"), str)
+                        else None
+                    ) or DEFAULT_GROQ_PROXY_URL
+                    ensure_cloud_token_for_proxy(base)
+                    _refresh_cloud()
+                    messagebox.showinfo("Whisper Cloud", "Устройство зарегистрировано.", parent=root)
+                except Exception as e:
+                    messagebox.showerror("Whisper Cloud", str(e), parent=root)
+
+            def _cloud_paste_token() -> None:
+                ans = simpledialog.askstring(
+                    "Cloud токен",
+                    "Вставь wsk_… Пусто + OK — удалить.",
+                    show="*",
+                    parent=root,
+                )
+                if ans is None:
+                    return
+                p = load_hotkey_prefs()
+                s = ans.strip()
+                if not s:
+                    p.pop("cloud_token", None)
+                elif not s.startswith("wsk_"):
+                    messagebox.showerror("Cloud", "Токен должен начинаться с wsk_", parent=root)
+                    return
+                else:
+                    p["cloud_token"] = s
+                save_hotkey_prefs(p)
+                if on_prefs_saved:
+                    on_prefs_saved()
+                _refresh_cloud()
+
+            def _cloud_checkout() -> None:
+                try:
+                    p = load_hotkey_prefs()
+                    base = resolve_groq_proxy_url(
+                        p.get("groq_proxy_url") if isinstance(p.get("groq_proxy_url"), str) else None
+                    ) or DEFAULT_GROQ_PROXY_URL
+                    tok = ensure_cloud_token_for_proxy(base)
+                    out = create_cloud_checkout(base, tok)
+                    url = out.get("checkout_url")
+                    if not url:
+                        messagebox.showinfo(
+                            "Whisper Cloud",
+                            "Stripe на сервере не настроен. Админ может выдать Pro через grant_pro.py.",
+                            parent=root,
+                        )
+                        return
+                    import webbrowser
+
+                    webbrowser.open(str(url))
+                except Exception as e:
+                    messagebox.showerror("Whisper Cloud", str(e), parent=root)
+
+            cloud_row = ttk.Frame(frm)
+            cloud_row.pack(fill=tk.X, pady=2)
+            ttk.Button(cloud_row, text="Обновить статус", command=_refresh_cloud).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
+            ttk.Button(cloud_row, text="Зарегистрировать", command=_cloud_register).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
+            ttk.Button(cloud_row, text="Вставить токен…", command=_cloud_paste_token).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
+            ttk.Button(cloud_row, text="Оформить Pro…", command=_cloud_checkout).pack(side=tk.LEFT)
+            _refresh_cloud()
 
             # —— Voice ——
             ttk.Separator(frm, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)

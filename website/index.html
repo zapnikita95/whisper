@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Whisper Hotkey — голос в текст без железа</title>
+  <meta name="description" content="Диктовка по хоткею: локальный GPU, Mac↔Windows, Whisper Cloud 30 мин бесплатно. Privacy-first." />
+  <style>
+    :root {
+      --bg0: #0f1419;
+      --bg1: #1a2332;
+      --ink: #e8eef6;
+      --muted: #9aa8b8;
+      --accent: #3d9cf0;
+      --accent2: #5eead4;
+      --card: rgba(255,255,255,0.04);
+      --line: rgba(255,255,255,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "SF Pro Text", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 55%),
+        radial-gradient(900px 500px at 90% 0%, #0d3d38 0%, transparent 50%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 48px 20px 80px; }
+    .brand {
+      font-size: clamp(2.4rem, 6vw, 3.6rem);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      margin: 0 0 12px;
+    }
+    .brand span { color: var(--accent2); }
+    .lead { font-size: 1.15rem; color: var(--muted); max-width: 34em; margin: 0 0 28px; }
+    .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 40px; }
+    a.btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 18px; border-radius: 10px; text-decoration: none;
+      font-weight: 600; border: 1px solid var(--line);
+      background: var(--card); color: var(--ink);
+      transition: transform .15s ease, border-color .15s;
+    }
+    a.btn:hover { transform: translateY(-1px); border-color: var(--accent); }
+    a.btn.primary { background: linear-gradient(135deg, #2b7de9, #1f9d8a); border: none; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 14px; padding: 20px 18px;
+    }
+    .card h2 { margin: 0 0 8px; font-size: 1.1rem; }
+    .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+    .price { font-size: 1.8rem; font-weight: 700; margin: 8px 0; }
+    .price small { font-size: 0.9rem; font-weight: 500; color: var(--muted); }
+    ul { margin: 10px 0 0; padding-left: 1.1em; color: var(--muted); }
+    footer { margin-top: 48px; color: var(--muted); font-size: 0.85rem; }
+    footer a { color: var(--accent); }
+    .note {
+      margin-top: 28px; padding: 14px 16px; border-radius: 10px;
+      border: 1px dashed var(--line); color: var(--muted); font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="brand">Whisper <span>Hotkey</span></h1>
+    <p class="lead">
+      Зажми хоткей — говори — текст вставится. Локальный GPU и свой сервер Win↔Mac бесплатно навсегда.
+      Без железа — Whisper Cloud: 30 минут в месяц, дальше Pro.
+    </p>
+    <div class="cta">
+      <a class="btn primary" id="dl-win" href="https://github.com/zapnikita95/whisper/releases/latest">Скачать Windows</a>
+      <a class="btn" id="dl-mac" href="https://github.com/zapnikita95/whisper/releases/latest">Скачать Mac</a>
+      <a class="btn" href="https://github.com/zapnikita95/whisper">GitHub</a>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Free forever</h2>
+        <div class="price">$0 <small>/ всегда</small></div>
+        <ul>
+          <li>Локальный Whisper на NVIDIA</li>
+          <li>Свой ключ Groq (BYOK)</li>
+          <li>Mac-клиент + Windows GPU-сервер</li>
+          <li>Словарь, speaker verify, RU-модели</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Cloud Free</h2>
+        <div class="price">30 мин <small>/ месяц</small></div>
+        <ul>
+          <li>Облако без своего API-ключа</li>
+          <li>Авто-регистрация устройства в приложении</li>
+          <li>Работает без GPU в день установки</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Cloud Pro</h2>
+        <div class="price">Pro <small>/ месяц</small></div>
+        <ul>
+          <li>Безлимит облака (soft-cap против abuse)</li>
+          <li>Оплата в приложении → Stripe Checkout</li>
+          <li>Или Pro-токен от админа</li>
+        </ul>
+        <p style="margin-top:12px"><a class="btn primary" href="https://github.com/zapnikita95/whisper/releases/latest">Установить и оформить в приложении</a></p>
+      </div>
+    </div>
+
+    <div class="note">
+      Чем мы отличаемся от Wispr Flow / Superwhisper: privacy-first локальный путь, русские CT2-пресеты,
+      открытый self-host, speaker verify. Cloud — только если тебе удобнее без железа.
+    </div>
+
+    <footer>
+      Релизы: <a href="https://github.com/zapnikita95/whisper/releases">github.com/zapnikita95/whisper/releases</a>
+      · прокси: Railway <code>groq_proxy</code>
+      · <span id="checkout-msg"></span>
+    </footer>
+  </div>
+  <script>
+    (async () => {
+      try {
+        const r = await fetch("https://api.github.com/repos/zapnikita95/whisper/releases/latest");
+        if (!r.ok) return;
+        const j = await r.json();
+        const assets = j.assets || [];
+        const win = assets.find(a => /WhisperHotkeySetup/i.test(a.name));
+        const mac = assets.find(a => /WhisperClient.*\.dmg/i.test(a.name));
+        if (win) document.getElementById("dl-win").href = win.browser_download_url;
+        if (mac) document.getElementById("dl-mac").href = mac.browser_download_url;
+      } catch (_) {}
+      const q = new URLSearchParams(location.search);
+      const el = document.getElementById("checkout-msg");
+      if (q.get("checkout") === "success") el.textContent = "Оплата прошла — открой приложение и обнови статус Cloud.";
+      if (q.get("checkout") === "cancel") el.textContent = "Оплата отменена.";
+    })();
+  </script>
+</body>
+</html>

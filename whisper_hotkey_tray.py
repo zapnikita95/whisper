@@ -1194,6 +1194,86 @@ def main() -> int:
             Item("Показать подсказку словаря", vocab_show_prompt),
         )
 
+    def cloud_submenu():
+        def cloud_status(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                from whisper_groq import (
+                    DEFAULT_GROQ_PROXY_URL,
+                    ensure_cloud_token_for_proxy,
+                    fetch_cloud_me,
+                    resolve_groq_proxy_url,
+                    read_hotkey_groq_proxy_url_pref,
+                )
+
+                base = resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()) or DEFAULT_GROQ_PROXY_URL
+                tok = ensure_cloud_token_for_proxy(base)
+                me = fetch_cloud_me(base, tok)
+                _notify(
+                    "Whisper Cloud",
+                    f"{me.get('plan')}: {me.get('remaining_minutes')} мин осталось ({me.get('period')})",
+                    False,
+                    force=True,
+                )
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        def cloud_checkout(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                from whisper_groq import (
+                    DEFAULT_GROQ_PROXY_URL,
+                    create_cloud_checkout,
+                    ensure_cloud_token_for_proxy,
+                    resolve_groq_proxy_url,
+                    read_hotkey_groq_proxy_url_pref,
+                )
+
+                base = resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()) or DEFAULT_GROQ_PROXY_URL
+                tok = ensure_cloud_token_for_proxy(base)
+                out = create_cloud_checkout(base, tok)
+                url = out.get("checkout_url")
+                if not url:
+                    _notify(
+                        "Whisper Cloud",
+                        "Stripe не настроен — нужен grant_pro.py или STRIPE_* на Railway",
+                        True,
+                        force=True,
+                    )
+                    return
+                webbrowser.open(str(url))
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        def cloud_paste_token(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                import tkinter as tk
+                from tkinter import simpledialog
+
+                from whisper_groq import load_hotkey_prefs, save_hotkey_prefs
+
+                root = tk.Tk()
+                root.withdraw()
+                ans = simpledialog.askstring("Cloud токен", "wsk_… (пусто — очистить)", show="*")
+                root.destroy()
+                if ans is None:
+                    return
+                p = load_hotkey_prefs()
+                s = ans.strip()
+                if not s:
+                    p.pop("cloud_token", None)
+                else:
+                    p["cloud_token"] = s
+                save_hotkey_prefs(p)
+                _notify("Whisper Cloud", "Токен сохранён" if s else "Токен очищен", False, force=True)
+                icon.update_menu()
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        return pystray.Menu(
+            Item("Статус минут…", cloud_status),
+            Item("Вставить токен…", cloud_paste_token),
+            Item("Оформить Pro…", cloud_checkout),
+        )
+
     def groq_api_submenu():
         return pystray.Menu(
             Item(groq_key_status_label, None, enabled=False),
@@ -1267,6 +1347,7 @@ def main() -> int:
         Item("Макс. длина записи (сек)…", edit_max_hold),
         Item("Словарь →", vocab_submenu()),
         Item("История →", history_submenu()),
+        Item("Whisper Cloud →", cloud_submenu()),
         Item("Groq API →", groq_api_submenu()),
         Item("Проверить обновления…", hotkey_check_for_updates),
         Item("Папка логов", open_log_folder),

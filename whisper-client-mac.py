@@ -140,6 +140,11 @@ except ImportError:
 
 try:
     from whisper_groq import (
+        CloudQuotaExceeded,
+        DEFAULT_GROQ_PROXY_URL,
+        create_cloud_checkout,
+        ensure_cloud_token_for_proxy,
+        fetch_cloud_me,
         post_groq_audio_transcription,
         resolve_auto_vram_backend_order,
         resolve_groq_api_key,
@@ -681,6 +686,8 @@ _MAC_CLIENT_PREF_STR_KEYS = frozenset(
         "groq_api_key",
         "groq_proxy_url",
         "groq_proxy_secret",
+        "cloud_token",
+        "cloud_device_id",
         "server_url",
         "server_host",
     }
@@ -785,7 +792,7 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 else:
                     cur[k] = s
                 continue
-            if k in ("groq_proxy_url", "groq_proxy_secret"):
+            if k in ("groq_proxy_url", "groq_proxy_secret", "cloud_token", "cloud_device_id"):
                 if not s:
                     cur.pop(k, None)
                 else:
@@ -888,6 +895,8 @@ def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
         out["groq_api_key"] = "(задан)"
     if "groq_proxy_secret" in out and out["groq_proxy_secret"]:
         out["groq_proxy_secret"] = "(задан)"
+    if "cloud_token" in out and out["cloud_token"]:
+        out["cloud_token"] = "(задан)"
     return out
 
 
@@ -2201,6 +2210,8 @@ class WhisperClientMac:
         self._pref_groq_proxy_url: str | None = None
         self._pref_groq_proxy_secret: str | None = None
         self._pref_groq_proxy_enabled: bool | None = None
+        self._pref_cloud_token: str | None = None
+        self._pref_cloud_device_id: str | None = None
         self._pref_server_url: str | None = None
         self._pref_server_host: str | None = None
         self._pref_server_port: int | None = None
@@ -2238,6 +2249,14 @@ class WhisperClientMac:
         self._pref_groq_proxy_enabled = None
         if "groq_proxy_enabled" in p:
             self._pref_groq_proxy_enabled = bool(p["groq_proxy_enabled"])
+        ct = p.get("cloud_token")
+        self._pref_cloud_token = (
+            ct.strip() if isinstance(ct, str) and ct.strip().startswith("wsk_") else None
+        )
+        cd = p.get("cloud_device_id")
+        self._pref_cloud_device_id = (
+            cd.strip() if isinstance(cd, str) and len(cd.strip()) >= 8 else None
+        )
         su = p.get("server_url")
         self._pref_server_url = (
             su.strip().rstrip("/")
@@ -2349,7 +2368,32 @@ class WhisperClientMac:
         if raw:
             return raw
         env = (os.environ.get("WHISPER_GROQ_PROXY_URL") or os.environ.get("GROQ_PROXY_URL") or "").strip().rstrip("/")
-        return env
+        return env or DEFAULT_GROQ_PROXY_URL.rstrip("/")
+
+    def _persist_cloud_registration(self, token: str, snap: dict) -> None:
+        did = snap.get("device_id") if isinstance(snap.get("device_id"), str) else self._pref_cloud_device_id
+        self._merge_save_mac_prefs(
+            cloud_token=token,
+            cloud_device_id=did or "",
+        )
+
+    def _ensure_mac_cloud_token(self) -> str:
+        import uuid
+
+        did = self._pref_cloud_device_id or str(uuid.uuid4())
+        if not self._pref_cloud_device_id:
+            self._merge_save_mac_prefs(cloud_device_id=did)
+
+        def _on_reg(token: str, snap: dict) -> None:
+            self._persist_cloud_registration(token, snap)
+
+        return ensure_cloud_token_for_proxy(
+            self._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+            pref_token=self._pref_cloud_token,
+            device_id=did,
+            persist_hotkey=False,
+            on_registered=_on_reg,
+        )
 
     def _effective_transcribe_backend_mode(self) -> str:
         return resolve_transcribe_backend_mode(
@@ -2489,6 +2533,12 @@ class WhisperClientMac:
             raise ValueError(
                 "Нет ключа Groq или прокси: меню «Groq API ключ…», .env, либо «Groq прокси URL» (Railway).",
             )
+        cloud_tok = self._pref_cloud_token
+        if proxy_on and not self._pref_groq_proxy_secret:
+            try:
+                cloud_tok = self._ensure_mac_cloud_token()
+            except Exception as e:
+                _mac_log("warning", "cloud_register_failed err=%s", e)
         _tx_conn, _tx_read = self._effective_transcribe_timeouts()
         try:
             return post_groq_audio_transcription(
@@ -2500,14 +2550,17 @@ class WhisperClientMac:
                 pref_proxy_url=self._effective_groq_proxy_url(),
                 pref_proxy_secret=self._pref_groq_proxy_secret,
                 pref_proxy_enabled=proxy_enabled,
+                pref_cloud_token=cloud_tok,
                 prompt=prompt,
             )
+        except CloudQuotaExceeded as e:
+            raise ValueError(str(e)) from e
         except RuntimeError as e:
             low = str(e).lower()
             if "proxy secret" in low or "missing proxy secret" in low:
                 raise ValueError(
-                    "Groq-прокси требует секрет. В меню: Groq API → «Свой Groq прокси секрет…» "
-                    "(тот же PROXY_SHARED_SECRET из Railway)."
+                    "Groq-прокси требует секрет или Whisper Cloud токен. "
+                    "Меню: Cloud → статус / вставить токен, либо «Свой Groq прокси секрет…»."
                 ) from e
             raise
 
@@ -4456,6 +4509,7 @@ if rumps is not None:
                 rumps.separator,
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
                 ("Словарь", self._vocab_submenu_items()),
+                ("Whisper Cloud", self._cloud_submenu_items()),
                 ("Groq API", self._groq_api_submenu_items()),
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
@@ -4685,6 +4739,77 @@ if rumps is not None:
                 f"Файл словаря: {vocab_file_path()}"
             )
             rumps.alert("Словарь — текущая подсказка", msg)
+
+        def _cloud_submenu_items(self) -> list:
+            return [
+                rumps.MenuItem("Статус минут…", callback=self._cloud_status_menu),
+                rumps.MenuItem("Зарегистрировать Cloud…", callback=self._cloud_register_menu),
+                rumps.MenuItem("Вставить Cloud токен…", callback=self._cloud_token_menu),
+                rumps.MenuItem("Оформить Pro (Stripe)…", callback=self._cloud_checkout_menu),
+            ]
+
+        def _cloud_status_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                me = fetch_cloud_me(
+                    self.client._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+                    tok,
+                )
+                rumps.alert(
+                    "Whisper Cloud",
+                    (
+                        f"План: {me.get('plan')}\n"
+                        f"Осталось: {me.get('remaining_minutes')} мин "
+                        f"({me.get('remaining_seconds')} с)\n"
+                        f"Период: {me.get('period')}\n"
+                        f"Квота: {round(float(me.get('quota_seconds') or 0)/60, 1)} мин"
+                    ),
+                )
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Не удалось получить статус:\n{e}")
+
+        def _cloud_register_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                mac_banner_notification("Whisper Cloud", f"Токен готов ({tok[:12]}…)")
+                self._safe_recompose_menu()
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Регистрация не удалась:\n{e}")
+
+        def _cloud_token_menu(self, _sender) -> None:
+            raw = _mac_osascript_prompt_line(
+                title="Whisper Cloud токен",
+                message="Вставь wsk_… токен. Пусто + Сохранить — очистить.",
+            )
+            if raw is None:
+                return
+            s = raw.strip()
+            if s and not s.startswith("wsk_"):
+                rumps.alert("Whisper Cloud", "Токен должен начинаться с wsk_")
+                return
+            self.client._merge_save_mac_prefs(cloud_token=s if s else "")
+            self._safe_recompose_menu()
+            mac_banner_notification("Whisper Cloud", "Токен сохранён." if s else "Токен очищен.")
+
+        def _cloud_checkout_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                out = create_cloud_checkout(
+                    self.client._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+                    tok,
+                )
+                url = out.get("checkout_url")
+                if not url:
+                    rumps.alert(
+                        "Whisper Cloud",
+                        "Stripe не настроен на сервере. Попроси админа выдать Pro "
+                        "(grant_pro.py) или задай STRIPE_* на Railway.",
+                    )
+                    return
+                subprocess.Popen(["open", str(url)])  # noqa: S603
+                mac_banner_notification("Whisper Cloud", "Открыта оплата Pro в браузере.")
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Checkout:\n{e}")
 
         def _groq_api_submenu_items(self) -> list:
             proxy_enabled = self.client._effective_groq_proxy_enabled()
