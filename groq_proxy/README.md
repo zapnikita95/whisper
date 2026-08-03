@@ -1,31 +1,15 @@
-<<<<<<< HEAD
-# Groq proxy (Railway + Layero RF)
+# Groq proxy + Whisper Cloud
 
-Если с твоей сети **api.groq.com** / `*.up.railway.app` не открывается (РФ без VPN):
+Прокси к Groq STT + freemium Cloud (токены `wsk_…`, минуты, Stripe).
 
-1. Origin остаётся на Railway: `https://whisper-groq-proxy-production.up.railway.app`
-2. Публичное зеркало для РФ — **Layero**: `https://whisper-groq-proxy.layero.app` (см. `rf-mirror-layero/`)
+- Railway origin: **https://whisper-groq-proxy-production.up.railway.app**
+- Layero RF mirror (без VPN из РФ): **https://whisper-groq-proxy.layero.app** — см. `rf-mirror-layero/`
 
 ```env
 WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy.layero.app
 ```
 
 Mac-клиент (b53+) использует Layero URL по умолчанию, прокси включён.
-
-## Railway origin
-
-Проект: `whisper-groq-proxy` (`railway up` из `groq_proxy/`).
-
-| Переменная | Значение |
-|------------|----------|
-| `GROQ_API_KEY` | ключ `gsk_…` |
-| `PROXY_SHARED_SECRET` | опционально |
-=======
-# Groq proxy + Whisper Cloud
-
-Прокси к Groq STT + freemium Cloud (токены `wsk_…`, минуты, Stripe).
-
-Публичный URL (пример): **https://whisper-groq-proxy-production.up.railway.app**
 
 ## Эндпоинты
 
@@ -66,7 +50,6 @@ Mac-клиент (b53+) использует Layero URL по умолчанию,
 Подключи **Railway Volume** на `/data`, иначе SQLite будет в эфемерном FS.
 
 ## Локально
->>>>>>> origin/main
 
 ```bash
 cd groq_proxy
@@ -76,9 +59,6 @@ set GROQ_API_KEY=gsk_…
 uvicorn main:app --reload --port 8088
 ```
 
-<<<<<<< HEAD
-Клиент: `POST {PROXY}/openai/v1/audio/transcriptions` (тот же multipart, что у Groq).
-=======
 Ручной Pro:
 
 ```bash
@@ -92,9 +72,8 @@ python grant_pro.py wsk_... --remote https://….up.railway.app --admin-secret �
 В `.env` / prefs:
 
 ```env
-WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy-production.up.railway.app
+WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy.layero.app
 # WHISPER_CLOUD_TOKEN=wsk_…   # обычно создаётся сам при первой диктовке
 ```
 
 Windows/Mac: меню **Whisper Cloud** — статус минут, токен, Checkout.
->>>>>>> origin/main
