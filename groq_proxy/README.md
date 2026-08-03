@@ -2,7 +2,14 @@
 
 Прокси к Groq STT + freemium Cloud (токены `wsk_…`, минуты, Stripe).
 
-Публичный URL (пример): **https://whisper-groq-proxy-production.up.railway.app**
+- Railway origin: **https://whisper-groq-proxy-production.up.railway.app**
+- Layero RF mirror (без VPN из РФ): **https://whisper-groq-proxy.layero.app** — см. `rf-mirror-layero/`
+
+```env
+WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy.layero.app
+```
+
+Mac-клиент (b53+) использует Layero URL по умолчанию, прокси включён.
 
 ## Эндпоинты
 
@@ -65,7 +72,7 @@ python grant_pro.py wsk_... --remote https://….up.railway.app --admin-secret �
 В `.env` / prefs:
 
 ```env
-WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy-production.up.railway.app
+WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy.layero.app
 # WHISPER_CLOUD_TOKEN=wsk_…   # обычно создаётся сам при первой диктовке
 ```
 

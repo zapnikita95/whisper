@@ -166,7 +166,8 @@ static void WCInstallEditMenu(void) {
 	[_pastePopup selectItemAtIndex:pidx ? pidx.integerValue : 0];
 	NSString *gk = p[@"groq_api_key"];
 	_groqField.stringValue = [gk isKindOfClass:[NSString class]] ? gk : @"";
-	_statusLabel.stringValue = [NSString stringWithFormat:@"Сейчас: %@ · %@", wcBackendLabel(bk), wcServerURL(p)];
+	_statusLabel.stringValue = [NSString stringWithFormat:@"Сейчас: %@ · %@ · прокси %@", wcBackendLabel(bk), wcServerURL(p),
+	                                                      (wcGroqProxyEnabled(p, self.app.env) ? @"ON" : @"OFF")];
 }
 
 - (void)save:(id)sender {
@@ -259,25 +260,70 @@ static void wcHttpProbe(NSString *urlStr, void (^done)(NSInteger code, NSError *
 			}
 		}
 		if (testGroq) {
-			if (!groqKey.length) {
+			BOOL proxyOn = wcGroqProxyEnabled(formPrefs, self.app.env);
+			NSString *proxyBase = wcGroqProxyURL(formPrefs, self.app.env);
+			if (proxyOn && proxyBase.length) {
+				__block NSInteger pcode = -1;
+				__block NSError *perr = nil;
+				__block NSData *pbody = nil;
+				NSInteger codeTmp = -1;
+				NSError *errTmp = nil;
+				NSData *bodyTmp = nil;
+				if (!wcHttpRequest(@"GET", [NSString stringWithFormat:@"%@/", proxyBase], nil, nil, 15, &codeTmp, &bodyTmp,
+				                   &errTmp)) {
+					pcode = -1;
+					perr = errTmp;
+				} else {
+					pcode = codeTmp;
+					pbody = bodyTmp;
+				}
+				NSInteger hcode = -1;
+				NSError *herr = nil;
+				NSData *hbody = nil;
+				wcHttpRequest(@"GET", [NSString stringWithFormat:@"%@/__rf_mirror_health", proxyBase], nil, nil, 15, &hcode,
+				              &hbody, &herr);
+				(void)herr;
+				BOOL proxyOk = (pcode >= 200 && pcode < 300);
+				if (proxyOk) {
+					[lines addObject:[NSString stringWithFormat:@"✓ Groq-прокси %@ (HTTP %ld)%@", proxyBase, (long)pcode,
+					                                            (hcode == 200 ? @" · Layero OK" : @"")]];
+				} else if (perr) {
+					allOk = NO;
+					[lines addObject:[NSString stringWithFormat:@"✗ Прокси %@: %@", proxyBase, perr.localizedDescription]];
+				} else {
+					allOk = NO;
+					[lines addObject:[NSString stringWithFormat:@"✗ Прокси %@: HTTP %ld (нужен 2xx, не 404)", proxyBase,
+					                                            (long)pcode]];
+				}
+				(void)pbody;
+				if (hcode > 0 && hcode != 200) {
+					[lines addObject:[NSString stringWithFormat:@"· mirror health HTTP %ld", (long)hcode]];
+				}
+				if (!groqKey.length) {
+					[lines addObject:@"· Ключ Groq на клиенте не задан — прокси может подставить свой"];
+				}
+			} else if (!groqKey.length) {
 				allOk = NO;
-				[lines addObject:@"✗ Groq: ключ не задан"];
+				[lines addObject:@"✗ Groq: ключ не задан (прокси выключен)"];
 			} else {
-				NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.groq.com/openai/v1/models"]];
+				NSMutableURLRequest *req =
+				    [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.groq.com/openai/v1/models"]];
 				req.timeoutInterval = 15;
 				[req setValue:[NSString stringWithFormat:@"Bearer %@", groqKey] forHTTPHeaderField:@"Authorization"];
 				dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 				__block NSInteger code = -1;
 				__block NSError *err = nil;
-				[[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-					(void)d;
-					err = e;
-					if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = [(NSHTTPURLResponse *)r statusCode];
-					dispatch_semaphore_signal(sem);
-				}] resume];
-				dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+				[[[NSURLSession sharedSession] dataTaskWithRequest:req
+				                                 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+					                                 (void)d;
+					                                 err = e;
+					                                 if ([r isKindOfClass:[NSHTTPURLResponse class]])
+						                                 code = [(NSHTTPURLResponse *)r statusCode];
+					                                 dispatch_semaphore_signal(sem);
+				                                 }] resume];
+				dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
 				if (code == 200) {
-					[lines addObject:@"✓ Groq API (ключ OK)"];
+					[lines addObject:@"✓ Groq API напрямую (ключ OK)"];
 				} else if (code == 401 || code == 403) {
 					allOk = NO;
 					[lines addObject:[NSString stringWithFormat:@"✗ Groq: ключ отклонён (HTTP %ld)", (long)code]];

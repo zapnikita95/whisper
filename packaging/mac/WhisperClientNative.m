@@ -14,6 +14,8 @@ static NSString *const kDefaultServerHost = @"100.115.68.2";
 static const NSInteger kDefaultServerPort = 8001;
 static NSString *const kGroqURL = @"https://api.groq.com/openai/v1/audio/transcriptions";
 static NSString *const kGroqModel = @"whisper-large-v3";
+/* Layero RF mirror → Railway groq_proxy (без VPN из РФ). */
+static NSString *const kDefaultGroqProxyURL = @"https://whisper-groq-proxy.layero.app";
 
 static const CGEventFlags kModFn = kCGEventFlagMaskSecondaryFn;
 static const CGEventFlags kOtherMods =
@@ -33,6 +35,9 @@ static CFRunLoopRef g_tapLoop = NULL;
 @property(nonatomic, assign) pid_t pasteTargetPID;
 @property(nonatomic, assign) BOOL recording;
 @property(nonatomic, assign) BOOL menuRecording;
+@property(nonatomic, assign) BOOL processing; /* afconvert/upload — UI must stay alive */
+@property(nonatomic, assign) BOOL menuIsOpen;
+@property(nonatomic, assign) BOOL menuNeedsRebuild;
 @property(nonatomic, strong) NSTimer *maxRecordTimer;
 @property(nonatomic, strong) NSMutableDictionary *prefs;
 @property(nonatomic, strong) NSDictionary *env;
@@ -43,6 +48,7 @@ static CFRunLoopRef g_tapLoop = NULL;
 - (void)rebuildMenu;
 - (void)savePrefs;
 - (void)userNotify:(NSString *)title body:(NSString *)body;
+- (void)finishProcessingAfterDelay:(NSTimeInterval)sec;
 - (void)openSettings:(id)sender;
 - (void)editServerURL:(id)sender;
 - (void)clearServer:(id)sender;
@@ -69,6 +75,7 @@ static CFRunLoopRef g_tapLoop = NULL;
 - (void)openHistoryFile:(id)sender;
 - (void)menuStartRecord:(id)sender;
 - (void)menuStopRecord:(id)sender;
+- (void)retryLastTake:(id)sender;
 - (void)restartHotkey:(id)sender;
 - (void)openInputMonitoring:(id)sender;
 - (void)openLog:(id)sender;
@@ -129,7 +136,7 @@ static void *wcTapThreadMain(void *arg) {
 	(void)arg;
 	CGEventMask mask = CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown) |
 	                   CGEventMaskBit(kCGEventKeyUp);
-	g_tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, wcTapCallback, NULL);
+	g_tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, wcTapCallback, NULL);
 	if (!g_tap) {
 		wcLog(@"CGEventTapCreate failed in tap thread");
 		g_tapRunning = 0;
@@ -256,6 +263,45 @@ static NSString *wcGroqKey(NSDictionary *prefs, NSDictionary *env) {
 	return wcStringPref(prefs, @"groq_api_key");
 }
 
+NSString *wcGroqProxyURL(NSDictionary *prefs, NSDictionary *env) {
+	NSString *p = wcStringPref(prefs, @"groq_proxy_url");
+	if (p.length) return [p stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
+	p = env[@"WHISPER_GROQ_PROXY_URL"] ?: @"";
+	if (p.length) return [p stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
+	return kDefaultGroqProxyURL;
+}
+
+BOOL wcGroqProxyEnabled(NSDictionary *prefs, NSDictionary *env) {
+	id v = prefs[@"groq_proxy_enabled"];
+	if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+	NSString *e = env[@"WHISPER_GROQ_PROXY_ENABLED"] ?: env[@"GROQ_PROXY_ENABLED"];
+	if ([e isKindOfClass:[NSString class]] && e.length) {
+		NSString *l = e.lowercaseString;
+		if ([l isEqualToString:@"0"] || [l isEqualToString:@"false"] || [l isEqualToString:@"no"] ||
+		    [l isEqualToString:@"off"])
+			return NO;
+		return YES;
+	}
+	/* По умолчанию ON: из РФ прямой api.groq.com / Railway часто таймаутится. */
+	return YES;
+}
+
+static NSString *wcGroqProxySecret(NSDictionary *prefs, NSDictionary *env) {
+	NSString *s = wcStringPref(prefs, @"groq_proxy_secret");
+	if (s.length) return s;
+	return env[@"WHISPER_GROQ_PROXY_SECRET"] ?: env[@"PROXY_SHARED_SECRET"] ?: @"";
+}
+
+static NSString *wcLastTakePath(void) {
+	return [NSHomeDirectory()
+	    stringByAppendingPathComponent:@"Library/Application Support/WhisperClient/last_take.wav"];
+}
+
+static BOOL wcHasLastTake(void) {
+	NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:wcLastTakePath() error:nil];
+	return attrs.fileSize >= 800;
+}
+
 NSString *wcPasteMode(NSDictionary *prefs) {
 	NSString *m = wcStringPref(prefs, @"paste_mode");
 	if ([m isEqualToString:@"clipboard"] || [m isEqualToString:@"history_only"]) return m;
@@ -277,10 +323,17 @@ static NSString *wcPasteLabel(NSString *mode) {
 	return m[mode] ?: mode;
 }
 
+/* Hard cap: unlimited prefs used to leave main thread stuck on huge afconvert. */
+static const double kWCHardMaxRecordSec = 600.0;
+static const double kWCDefaultMaxRecordSec = 300.0;
+
 static double wcMaxRecordSeconds(NSDictionary *prefs) {
 	id v = prefs[@"max_record_seconds"];
-	if ([v respondsToSelector:@selector(doubleValue)] && [v doubleValue] > 0) return [v doubleValue];
-	return 0;
+	double sec = 0;
+	if ([v respondsToSelector:@selector(doubleValue)]) sec = [v doubleValue];
+	if (sec <= 0) sec = kWCDefaultMaxRecordSec;
+	if (sec > kWCHardMaxRecordSec) sec = kWCHardMaxRecordSec;
+	return sec;
 }
 
 static BOOL wcSkipHealth(NSDictionary *prefs) {
@@ -307,19 +360,9 @@ static void wcOpenURL(NSString *urlStr) {
 }
 
 static void wcOsascriptBanner(NSString *title, NSString *body) {
-	NSString *t = (title.length ? title : @"Whisper");
-	NSString *b = (body.length ? body : @"");
-	t = [t stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-	b = [b stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-	NSString *script = [NSString stringWithFormat:@"display notification \"%@\" with title \"%@\"", b, t];
-	NSTask *task = [[NSTask alloc] init];
-	task.launchPath = @"/usr/bin/osascript";
-	task.arguments = @[ @"-e", script ];
-	@try {
-		[task launch];
-	} @catch (NSException *e) {
-		(void)e;
-	}
+	/* MAS sandbox: NSTask→osascript часто = deny + kill процесса. Не вызываем. */
+	(void)title;
+	(void)body;
 }
 
 static NSString *wcCheckMark(BOOL on) {
@@ -334,6 +377,23 @@ static NSString *wcCheckMark(BOOL on) {
 	if (!data.length) data = [NSData dataWithContentsOfFile:wcLegacyPrefsPath()];
 	id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
 	self.prefs = [obj isKindOfClass:[NSDictionary class]] ? [obj mutableCopy] : [NSMutableDictionary dictionary];
+	/* One-shot b53: dead Layero URLs + re-enable proxy after mirror restore. */
+	BOOL changed = NO;
+	NSString *purl = wcStringPref(self.prefs, @"groq_proxy_url");
+	if (purl.length) {
+		NSString *l = purl.lowercaseString;
+		if ([l containsString:@"anyquery-whisper-groq-proxy"] || [l containsString:@"preview.layero.ru"]) {
+			[self.prefs removeObjectForKey:@"groq_proxy_url"];
+			changed = YES;
+		}
+	}
+	if (!self.prefs[@"groq_proxy_migrated_b53"]) {
+		self.prefs[@"groq_proxy_enabled"] = @YES;
+		self.prefs[@"groq_proxy_migrated_b53"] = @YES;
+		changed = YES;
+		wcLog(@"migrated groq proxy ON → %@", kDefaultGroqProxyURL);
+	}
+	if (changed) [self savePrefs];
 }
 
 - (void)savePrefs {
@@ -351,16 +411,33 @@ static NSString *wcCheckMark(BOOL on) {
 
 - (void)userNotify:(NSString *)title body:(NSString *)body {
 	wcLog(@"notify: %@ — %@", title, body);
-	wcOsascriptBanner(title, body);
+	/* Не трогаем osascript в sandbox — это роняло клиент после «готово». */
 	if (@available(macOS 10.14, *)) {
+		static BOOL sNotifyDenied;
+		if (sNotifyDenied) return;
 		UNMutableNotificationContent *c = [[UNMutableNotificationContent alloc] init];
 		c.title = title ?: @"Whisper";
 		c.body = body ?: @"";
 		UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
 		                                                                    content:c
-		                                                                    trigger:[UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.05 repeats:NO]];
-		[[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:nil];
+		                                                                    trigger:nil];
+		[[UNUserNotificationCenter currentNotificationCenter]
+		    addNotificationRequest:req
+		     withCompletionHandler:^(NSError *err) {
+			     if (!err) return;
+			     /* Code 1 = notifications not allowed — не спамим addNotificationRequest. */
+			     if ([err.domain isEqualToString:UNErrorDomain] && err.code == 1) sNotifyDenied = YES;
+			     else wcLog(@"UN notify err: %@", err);
+		     }];
 	}
+}
+
+- (void)finishProcessingAfterDelay:(NSTimeInterval)sec {
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		self.processing = NO;
+		if (!self.recording) self.statusItem.button.title = @"🎤";
+		[self rebuildMenu];
+	});
 }
 
 - (void)notify:(NSString *)title body:(NSString *)body {
@@ -390,6 +467,12 @@ static NSString *wcCheckMark(BOOL on) {
 }
 
 - (void)rebuildMenu {
+	/* Replacing statusItem.menu while open kills clicks — defer until close. */
+	if (self.menuIsOpen) {
+		self.menuNeedsRebuild = YES;
+		return;
+	}
+	self.menuNeedsRebuild = NO;
 	NSMenu *menu = [[NSMenu alloc] init];
 	menu.delegate = self;
 	menu.autoenablesItems = NO;
@@ -397,11 +480,13 @@ static NSString *wcCheckMark(BOOL on) {
 	NSString *curBackend = wcBackend(self.prefs, self.env);
 	NSString *curPaste = wcPasteMode(self.prefs);
 	NSString *hk = AXIsProcessTrusted() ? @"Fn OK (удерживай для записи)" : @"Fn — нет Input Monitoring";
-	[menu addItem:[self disabled:[NSString stringWithFormat:@"Версия %@", self.appVersion ?: @"?"]]];
+	[menu addItem:[self disabled:[NSString stringWithFormat:@"Версия %@ (%@)", self.appVersion ?: @"?",
+	                                                        [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"]]];
 	[menu addItem:[self disabled:[NSString stringWithFormat:@"Сервер: %@", url]]];
 	[menu addItem:[self disabled:[NSString stringWithFormat:@"Транскрипция: %@", wcBackendLabel(curBackend)]]];
 	[menu addItem:[self disabled:[NSString stringWithFormat:@"Текст: %@", wcPasteLabel(curPaste)]]];
 	[menu addItem:[self disabled:hk]];
+	if (self.processing) [menu addItem:[self disabled:@"⏳ Обработка записи…"]];
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self item:@"⚙️ Настройки…" action:@selector(openSettings:) key:@","]];
 
@@ -428,9 +513,24 @@ static NSString *wcCheckMark(BOOL on) {
 	[menu addItem:[NSMenuItem separatorItem]];
 	if (self.menuRecording) {
 		[menu addItem:[self item:@"⏹ Остановить запись" action:@selector(menuStopRecord:) key:@""]];
+	} else if (self.processing) {
+		[menu addItem:[self disabled:@"🎤 Запись занята…"]];
 	} else {
 		[menu addItem:[self item:@"🎤 Записать сейчас" action:@selector(menuStartRecord:) key:@""]];
 	}
+	if (wcHasLastTake() && !self.processing && !self.menuRecording) {
+		NSUInteger sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:wcLastTakePath() error:nil] fileSize];
+		NSString *title = [NSString stringWithFormat:@"🔁 Повторить расшифровку (%.0f KB)", sz / 1024.0];
+		[menu addItem:[self item:title action:@selector(retryLastTake:) key:@"r"]];
+	}
+	BOOL proxyOn = wcGroqProxyEnabled(self.prefs, self.env);
+	NSString *proxyURL = wcGroqProxyURL(self.prefs, self.env);
+	[menu addItem:[self disabled:[NSString stringWithFormat:@"Прокси: %@%@", proxyOn ? @"ON · " : @"OFF",
+	                                                        proxyOn ? proxyURL : @""]]];
+	[menu addItem:[self item:(proxyOn ? @"Выключить Groq-прокси" : @"Включить Groq-прокси (Layero)")
+	                   action:@selector(toggleGroqProxy:)
+	                      key:@""]];
+	[menu addItem:[self item:@"URL Groq-прокси…" action:@selector(editGroqProxyURL:) key:@""]];
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self item:@"Перезапустить перехват клавиш" action:@selector(restartHotkey:) key:@""]];
 	[menu addItem:[self item:@"Открыть Input Monitoring…" action:@selector(openInputMonitoring:) key:@""]];
@@ -578,19 +678,23 @@ static NSString *wcCheckMark(BOOL on) {
 
 - (void)toggleGroqProxy:(id)sender {
 	(void)sender;
-	BOOL cur = [self.prefs[@"groq_proxy_enabled"] boolValue];
+	BOOL cur = wcGroqProxyEnabled(self.prefs, self.env);
 	self.prefs[@"groq_proxy_enabled"] = @(!cur);
 	[self savePrefs];
 	self.env = [self loadEnv];
 	[self rebuildMenu];
+	[self userNotify:@"Whisper" body:!cur ? @"Groq-прокси (Layero) включён." : @"Groq-прокси выключен — прямой api.groq.com."];
 }
 
 - (void)editGroqProxyURL:(id)sender {
 	(void)sender;
-	NSString *v = wcPromptLine(@"Groq прокси", @"Базовый URL без / в конце:", wcStringPref(self.prefs, @"groq_proxy_url"));
+	NSString *cur = wcStringPref(self.prefs, @"groq_proxy_url");
+	if (!cur.length) cur = wcGroqProxyURL(self.prefs, self.env);
+	NSString *v = wcPromptLine(@"Groq прокси", @"Базовый URL без / в конце (Layero / Railway):", cur);
 	if (v == nil) return;
 	if (v.length) self.prefs[@"groq_proxy_url"] = v;
 	else [self.prefs removeObjectForKey:@"groq_proxy_url"];
+	self.prefs[@"groq_proxy_enabled"] = @YES;
 	[self savePrefs];
 	self.env = [self loadEnv];
 	[self rebuildMenu];
@@ -664,6 +768,50 @@ static NSString *wcCheckMark(BOOL on) {
 	[self onHotkeyUp];
 }
 
+- (void)preserveTakeForRetry:(NSString *)wavPath {
+	if (!wavPath.length) return;
+	NSString *dst = wcLastTakePath();
+	if ([wavPath isEqualToString:dst]) return;
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSDictionary *attrs = [fm attributesOfItemAtPath:wavPath error:nil];
+	unsigned long long bytes = attrs.fileSize;
+	/* Не затираем хороший last_take коротким/пустым кликом Fn. */
+	if (bytes < 8000) {
+		wcLog(@"skip preserve last_take — too small (%llu)", bytes);
+		return;
+	}
+	NSString *dir = [dst stringByDeletingLastPathComponent];
+	[fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+	[fm removeItemAtPath:dst error:nil];
+	NSError *err = nil;
+	if (![fm copyItemAtPath:wavPath toPath:dst error:&err]) {
+		wcLog(@"preserve last_take failed: %@", err);
+		return;
+	}
+	wcLog(@"preserved last_take bytes=%llu", bytes);
+}
+
+- (void)retryLastTake:(id)sender {
+	(void)sender;
+	if (self.recording || self.processing) {
+		[self userNotify:@"Whisper" body:@"Сейчас занято — дождись конца записи/отправки."];
+		return;
+	}
+	if (!wcHasLastTake()) {
+		[self userNotify:@"Whisper" body:@"Нет сохранённой записи для повтора."];
+		return;
+	}
+	NSString *path = wcLastTakePath();
+	wcLog(@"retry last_take %@", path);
+	self.processing = YES;
+	self.statusItem.button.title = @"⏳";
+	[self rebuildMenu];
+	[self userNotify:@"Whisper" body:@"Повторная расшифровка последней записи…"];
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		[self transcribeAndDeliver:path deleteSource:NO];
+	});
+}
+
 - (void)restartHotkey:(id)sender {
 	(void)sender;
 	[self stopHotkeyTap];
@@ -711,7 +859,12 @@ static NSString *wcCheckMark(BOOL on) {
 		g_tapRunning = 0;
 		return NO;
 	}
-	usleep(150000);
+	/* Don't usleep on main — spin runloop briefly so UI stays responsive. */
+	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.6];
+	while (!g_tap && [[NSDate date] compare:deadline] == NSOrderedAscending) {
+		[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+		                          beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+	}
 	if (!g_tap) {
 		wcLog(@"tap not created after thread start");
 		return NO;
@@ -720,10 +873,23 @@ static NSString *wcCheckMark(BOOL on) {
 }
 
 - (void)stopHotkeyTap {
-	if (g_tapRunning) {
-		g_tapRunning = 0;
-		if (g_tapLoop) CFRunLoopStop(g_tapLoop);
+	if (!g_tapRunning) {
+		wcHotkeyUp();
+		return;
+	}
+	g_tapRunning = 0;
+	CFRunLoopRef loop = g_tapLoop;
+	if (loop) CFRunLoopStop(loop);
+	/* Timed join — never block menubar forever if tap thread is wedged. */
+	NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+	while (g_tapLoop && [[NSDate date] compare:deadline] == NSOrderedAscending) {
+		[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+		                          beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+	}
+	if (!g_tapLoop) {
 		pthread_join(g_tapThread, NULL);
+	} else {
+		wcLog(@"tap thread join timeout — leaving thread to exit alone");
 	}
 	wcHotkeyUp();
 }
@@ -765,12 +931,17 @@ static NSString *wcCheckMark(BOOL on) {
 	if (![self startHotkeyTap]) {
 		[self notify:@"Whisper" body:@"Хоткей Fn: Системные настройки → Конфиденциальность → Мониторинг ввода → WhisperClient."];
 	}
-	wcLog(@"started v=%@ server=%@ backend=%@ input_trusted=%d", self.appVersion, wcServerURL(self.prefs),
-	      wcBackend(self.prefs, self.env), AXIsProcessTrusted());
+	wcLog(@"started v=%@ build=%@ server=%@ backend=%@ proxy=%d input_trusted=%d", self.appVersion,
+	      [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?", wcServerURL(self.prefs),
+	      wcBackend(self.prefs, self.env), wcGroqProxyEnabled(self.prefs, self.env), AXIsProcessTrusted());
 }
 
 - (void)onHotkeyDown {
 	if (self.recording) return;
+	if (self.processing) {
+		wcLog(@"ignore hotkey down — still processing previous take");
+		return;
+	}
 	AVAuthorizationStatus mic = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
 	if (mic == AVAuthorizationStatusDenied || mic == AVAuthorizationStatusRestricted) {
 		[self userNotify:@"Whisper" body:@"Нет доступа к микрофону — Системные настройки → Конфиденциальность → Микрофон."];
@@ -784,15 +955,30 @@ static NSString *wcCheckMark(BOOL on) {
 	}
 	NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
 	self.pasteTargetPID = front ? front.processIdentifier : 0;
+	/* Write WAV directly — avoids main-thread afconvert freezes on long takes. */
 	NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-	                 [NSString stringWithFormat:@"whisper_%@.caf", [[NSUUID UUID] UUIDString]]];
+	                 [NSString stringWithFormat:@"whisper_%@.wav", [[NSUUID UUID] UUIDString]]];
 	[[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
 
 	AVAudioEngine *engine = [[AVAudioEngine alloc] init];
 	AVAudioInputNode *input = engine.inputNode;
-	AVAudioFormat *fmt = [input outputFormatForBus:0];
+	AVAudioFormat *inFmt = [input outputFormatForBus:0];
+	if (inFmt.sampleRate < 1000 || inFmt.channelCount < 1) {
+		wcLog(@"bad input format sr=%f ch=%u", inFmt.sampleRate, inFmt.channelCount);
+		[self userNotify:@"Whisper" body:@"Микрофон недоступен — проверь устройство ввода."];
+		return;
+	}
+	NSDictionary *wavSettings = @{
+		AVFormatIDKey : @(kAudioFormatLinearPCM),
+		AVSampleRateKey : @(inFmt.sampleRate),
+		AVNumberOfChannelsKey : @(1),
+		AVLinearPCMBitDepthKey : @16,
+		AVLinearPCMIsFloatKey : @NO,
+		AVLinearPCMIsBigEndianKey : @NO,
+		AVLinearPCMIsNonInterleaved : @NO
+	};
 	NSError *err = nil;
-	AVAudioFile *file = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:tmp] settings:fmt.settings error:&err];
+	AVAudioFile *file = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:tmp] settings:wavSettings error:&err];
 	if (!file || err) {
 		wcLog(@"audio file fail: %@", err);
 		[self userNotify:@"Whisper" body:@"Не удалось начать запись — проверь микрофон."];
@@ -800,10 +986,63 @@ static NSString *wcCheckMark(BOOL on) {
 		[self rebuildMenu];
 		return;
 	}
-	[input installTapOnBus:0 bufferSize:4096 format:fmt block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+	AVAudioFormat *outFmt = file.processingFormat;
+	BOOL sameFmt = (fabs(inFmt.sampleRate - outFmt.sampleRate) < 0.5) && (inFmt.channelCount == outFmt.channelCount) &&
+	               (inFmt.commonFormat == outFmt.commonFormat);
+	AVAudioConverter *converter = nil;
+	if (!sameFmt) {
+		converter = [[AVAudioConverter alloc] initFromFormat:inFmt toFormat:outFmt];
+		if (!converter) {
+			wcLog(@"AVAudioConverter init failed in=%@ out=%@", inFmt, outFmt);
+			[self userNotify:@"Whisper" body:@"Не удалось настроить запись микрофона."];
+			return;
+		}
+	}
+	/* Pre-size one reusable PCM buffer — never alloc on the realtime tap thread. */
+	AVAudioFrameCount reuseCap = 8192;
+	AVAudioPCMBuffer *reuseBuf =
+	    sameFmt ? nil : [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFmt frameCapacity:reuseCap];
+	__block AVAudioConverter *convRef = converter;
+	__block AVAudioPCMBuffer *bufRef = reuseBuf;
+	__block AVAudioFrameCount bufCap = reuseCap;
+	[input installTapOnBus:0 bufferSize:4096 format:inFmt block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
 		(void)when;
+		if (!buffer.frameLength) return;
 		NSError *werr = nil;
-		[file writeFromBuffer:buffer error:&werr];
+		if (!convRef) {
+			[file writeFromBuffer:buffer error:&werr];
+			if (werr) wcLog(@"audio write err: %@", werr);
+			return;
+		}
+		AVAudioFrameCount need =
+		    (AVAudioFrameCount)ceil((double)buffer.frameLength * outFmt.sampleRate / inFmt.sampleRate) + 32;
+		if (!bufRef || need > bufCap) {
+			/* Rare resize only — prefer reuse. */
+			bufCap = MAX(need, bufCap * 2);
+			bufRef = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFmt frameCapacity:bufCap];
+			if (!bufRef) return;
+		}
+		bufRef.frameLength = 0;
+		NSError *cerr = nil;
+		__block BOOL provided = NO;
+		AVAudioConverterInputBlock inBlock =
+		    ^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
+			    (void)inNumberOfPackets;
+			    if (provided) {
+				    *outStatus = AVAudioConverterInputStatus_NoDataNow;
+				    return nil;
+			    }
+			    provided = YES;
+			    *outStatus = AVAudioConverterInputStatus_HaveData;
+			    return buffer;
+		    };
+		AVAudioConverterOutputStatus st = [convRef convertToBuffer:bufRef error:&cerr withInputFromBlock:inBlock];
+		if (cerr) {
+			wcLog(@"audio convert err: %@", cerr);
+			return;
+		}
+		if (st == AVAudioConverterOutputStatus_Error || bufRef.frameLength == 0) return;
+		[file writeFromBuffer:bufRef error:&werr];
 		if (werr) wcLog(@"audio write err: %@", werr);
 	}];
 	[engine prepare];
@@ -822,35 +1061,21 @@ static NSString *wcCheckMark(BOOL on) {
 	self.menuRecording = YES;
 	self.statusItem.button.title = @"🔴";
 	double maxS = wcMaxRecordSeconds(self.prefs);
-	if (maxS > 0) {
-		[self.maxRecordTimer invalidate];
-		self.maxRecordTimer = [NSTimer scheduledTimerWithTimeInterval:maxS repeats:NO block:^(NSTimer *t) {
-			(void)t;
-			[gApp onHotkeyUp];
-		}];
-	}
-	wcLog(@"recording engine %@ sr=%.0f ch=%u max=%.0fs", tmp, fmt.sampleRate, fmt.channelCount, maxS);
+	[self.maxRecordTimer invalidate];
+	self.maxRecordTimer = [NSTimer scheduledTimerWithTimeInterval:maxS repeats:NO block:^(NSTimer *t) {
+		(void)t;
+		wcLog(@"max record %.0fs reached — auto stop", maxS);
+		[gApp onHotkeyUp];
+	}];
+	wcLog(@"recording engine %@ sr=%.0f→%.0f ch=%u max=%.0fs", tmp, inFmt.sampleRate, outFmt.sampleRate,
+	      outFmt.channelCount, maxS);
 }
 
 - (NSString *)convertRecordingToWav:(NSString *)src {
-	NSString *dst = [src stringByReplacingOccurrencesOfString:@".caf" withString:@".wav"];
-	[[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
-	NSTask *task = [[NSTask alloc] init];
-	task.launchPath = @"/usr/bin/afconvert";
-	task.arguments = @[ src, dst, @"-d", @"LEI16", @"-f", @"WAVE", @"-c", @"1", @"-r", @"16000" ];
-	@try {
-		[task launch];
-		[task waitUntilExit];
-	} @catch (NSException *ex) {
-		wcLog(@"afconvert exception: %@", ex);
-		return src;
-	}
-	if (task.terminationStatus != 0) {
-		wcLog(@"afconvert exit %d — отправляем исходный файл", task.terminationStatus);
-		return src;
-	}
-	[[NSFileManager defaultManager] removeItemAtPath:src error:nil];
-	return dst;
+	/* Prefer already-WAV path (new recorder). Never NSTask/afconvert in MAS sandbox. */
+	if ([src.pathExtension.lowercaseString isEqualToString:@"wav"]) return src;
+	wcLog(@"non-wav recording %@ — send as-is (no afconvert in sandbox)", src);
+	return src;
 }
 
 - (void)onHotkeyUp {
@@ -859,28 +1084,56 @@ static NSString *wcCheckMark(BOOL on) {
 	self.maxRecordTimer = nil;
 	self.recording = NO;
 	self.menuRecording = NO;
-	self.statusItem.button.title = @"🎤";
-	if (self.audioEngine) {
-		[self.audioEngine.inputNode removeTapOnBus:0];
-		[self.audioEngine stop];
-	}
-	self.audioEngine = nil;
+	self.statusItem.button.title = @"⏳";
+	AVAudioEngine *engine = self.audioEngine;
 	NSString *path = self.wavPath;
-	self.audioFile = nil;
+	self.audioEngine = nil;
 	self.wavPath = nil;
+	if (engine) {
+		@try {
+			[engine.inputNode removeTapOnBus:0];
+		} @catch (NSException *ex) {
+			wcLog(@"removeTap exception: %@", ex);
+		}
+		@try {
+			[engine stop];
+		} @catch (NSException *ex) {
+			wcLog(@"engine stop exception: %@", ex);
+		}
+	}
+	/* Close WAV after tap is gone so the file is finalized. */
+	self.audioFile = nil;
+	self.processing = YES;
 	[self rebuildMenu];
-	if (!path.length) return;
+	if (!path.length) {
+		self.processing = NO;
+		self.statusItem.button.title = @"🎤";
+		[self rebuildMenu];
+		return;
+	}
 	NSUInteger bytes = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
 	wcLog(@"stopped recording %@ bytes=%lu", path, (unsigned long)bytes);
 	if (bytes < 800) {
 		[[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+		self.processing = NO;
+		self.statusItem.button.title = @"🎤";
+		[self rebuildMenu];
 		[self userNotify:@"Whisper" body:@"Запись пустая — удерживай Fn дольше и проверь микрофон."];
 		return;
 	}
-	NSString *wav = [self convertRecordingToWav:path];
 	[self userNotify:@"Whisper" body:@"Отправляю на сервер…"];
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-		[self transcribeAndDeliver:wav];
+		@try {
+			NSString *wav = [self convertRecordingToWav:path];
+			[self preserveTakeForRetry:wav];
+			[self transcribeAndDeliver:wav deleteSource:![wav isEqualToString:wcLastTakePath()]];
+		} @catch (NSException *ex) {
+			wcLog(@"transcribe pipeline exception: %@", ex);
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[self userNotify:@"Whisper — ошибка" body:@"Сбой обработки записи. Попробуй «Повторить расшифровку»."];
+				[self finishProcessingAfterDelay:0.2];
+			});
+		}
 	});
 }
 
@@ -937,14 +1190,11 @@ static NSString *wcCheckMark(BOOL on) {
 	return [json isKindOfClass:[NSDictionary class]] ? json : nil;
 }
 
-- (NSDictionary *)transcribeGroq:(NSString *)wavPath error:(NSError **)outErr {
+- (NSDictionary *)transcribeGroqOnce:(NSString *)wavPath useProxy:(BOOL)useProxy error:(NSError **)outErr {
 	NSString *key = wcGroqKey(self.prefs, self.env);
-	NSString *proxy = wcStringPref(self.prefs, @"groq_proxy_url");
-	if (!proxy.length) proxy = self.env[@"WHISPER_GROQ_PROXY_URL"] ?: @"";
-	BOOL proxyOn = [self.prefs[@"groq_proxy_enabled"] boolValue] || self.env[@"WHISPER_GROQ_PROXY_URL"];
-	NSString *urlStr = (proxy.length && proxyOn) ? [NSString stringWithFormat:@"%@/openai/v1/audio/transcriptions",
-	    [proxy stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]]] : kGroqURL;
-	if (!(proxy.length && proxyOn) && !key.length) {
+	NSString *proxy = useProxy ? wcGroqProxyURL(self.prefs, self.env) : @"";
+	NSString *urlStr = proxy.length ? [NSString stringWithFormat:@"%@/openai/v1/audio/transcriptions", proxy] : kGroqURL;
+	if (!proxy.length && !key.length) {
 		if (outErr) *outErr = [NSError errorWithDomain:@"wc" code:2 userInfo:@{NSLocalizedDescriptionKey : @"no groq key"}];
 		return nil;
 	}
@@ -953,10 +1203,16 @@ static NSString *wcCheckMark(BOOL on) {
 		if (outErr) *outErr = [NSError errorWithDomain:@"wc" code:1 userInfo:@{NSLocalizedDescriptionKey : @"empty wav"}];
 		return nil;
 	}
+	wcLog(@"groq POST %@ proxy=%d bytes=%lu", urlStr, (int)(proxy.length > 0), (unsigned long)wav.length);
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
 	req.HTTPMethod = @"POST";
-	req.timeoutInterval = 600;
+	/* Layero edge ~60–90s; Railway+Groq can need longer for big takes. */
+	NSTimeInterval hardWait = proxy.length ? 90.0 : 180.0;
+	req.timeoutInterval = hardWait;
 	if (key.length) [req setValue:[NSString stringWithFormat:@"Bearer %@", key] forHTTPHeaderField:@"Authorization"];
+	NSString *secret = wcGroqProxySecret(self.prefs, self.env);
+	if (proxy.length && secret.length)
+		[req setValue:secret forHTTPHeaderField:@"X-Whisper-Groq-Proxy-Secret"];
 	NSString *boundary = [[NSUUID UUID] UUIDString];
 	[req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
 	req.HTTPBody = [self multipartBody:boundary fields:@{@"model" : kGroqModel, @"response_format" : @"json"} fileField:@"file"
@@ -965,15 +1221,33 @@ static NSString *wcCheckMark(BOOL on) {
 	__block NSData *respData = nil;
 	__block NSURLResponse *resp = nil;
 	__block NSError *err = nil;
-	[[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-		respData = d; resp = r; err = e;
-		dispatch_semaphore_signal(sem);
-	}] resume];
-	dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+	NSURLSessionDataTask *task =
+	    [[NSURLSession sharedSession] dataTaskWithRequest:req
+	                                    completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+		                                    respData = d;
+		                                    resp = r;
+		                                    err = e;
+		                                    dispatch_semaphore_signal(sem);
+	                                    }];
+	[task resume];
+	long waitRc = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hardWait * NSEC_PER_SEC)));
+	if (waitRc != 0) {
+		[task cancel];
+		if (outErr)
+			*outErr = [NSError errorWithDomain:@"wc" code:-1001
+			                          userInfo:@{NSLocalizedDescriptionKey :
+			                                         [NSString stringWithFormat:@"groq timeout (%.0fs)", hardWait]}];
+		return nil;
+	}
 	if (err) { if (outErr) *outErr = err; return nil; }
 	NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
 	if (http.statusCode >= 400) {
-		if (outErr) *outErr = [NSError errorWithDomain:@"wc" code:http.statusCode userInfo:@{NSLocalizedDescriptionKey : @"groq error"}];
+		NSString *detail = [[NSString alloc] initWithData:respData ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"";
+		if (detail.length > 180) detail = [[detail substringToIndex:180] stringByAppendingString:@"…"];
+		if (!detail.length) detail = [NSString stringWithFormat:@"HTTP %ld", (long)http.statusCode];
+		if (outErr)
+			*outErr = [NSError errorWithDomain:@"wc" code:http.statusCode
+			                          userInfo:@{NSLocalizedDescriptionKey : detail}];
 		return nil;
 	}
 	id json = [NSJSONSerialization JSONObjectWithData:respData options:0 error:&err];
@@ -981,7 +1255,37 @@ static NSString *wcCheckMark(BOOL on) {
 	return [json isKindOfClass:[NSDictionary class]] ? json : nil;
 }
 
-- (void)transcribeAndDeliver:(NSString *)wavPath {
+- (NSDictionary *)transcribeGroq:(NSString *)wavPath error:(NSError **)outErr {
+	BOOL proxyOn = wcGroqProxyEnabled(self.prefs, self.env);
+	NSError *firstErr = nil;
+	NSDictionary *result = [self transcribeGroqOnce:wavPath useProxy:proxyOn error:&firstErr];
+	if (result) return result;
+	/* Fallback: proxy ↔ direct, чтобы не зависеть от одного канала из РФ. */
+	BOOL tryOther = !proxyOn;
+	if (proxyOn) {
+		NSInteger code = firstErr.code;
+		BOOL retryWorthy = (code == -1001) || (code == NSURLErrorTimedOut) || (code == NSURLErrorCannotConnectToHost) ||
+		                   (code == NSURLErrorNetworkConnectionLost) || (code == NSURLErrorNotConnectedToInternet) ||
+		                   (code == 404) || (code == 405) || (code == 502) || (code == 503) || (code == 504);
+		NSString *msg = firstErr.localizedDescription.lowercaseString ?: @"";
+		if ([msg containsString:@"methodnotallowed"] || [msg containsString:@"адрес свободен"]) retryWorthy = YES;
+		tryOther = retryWorthy;
+	} else {
+		tryOther = YES; /* proxy was OFF — try proxy once if direct failed */
+	}
+	if (tryOther) {
+		wcLog(@"groq fallback %@ → %@", proxyOn ? @"proxy" : @"direct", proxyOn ? @"direct" : @"proxy");
+		NSError *secondErr = nil;
+		result = [self transcribeGroqOnce:wavPath useProxy:!proxyOn error:&secondErr];
+		if (result) return result;
+		if (outErr) *outErr = secondErr ?: firstErr;
+		return nil;
+	}
+	if (outErr) *outErr = firstErr;
+	return nil;
+}
+
+- (void)transcribeAndDeliver:(NSString *)wavPath deleteSource:(BOOL)deleteSource {
 	NSString *mode = wcBackend(self.prefs, self.env);
 	NSDictionary *result = nil;
 	NSError *lastErr = nil;
@@ -989,44 +1293,74 @@ static NSString *wcCheckMark(BOOL on) {
 	for (NSString *route in wcBackendOrder(mode)) {
 		usedRoute = route;
 		wcLog(@"transcribe try route=%@", route);
-		result = [route isEqualToString:@"server"] ? [self transcribeServer:wavPath error:&lastErr] : [self transcribeGroq:wavPath error:&lastErr];
+		@try {
+			result = [route isEqualToString:@"server"] ? [self transcribeServer:wavPath error:&lastErr]
+			                                           : [self transcribeGroq:wavPath error:&lastErr];
+		} @catch (NSException *ex) {
+			wcLog(@"transcribe %@ exception: %@", route, ex);
+			lastErr = [NSError errorWithDomain:@"wc" code:-2
+			                          userInfo:@{NSLocalizedDescriptionKey : ex.reason ?: @"exception"}];
+			result = nil;
+		}
 		if (result) break;
 		wcLog(@"transcribe %@ failed: %@", route, lastErr);
 	}
-	[[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
+	[self preserveTakeForRetry:wavPath];
+	if (deleteSource && wavPath.length && ![wavPath isEqualToString:wcLastTakePath()]) {
+		[[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
+	}
 	if (!result) {
 		NSString *msg = lastErr.localizedDescription ?: @"нет ответа";
 		dispatch_async(dispatch_get_main_queue(), ^{
-			[self userNotify:@"Whisper — ошибка" body:[NSString stringWithFormat:@"%@: %@", usedRoute ?: @"?", msg]];
+			[self rebuildMenu];
+			[self userNotify:@"Whisper — ошибка"
+			              body:[NSString stringWithFormat:@"%@: %@. Аудио сохранено — меню → «Повторить расшифровку».",
+			                                              usedRoute ?: @"?", msg]];
+			[self finishProcessingAfterDelay:0.15];
 		});
 		return;
 	}
 	NSString *text = [self extractText:result];
 	if (!text.length) {
 		dispatch_async(dispatch_get_main_queue(), ^{
-			[self userNotify:@"Whisper" body:@"Пустой ответ распознавания."];
+			[self rebuildMenu];
+			[self userNotify:@"Whisper" body:@"Пустой ответ. Можно повторить расшифровку из меню."];
+			[self finishProcessingAfterDelay:0.15];
 		});
 		return;
 	}
 	wcLog(@"text len=%lu route=%@", (unsigned long)text.length, usedRoute);
-	[self appendHistory:text];
+	@try {
+		[self appendHistory:text];
+	} @catch (NSException *ex) {
+		wcLog(@"appendHistory exception: %@", ex);
+	}
 	NSString *preview = text.length > 160 ? [[text substringToIndex:160] stringByAppendingString:@"…"] : text;
 	NSString *pasteMode = wcPasteMode(self.prefs);
 	pid_t target = self.pasteTargetPID;
 	dispatch_async(dispatch_get_main_queue(), ^{
-		[self rebuildMenu];
-		[[NSPasteboard generalPasteboard] clearContents];
-		[[NSPasteboard generalPasteboard] setString:text forType:NSPasteboardTypeString];
-		if ([pasteMode isEqualToString:@"history_only"]) {
+		@try {
+			[self rebuildMenu];
+			[[NSPasteboard generalPasteboard] clearContents];
+			[[NSPasteboard generalPasteboard] setString:text forType:NSPasteboardTypeString];
+			if ([pasteMode isEqualToString:@"history_only"]) {
+				[self userNotify:@"Whisper — готово" body:preview];
+				[self finishProcessingAfterDelay:0.2];
+				return;
+			}
+			if ([pasteMode isEqualToString:@"clipboard"]) {
+				[self userNotify:@"Whisper — готово, в буфере" body:preview];
+				[self finishProcessingAfterDelay:0.2];
+				return;
+			}
+			[self pasteCmdV:target];
 			[self userNotify:@"Whisper — готово" body:preview];
-			return;
+			/* processing держим до конца Cmd+V — иначе Fn стартует запись и роняет engine. */
+			[self finishProcessingAfterDelay:0.45];
+		} @catch (NSException *ex) {
+			wcLog(@"deliver UI exception: %@", ex);
+			[self finishProcessingAfterDelay:0.2];
 		}
-		if ([pasteMode isEqualToString:@"clipboard"]) {
-			[self userNotify:@"Whisper — готово, в буфере" body:preview];
-			return;
-		}
-		[self pasteCmdV:target];
-		[self userNotify:@"Whisper — готово" body:preview];
 	});
 }
 
@@ -1040,10 +1374,30 @@ static NSString *wcCheckMark(BOOL on) {
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	(void)menu;
+	self.menuIsOpen = YES;
 	[NSApp activateIgnoringOtherApps:YES];
 }
 
+- (void)menuDidClose:(NSMenu *)menu {
+	(void)menu;
+	self.menuIsOpen = NO;
+	if (self.menuNeedsRebuild) [self rebuildMenu];
+}
+
 - (void)pasteCmdV:(pid_t)targetPID {
+	void (^firePaste)(void) = ^{
+		CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+		if (!src) return;
+		CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)9, true);
+		CGEventRef up = CGEventCreateKeyboardEvent(src, (CGKeyCode)9, false);
+		CGEventSetFlags(down, kCGEventFlagMaskCommand);
+		CGEventSetFlags(up, kCGEventFlagMaskCommand);
+		CGEventPost(kCGHIDEventTap, down);
+		CGEventPost(kCGHIDEventTap, up);
+		CFRelease(down);
+		CFRelease(up);
+		CFRelease(src);
+	};
 	if (targetPID > 0) {
 		for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
 			if (app.processIdentifier == targetPID) {
@@ -1051,19 +1405,12 @@ static NSString *wcCheckMark(BOOL on) {
 				break;
 			}
 		}
-		usleep(120000);
+		/* Never usleep on main — that froze menubar after paste. */
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(),
+		               firePaste);
+	} else {
+		firePaste();
 	}
-	CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-	if (!src) return;
-	CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)9, true);
-	CGEventRef up = CGEventCreateKeyboardEvent(src, (CGKeyCode)9, false);
-	CGEventSetFlags(down, kCGEventFlagMaskCommand);
-	CGEventSetFlags(up, kCGEventFlagMaskCommand);
-	CGEventPost(kCGHIDEventTap, down);
-	CGEventPost(kCGHIDEventTap, up);
-	CFRelease(down);
-	CFRelease(up);
-	CFRelease(src);
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
