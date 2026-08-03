@@ -7,6 +7,10 @@
 *.env
 !.env.example
 .envrc
+# Whisper Cloud SQLite (local / proxy)
+groq_proxy/whisper_cloud.db
+*.sqlite
+*.sqlite3
 # Случайные выгрузки / сохранённые страницы — не в репозиторий
 assets/волга_files/
 assets/search.json

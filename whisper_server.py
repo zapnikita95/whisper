@@ -260,6 +260,87 @@ def list_clients():
     return get_clients_snapshot()
 
 
+@app.get("/system")
+def system_profile():
+    """Host capabilities for model recommendation (GPU VRAM, RAM, CPU)."""
+    from whisper_system_profile import detect_system
+
+    return {"status": "ok", "system": detect_system().to_dict()}
+
+
+@app.get("/models")
+def list_models():
+    """Full model catalog with local cache / download status."""
+    from whisper_model_hub import models_status_for_api
+    from whisper_models import catalog_for_api
+
+    cached = {row["key"]: row for row in models_status_for_api()}
+    models = []
+    for row in catalog_for_api():
+        st = cached.get(row["key"], {})
+        models.append(
+            {
+                **row,
+                "cached": bool(st.get("cached")),
+                "download_status": st.get("download_status"),
+            }
+        )
+    return {"status": "ok", "models": models, "active_model": _model_name}
+
+
+@app.get("/models/recommend")
+def recommend_models(
+    prefer_russian: bool = False,
+    prefer_english: bool = False,
+):
+    """Suggest best model for this machine."""
+    from whisper_system_profile import detect_system, recommend_model
+
+    prof = detect_system()
+    rec = recommend_model(prof, prefer_russian=prefer_russian, prefer_english=prefer_english)
+    return {
+        "status": "ok",
+        "system": prof.to_dict(),
+        "recommendation": rec.to_dict(),
+    }
+
+
+_download_jobs_lock = threading.Lock()
+_download_jobs: dict[str, dict[str, Any]] = {}
+
+
+@app.post("/models/{model_key}/download")
+def download_model_weights(model_key: str):
+    """Pre-download model weights to the local Hugging Face cache."""
+    from whisper_model_hub import download_model, download_status, is_model_cached
+    from whisper_models import SPEC_BY_KEY
+
+    key = (model_key or "").strip()
+    if key not in SPEC_BY_KEY:
+        raise HTTPException(status_code=404, detail=f"Unknown model key: {key}")
+    if is_model_cached(key):
+        return {"status": "ok", "model_key": key, "cached": True, "message": "Already cached"}
+    st = download_status(key)
+    if st and st.startswith("downloading"):
+        return {"status": "ok", "model_key": key, "cached": False, "message": "Download in progress"}
+
+    def worker() -> None:
+        try:
+            download_model(key)
+            with _download_jobs_lock:
+                _download_jobs[key] = {"state": "done"}
+        except Exception as e:
+            log.exception("download %s", key)
+            with _download_jobs_lock:
+                _download_jobs[key] = {"state": "error", "detail": str(e)}
+
+    with _download_jobs_lock:
+        if key not in _download_jobs or _download_jobs[key].get("state") in ("error", "done"):
+            _download_jobs[key] = {"state": "running"}
+            threading.Thread(target=worker, name=f"dl-{key}", daemon=True).start()
+    return {"status": "ok", "model_key": key, "cached": False, "message": "Download started"}
+
+
 @app.post("/transcribe")
 async def transcribe(
     request: Request,
@@ -318,23 +399,8 @@ async def transcribe(
             text = " ".join(text_parts).strip()
 
             if spoken_punctuation and text:
-                import re
-
-                pairs = [
-                    (r"восклицательный\s+знак", "!"),
-                    (r"вопросительный\s+знак", "?"),
-                    (r"запятая", ","),
-                    (r"точка", "."),
-                    (r"тире", "—"),
-                ]
-                for pattern, repl in pairs:
-                    text = re.sub(rf"(?iu)\b(?:{pattern})\b", repl, text)
-                text = re.sub(r"\s*,\s*", ", ", text)
-                text = re.sub(r"\s*\.\s*", ". ", text)
-                text = re.sub(r"\s*!\s*", "! ", text)
-                text = re.sub(r"\s*\?\s*", "? ", text)
-                text = re.sub(r"\s*—\s*", " — ", text)
-                text = re.sub(r"\s{2,}", " ", text).strip()
+                from whisper_text_post import apply_spoken_punctuation
+                text = apply_spoken_punctuation(text)
 
             return {
                 "text": text,

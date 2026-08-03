@@ -12,12 +12,15 @@ import requests
 GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_GROQ_MODEL = "whisper-large-v3"
 FALLBACK_GROQ_MODEL = "whisper-large-v3-turbo"
+DEFAULT_GROQ_PROXY_URL = "https://whisper-groq-proxy-production.up.railway.app"
 
 # Прокси (Railway/VPS), если api.groq.com с клиентской сети недоступен:
 # WHISPER_GROQ_PROXY_URL=https://xxx.up.railway.app
 # WHISPER_GROQ_PROXY_SECRET=… (если на прокси задан PROXY_SHARED_SECRET)
 
-ALLOWED_TRANSCRIBE_MODES = frozenset({"server", "groq", "server_then_groq", "groq_then_server"})
+ALLOWED_TRANSCRIBE_MODES = frozenset(
+    {"server", "groq", "server_then_groq", "groq_then_server", "auto_vram"}
+)
 
 
 def _clean_groq_key(raw: str | None) -> str | None:
@@ -44,7 +47,8 @@ def resolve_groq_proxy_url(pref_stored: str | None = None) -> str:
     ):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip().rstrip("/")
-    return ""
+    # Cloud по умолчанию: публичный Railway-прокси (freemium минуты).
+    return DEFAULT_GROQ_PROXY_URL.rstrip("/")
 
 
 def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
@@ -156,15 +160,219 @@ def load_whisper_dotenv_files() -> list[Path]:
 
 
 def hotkey_prefs_path() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "whisper_hotkey_prefs.json"
-    return Path(__file__).resolve().parent / "whisper_hotkey_prefs.json"
+    try:
+        from whisper_file_log import user_data_dir
+
+        return user_data_dir("WhisperHotkey") / "whisper_hotkey_prefs.json"
+    except ImportError:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "whisper_hotkey_prefs.json"
+        return Path(__file__).resolve().parent / "whisper_hotkey_prefs.json"
+
+
+def load_hotkey_prefs() -> dict:
+    p = hotkey_prefs_path()
+    try:
+        # utf-8-sig: PowerShell Set-Content -Encoding UTF8 часто пишет BOM → иначе JSON ломается.
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def save_hotkey_prefs(data: dict) -> None:
+    p = hotkey_prefs_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ensure_hotkey_default_prefs() -> dict:
+    """Первый запуск Windows Hotkey: режим auto_vram (как удобный старт на Mac)."""
+    data = load_hotkey_prefs()
+    changed = False
+    if not isinstance(data.get("transcribe_backend"), str) or not str(data.get("transcribe_backend")).strip():
+        data["transcribe_backend"] = "auto_vram"
+        changed = True
+    if "model_key" not in data:
+        data["model_key"] = "large-v3"
+        changed = True
+    if "notifications" not in data:
+        data["notifications"] = True
+        changed = True
+    if "paste_mode" not in data:
+        data["paste_mode"] = "auto"
+        changed = True
+    if not isinstance(data.get("ai_mode"), str) or not str(data.get("ai_mode")).strip():
+        data["ai_mode"] = "auto"
+        changed = True
+    if not isinstance(data.get("groq_proxy_url"), str) or not str(data.get("groq_proxy_url")).strip():
+        data["groq_proxy_url"] = DEFAULT_GROQ_PROXY_URL
+        data["groq_proxy_enabled"] = True
+        changed = True
+    if changed:
+        save_hotkey_prefs(data)
+    return data
+
+
+class CloudQuotaExceeded(RuntimeError):
+    """HTTP 402: free Cloud minutes exhausted."""
+
+    def __init__(self, message: str, *, remaining_seconds: float = 0.0, body: dict | None = None):
+        super().__init__(message)
+        self.remaining_seconds = float(remaining_seconds)
+        self.body = body or {}
+
+
+def _uuid4() -> str:
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+def read_hotkey_cloud_token_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("cloud_token")
+    if isinstance(v, str) and v.strip().startswith("wsk_"):
+        return v.strip()
+    return None
+
+
+def read_hotkey_cloud_device_id_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("cloud_device_id")
+    if isinstance(v, str) and len(v.strip()) >= 8:
+        return v.strip()
+    return None
+
+
+def resolve_cloud_token(pref_stored: str | None = None) -> str:
+    for candidate in (
+        os.environ.get("WHISPER_CLOUD_TOKEN"),
+        os.environ.get("WHISPER_GROQ_CLOUD_TOKEN"),
+        pref_stored,
+        read_hotkey_cloud_token_pref(),
+    ):
+        if isinstance(candidate, str) and candidate.strip().startswith("wsk_"):
+            return candidate.strip()
+    return ""
+
+
+def ensure_cloud_device_id(*, pref_get: dict | None = None, pref_save: Callable[[dict], None] | None = None) -> str:
+    """Stable anonymous device id in hotkey prefs (or provided dict)."""
+    if pref_get is not None:
+        existing = pref_get.get("cloud_device_id")
+        if isinstance(existing, str) and len(existing.strip()) >= 8:
+            return existing.strip()
+        did = _uuid4()
+        pref_get["cloud_device_id"] = did
+        if pref_save:
+            pref_save(pref_get)
+        return did
+    existing = read_hotkey_cloud_device_id_pref()
+    if existing:
+        return existing
+    did = _uuid4()
+    data = load_hotkey_prefs()
+    data["cloud_device_id"] = did
+    save_hotkey_prefs(data)
+    return did
+
+
+def register_cloud_device(
+    proxy_base: str,
+    *,
+    device_id: str | None = None,
+    timeout: float = 30.0,
+) -> dict:
+    """POST /v1/devices/register → {token, plan, remaining_…}."""
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    did = (device_id or ensure_cloud_device_id()).strip()
+    r = requests.post(
+        f"{base}/v1/devices/register",
+        json={"device_id": did},
+        headers={"Accept": "application/json", "User-Agent": "WhisperClient/1.0"},
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_register_http_{r.status_code}:{(r.text or '')[:300]}")
+    out = r.json()
+    if not isinstance(out, dict) or not str(out.get("token", "")).startswith("wsk_"):
+        raise RuntimeError("cloud_register_bad_response")
+    return out
+
+
+def fetch_cloud_me(proxy_base: str, token: str, *, timeout: float = 20.0) -> dict:
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    r = requests.get(
+        f"{base}/v1/me",
+        headers={
+            "Accept": "application/json",
+            "X-Whisper-Cloud-Token": token,
+            "User-Agent": "WhisperClient/1.0",
+        },
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_me_http_{r.status_code}:{(r.text or '')[:300]}")
+    out = r.json()
+    if not isinstance(out, dict):
+        raise RuntimeError("cloud_me_bad_response")
+    return out
+
+
+def create_cloud_checkout(proxy_base: str, token: str, *, timeout: float = 30.0) -> dict:
+    base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
+    r = requests.post(
+        f"{base}/v1/checkout",
+        headers={
+            "Accept": "application/json",
+            "X-Whisper-Cloud-Token": token,
+            "User-Agent": "WhisperClient/1.0",
+        },
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"cloud_checkout_http_{r.status_code}:{(r.text or '')[:400]}")
+    out = r.json()
+    if not isinstance(out, dict):
+        raise RuntimeError("cloud_checkout_bad_response")
+    return out
+
+
+def ensure_cloud_token_for_proxy(
+    proxy_base: str,
+    *,
+    pref_token: str | None = None,
+    device_id: str | None = None,
+    persist_hotkey: bool = True,
+    on_registered: Callable[[str, dict], None] | None = None,
+) -> str:
+    """Return wsk_…; register + persist if missing."""
+    tok = resolve_cloud_token(pref_token)
+    if tok:
+        return tok
+    did = (device_id or "").strip() or ensure_cloud_device_id()
+    snap = register_cloud_device(proxy_base, device_id=did)
+    token = str(snap["token"])
+    if persist_hotkey:
+        data = load_hotkey_prefs()
+        data["cloud_token"] = token
+        data["cloud_device_id"] = str(snap.get("device_id") or did)
+        save_hotkey_prefs(data)
+    if on_registered:
+        on_registered(token, snap)
+    return token
 
 
 def read_hotkey_groq_proxy_url_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -178,7 +386,7 @@ def read_hotkey_groq_proxy_url_pref() -> str | None:
 def read_hotkey_groq_proxy_secret_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -192,7 +400,7 @@ def read_hotkey_groq_proxy_secret_pref() -> str | None:
 def read_hotkey_groq_proxy_enabled_pref() -> bool | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -214,7 +422,7 @@ def read_hotkey_groq_proxy_enabled_pref() -> bool | None:
 def read_hotkey_groq_api_key_pref() -> str | None:
     p = hotkey_prefs_path()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -226,17 +434,91 @@ def read_hotkey_groq_api_key_pref() -> str | None:
 
 
 def read_hotkey_transcribe_backend_pref() -> str | None:
-    p = hotkey_prefs_path()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(data, dict):
-        return None
+    data = load_hotkey_prefs()
     v = data.get("transcribe_backend")
     if isinstance(v, str) and v.strip():
         return v.strip()
     return None
+
+
+def read_hotkey_model_key_pref() -> str | None:
+    data = load_hotkey_prefs()
+    v = data.get("model_key")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
+
+
+def read_hotkey_auto_vram_margin_pref() -> float | None:
+    data = load_hotkey_prefs()
+    v = data.get("auto_vram_margin_gb")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def groq_is_configured() -> bool:
+    if groq_api_key_from_env() or read_hotkey_groq_api_key_pref():
+        return True
+    proxy_enabled = read_hotkey_groq_proxy_enabled_pref()
+    if proxy_enabled is False:
+        return False
+    return bool(resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()))
+
+
+def resolve_auto_vram_backend_order(
+    model_key: str | None = None,
+    *,
+    margin_gb: float | None = None,
+    log_info: Callable[..., None] | None = None,
+) -> list[str]:
+    """Перед каждой расшифровкой: достаточно свободной VRAM → локально, иначе Groq."""
+    from whisper_models import SPEC_BY_KEY
+    from whisper_system_profile import nvidia_free_vram_gb, nvidia_vram_snapshot
+
+    key = (model_key or read_hotkey_model_key_pref() or "large-v3").strip() or "large-v3"
+    spec = SPEC_BY_KEY.get(key) or SPEC_BY_KEY["large-v3"]
+    margin = margin_gb
+    if margin is None:
+        margin = read_hotkey_auto_vram_margin_pref()
+    if margin is None:
+        raw = (os.environ.get("WHISPER_AUTO_VRAM_MARGIN_GB") or "0.8").strip()
+        try:
+            margin = float(raw)
+        except ValueError:
+            margin = 0.8
+    needed = max(0.5, spec.min_vram_gb + margin)
+    snap = nvidia_vram_snapshot()
+    free = snap.get("vram_free_gb")
+    if free is not None and float(free) >= needed:
+        if log_info:
+            log_info(
+                "auto_vram local model=%s free=%.2f needed=%.2f",
+                key,
+                float(free),
+                needed,
+            )
+        return ["server"]
+    if groq_is_configured():
+        if log_info:
+            log_info(
+                "auto_vram groq model=%s free=%s needed=%.2f",
+                key,
+                free,
+                needed,
+            )
+        return ["groq"]
+    if log_info:
+        log_info(
+            "auto_vram fallback_local model=%s free=%s needed=%.2f groq_unconfigured",
+            key,
+            free,
+            needed,
+        )
+    return ["server"]
 
 
 def resolve_transcribe_backend_mode(pref: str | None, *env_names: str) -> str:
@@ -246,7 +528,7 @@ def resolve_transcribe_backend_mode(pref: str | None, *env_names: str) -> str:
         v = (os.environ.get(name) or "").strip().lower()
         if v in ALLOWED_TRANSCRIBE_MODES:
             return v
-    return "server"
+    return "auto_vram"
 
 
 def transcribe_backend_order(mode: str) -> list[str]:
@@ -259,13 +541,18 @@ def transcribe_backend_order(mode: str) -> list[str]:
     return ["groq", "server"]
 
 
-def hotkey_transcribe_backend_order() -> list[str]:
+def hotkey_transcribe_backend_order(
+    *,
+    log_info: Callable[..., None] | None = None,
+) -> list[str]:
     pref = read_hotkey_transcribe_backend_pref()
     mode = resolve_transcribe_backend_mode(
         pref,
         "WHISPER_TRANSCRIBE_BACKEND",
         "WHISPER_MAC_TRANSCRIBE_BACKEND",
     )
+    if mode == "auto_vram":
+        return resolve_auto_vram_backend_order(log_info=log_info)
     return transcribe_backend_order(mode)
 
 
@@ -279,6 +566,7 @@ def post_groq_audio_transcription(
     pref_proxy_url: str | None = None,
     pref_proxy_secret: str | None = None,
     pref_proxy_enabled: bool | None = None,
+    pref_cloud_token: str | None = None,
     prompt: str | None = None,
 ) -> dict[str, Any]:
     proxy_enabled = resolve_groq_proxy_enabled(pref_proxy_enabled)
@@ -320,6 +608,26 @@ def post_groq_audio_transcription(
         headers["Authorization"] = f"Bearer {key}"
     elif not use_proxy:
         raise ValueError("Внутренняя ошибка: нет ключа для прямого запроса к Groq.")
+
+    cloud_token = ""
+    if use_proxy and not passthrough_auth and not (key and passthrough_auth):
+        # Hosted Cloud: register anonymous device unless BYOK passthrough or ops secret alone.
+        # Ops secret still works without token; for public users we auto-register.
+        if not proxy_secret or resolve_cloud_token(pref_cloud_token):
+            try:
+                cloud_token = ensure_cloud_token_for_proxy(
+                    proxy_base,
+                    pref_token=pref_cloud_token,
+                )
+                headers["X-Whisper-Cloud-Token"] = cloud_token
+            except Exception as e:
+                if not proxy_secret:
+                    raise RuntimeError(
+                        f"Не удалось зарегистрировать Whisper Cloud: {e}. "
+                        "Проверь интернет или вставь токен wsk_… в настройках Cloud."
+                    ) from e
+                if log_error:
+                    log_error("cloud_register_skipped_using_proxy_secret err=%s", e)
 
     prompt_str = (prompt or "").strip()
 
@@ -368,6 +676,24 @@ def post_groq_audio_transcription(
         if log_error:
             log_error("groq_transcribe_403_retry model=%s -> %s", primary, FALLBACK_GROQ_MODEL)
         resp = _post(FALLBACK_GROQ_MODEL, auth_key=auth_key)
+    if resp.status_code == 402:
+        detail = (resp.text or "")[:500]
+        remaining = 0.0
+        body: dict[str, Any] = {}
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                remaining = float(body.get("remaining_seconds") or 0)
+        except Exception:
+            body = {}
+        if log_error:
+            log_error("cloud_quota_exceeded remaining=%s body=%r", remaining, detail)
+        raise CloudQuotaExceeded(
+            "Минуты Whisper Cloud на этот месяц закончились. "
+            "Оформи Pro в настройках Cloud или используй локальный GPU / свой ключ Groq.",
+            remaining_seconds=remaining,
+            body=body if isinstance(body, dict) else {},
+        )
     if resp.status_code >= 400:
         detail = (resp.text or "")[:400]
         if log_error:

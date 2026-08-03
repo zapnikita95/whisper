@@ -39,7 +39,10 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperServer \
             "${ICON_ARGS[@]}" \
             --collect-all uvicorn --collect-all fastapi --collect-all starlette \
-            --hidden-import whisper_server --hidden-import whisper_models --hidden-import whisper_file_log \
+            --hidden-import whisper_server --hidden-import whisper_models \
+            --hidden-import whisper_model_hub --hidden-import whisper_system_profile \
+            --hidden-import whisper_server_gui_models_tab \
+            --hidden-import whisper_file_log \
             --hidden-import faster_whisper \
             --hidden-import whisper_version --hidden-import whisper_update_check \
             --add-data "packaging/VERSION;packaging" \
@@ -58,8 +61,11 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name WhisperHotkey \
             "${ICON_ARGS[@]}" \
             --hidden-import whisper_hotkey_core --hidden-import whisper_hotkey_tray \
+            --hidden-import whisper_hotkey_history \
+            --hidden-import whisper_hotkey_settings_win \
             --hidden-import whisper_groq --hidden-import whisper_vocab --hidden-import whisper_update_check \
-            --hidden-import whisper_models --hidden-import whisper_file_log \
+            --hidden-import whisper_models --hidden-import whisper_model_hub --hidden-import whisper_system_profile \
+            --hidden-import whisper_file_log \
             --hidden-import faster_whisper --hidden-import whisper_version \
             --hidden-import keyboard --hidden-import pyaudio --hidden-import pyperclip \
             --hidden-import soundfile --hidden-import numpy \
@@ -98,8 +104,14 @@ jobs:
   build-macos:
     runs-on: macos-latest
     timeout-minutes: 45
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: setup-python
+        with:
+          python-version: "3.13"
 
       - name: VERSION from tag
         run: |
@@ -116,6 +128,8 @@ jobs:
           APPLE_NOTARY_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_SPECIFIC_PASSWORD }}
           NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          WHISPER_BUNDLE_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+          WHISPER_STUB_ARCH_FLAGS: -arch arm64
         run: bash packaging/mac/ci_mac_signed_build.sh
 
       - uses: actions/upload-artifact@v4
@@ -125,6 +139,7 @@ jobs:
 
   publish:
     needs: [build-windows, build-macos]
+    if: always() && needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -132,13 +147,18 @@ jobs:
           path: artifacts
           pattern: whisper-*
 
+      - name: Collect release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release_files
+          find artifacts -type f \( -name 'WhisperSetup-*.exe' -o -name 'WhisperHotkeySetup-*.exe' -o -name 'WhisperClient-*.dmg' \) -exec cp {} release_files/ \;
+          ls -la release_files/
+
       - uses: softprops/action-gh-release@v2
         with:
           draft: false
           generate_release_notes: true
-          files: |
-            artifacts/whisper-setup/*.exe
-            artifacts/whisper-hotkey-setup/*.exe
-            artifacts/whisper-dmg/*.dmg
+          files: release_files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

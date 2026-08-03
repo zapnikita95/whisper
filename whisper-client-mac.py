@@ -140,7 +140,13 @@ except ImportError:
 
 try:
     from whisper_groq import (
+        CloudQuotaExceeded,
+        DEFAULT_GROQ_PROXY_URL,
+        create_cloud_checkout,
+        ensure_cloud_token_for_proxy,
+        fetch_cloud_me,
         post_groq_audio_transcription,
+        resolve_auto_vram_backend_order,
         resolve_groq_api_key,
         resolve_transcribe_backend_mode,
         transcribe_backend_order,
@@ -680,6 +686,9 @@ _MAC_CLIENT_PREF_STR_KEYS = frozenset(
         "groq_api_key",
         "groq_proxy_url",
         "groq_proxy_secret",
+        "cloud_token",
+        "cloud_device_id",
+        "ai_mode",
         "server_url",
         "server_host",
     }
@@ -775,7 +784,16 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 "groq",
                 "server_then_groq",
                 "groq_then_server",
+                "auto_vram",
             ):
+                continue
+            if k == "ai_mode":
+                from whisper_ai_modes import normalize_ai_mode
+
+                if not s:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = normalize_ai_mode(s)
                 continue
             if k == "groq_api_key":
                 if not s:
@@ -783,7 +801,7 @@ def merge_mac_client_prefs(updates: dict[str, Any]) -> None:
                 else:
                     cur[k] = s
                 continue
-            if k in ("groq_proxy_url", "groq_proxy_secret"):
+            if k in ("groq_proxy_url", "groq_proxy_secret", "cloud_token", "cloud_device_id"):
                 if not s:
                     cur.pop(k, None)
                 else:
@@ -886,6 +904,8 @@ def _mac_prefs_for_log(prefs: dict[str, Any]) -> dict[str, Any]:
         out["groq_api_key"] = "(задан)"
     if "groq_proxy_secret" in out and out["groq_proxy_secret"]:
         out["groq_proxy_secret"] = "(задан)"
+    if "cloud_token" in out and out["cloud_token"]:
+        out["cloud_token"] = "(задан)"
     return out
 
 
@@ -2199,6 +2219,9 @@ class WhisperClientMac:
         self._pref_groq_proxy_url: str | None = None
         self._pref_groq_proxy_secret: str | None = None
         self._pref_groq_proxy_enabled: bool | None = None
+        self._pref_cloud_token: str | None = None
+        self._pref_cloud_device_id: str | None = None
+        self._pref_ai_mode: str | None = None
         self._pref_server_url: str | None = None
         self._pref_server_host: str | None = None
         self._pref_server_port: int | None = None
@@ -2236,6 +2259,16 @@ class WhisperClientMac:
         self._pref_groq_proxy_enabled = None
         if "groq_proxy_enabled" in p:
             self._pref_groq_proxy_enabled = bool(p["groq_proxy_enabled"])
+        ct = p.get("cloud_token")
+        self._pref_cloud_token = (
+            ct.strip() if isinstance(ct, str) and ct.strip().startswith("wsk_") else None
+        )
+        cd = p.get("cloud_device_id")
+        self._pref_cloud_device_id = (
+            cd.strip() if isinstance(cd, str) and len(cd.strip()) >= 8 else None
+        )
+        am = p.get("ai_mode")
+        self._pref_ai_mode = am.strip() if isinstance(am, str) and am.strip() else None
         su = p.get("server_url")
         self._pref_server_url = (
             su.strip().rstrip("/")
@@ -2347,7 +2380,32 @@ class WhisperClientMac:
         if raw:
             return raw
         env = (os.environ.get("WHISPER_GROQ_PROXY_URL") or os.environ.get("GROQ_PROXY_URL") or "").strip().rstrip("/")
-        return env
+        return env or DEFAULT_GROQ_PROXY_URL.rstrip("/")
+
+    def _persist_cloud_registration(self, token: str, snap: dict) -> None:
+        did = snap.get("device_id") if isinstance(snap.get("device_id"), str) else self._pref_cloud_device_id
+        self._merge_save_mac_prefs(
+            cloud_token=token,
+            cloud_device_id=did or "",
+        )
+
+    def _ensure_mac_cloud_token(self) -> str:
+        import uuid
+
+        did = self._pref_cloud_device_id or str(uuid.uuid4())
+        if not self._pref_cloud_device_id:
+            self._merge_save_mac_prefs(cloud_device_id=did)
+
+        def _on_reg(token: str, snap: dict) -> None:
+            self._persist_cloud_registration(token, snap)
+
+        return ensure_cloud_token_for_proxy(
+            self._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+            pref_token=self._pref_cloud_token,
+            device_id=did,
+            persist_hotkey=False,
+            on_registered=_on_reg,
+        )
 
     def _effective_transcribe_backend_mode(self) -> str:
         return resolve_transcribe_backend_mode(
@@ -2357,7 +2415,12 @@ class WhisperClientMac:
         )
 
     def _effective_transcribe_backend_order(self) -> list[str]:
-        return transcribe_backend_order(self._effective_transcribe_backend_mode())
+        mode = self._effective_transcribe_backend_mode()
+        if mode == "auto_vram":
+            return resolve_auto_vram_backend_order(
+                log_info=lambda *a, **k: _mac_log("info", *a, **k),
+            )
+        return transcribe_backend_order(mode)
 
     def _server_health_check_or_raise(self) -> None:
         if self._effective_skip_health_check():
@@ -2482,6 +2545,12 @@ class WhisperClientMac:
             raise ValueError(
                 "Нет ключа Groq или прокси: меню «Groq API ключ…», .env, либо «Groq прокси URL» (Railway).",
             )
+        cloud_tok = self._pref_cloud_token
+        if proxy_on and not self._pref_groq_proxy_secret:
+            try:
+                cloud_tok = self._ensure_mac_cloud_token()
+            except Exception as e:
+                _mac_log("warning", "cloud_register_failed err=%s", e)
         _tx_conn, _tx_read = self._effective_transcribe_timeouts()
         try:
             return post_groq_audio_transcription(
@@ -2493,14 +2562,17 @@ class WhisperClientMac:
                 pref_proxy_url=self._effective_groq_proxy_url(),
                 pref_proxy_secret=self._pref_groq_proxy_secret,
                 pref_proxy_enabled=proxy_enabled,
+                pref_cloud_token=cloud_tok,
                 prompt=prompt,
             )
+        except CloudQuotaExceeded as e:
+            raise ValueError(str(e)) from e
         except RuntimeError as e:
             low = str(e).lower()
             if "proxy secret" in low or "missing proxy secret" in low:
                 raise ValueError(
-                    "Groq-прокси требует секрет. В меню: Groq API → «Свой Groq прокси секрет…» "
-                    "(тот же PROXY_SHARED_SECRET из Railway)."
+                    "Groq-прокси требует секрет или Whisper Cloud токен. "
+                    "Меню: Cloud → статус / вставить токен, либо «Свой Groq прокси секрет…»."
                 ) from e
             raise
 
@@ -2536,9 +2608,75 @@ class WhisperClientMac:
                 raw_text = (result.get("text") or "").strip()
                 result["_mac_raw_transcript"] = raw_text
                 if raw_text:
-                    replaced = self._apply_vocab_replacements(raw_text, vocab_app)
+                    from whisper_text_post import finalize_transcript
+
+                    # Server may already apply spoken_punctuation; re-apply is idempotent for symbols.
+                    # Groq path never did — finalize covers both.
+                    replaced = finalize_transcript(
+                        raw_text,
+                        spoken_punctuation=self.spoken_punctuation,
+                        app_name=vocab_app,
+                    )
                     if replaced != raw_text:
                         result["text"] = replaced
+                    else:
+                        result["text"] = raw_text
+                    # AI Modes + voice prefixes + auto context
+                    try:
+                        from whisper_ai_modes import (
+                            AiModeProRequired,
+                            apply_ai_mode,
+                            clamp_mode_for_plan,
+                            mode_label,
+                            resolve_cloud_plan_for_gate,
+                            resolve_effective_mode,
+                        )
+
+                        has_byok = bool(self._effective_groq_api_key())
+                        local_stt_ok = backend == "server"
+                        plan = (
+                            None
+                            if (has_byok or local_stt_ok)
+                            else resolve_cloud_plan_for_gate(
+                                pref_cloud_token=self._pref_cloud_token,
+                                pref_proxy_url=self._effective_groq_proxy_url() or None,
+                            )
+                        )
+                        allow_auto = bool(has_byok or local_stt_ok or (plan or "") == "pro")
+                        cleaned, mode = resolve_effective_mode(
+                            result.get("text") or "",
+                            app_name=vocab_app,
+                            pref_mode=getattr(self, "_pref_ai_mode", None) or "auto",
+                            allow_auto_context=True,
+                            free_fallback="polish" if allow_auto else "raw",
+                        )
+                        mode = clamp_mode_for_plan(
+                            mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
+                        )
+                        result["text"] = cleaned
+                        if mode != "raw" and cleaned.strip():
+                            _mac_log("info", "ai_mode_apply mode=%s", mode_label(mode))
+                            result["text"] = apply_ai_mode(
+                                cleaned,
+                                mode,
+                                cloud_plan=plan,
+                                has_byok=has_byok,
+                                local_stt_ok=local_stt_ok,
+                                pref_api_key=self._pref_groq_api_key,
+                                pref_proxy_url=self._effective_groq_proxy_url(),
+                                pref_proxy_secret=self._pref_groq_proxy_secret,
+                                pref_proxy_enabled=self._effective_groq_proxy_enabled(),
+                                pref_cloud_token=self._pref_cloud_token,
+                                log_error=lambda m, *a: _mac_log("error", m, *a),
+                            )
+                    except AiModeProRequired as e:
+                        _mac_log("warning", "ai_mode_pro_required err=%s", e)
+                        try:
+                            mac_banner_notification("Whisper Cloud Pro", str(e)[:180])
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        _mac_log("warning", "ai_mode_failed err=%s", e)
                 text = (result.get("text") or "").strip()
                 if text:
                     _mac_log(
@@ -2699,6 +2837,28 @@ class WhisperClientMac:
         finally:
             self._reset_hotkey_tracker()
             self._reset_native_hotkey_tap_state()
+        try:
+            from whisper_learn import schedule_learn_from_clipboard, suggest_add_vocab
+            from whisper_ai_modes import resolve_cloud_plan_for_gate
+
+            has_byok = bool(self._effective_groq_api_key())
+            # Mac often uses Groq/cloud; treat local server route as unlocked when prefs say server-first
+            plan = (
+                None
+                if has_byok
+                else resolve_cloud_plan_for_gate(
+                    pref_cloud_token=self._pref_cloud_token,
+                    pref_proxy_url=self._effective_groq_proxy_url() or None,
+                )
+            )
+            learn_ok = bool(has_byok or (plan or "") == "pro")
+
+            def _on_sug(frm: str, to: str) -> None:
+                mac_banner_notification("Словарь", suggest_add_vocab(frm, to, auto_add=True))
+
+            schedule_learn_from_clipboard(out, allowed=learn_ok, on_suggest=_on_sug)
+        except Exception as e:
+            _mac_log("debug", "learn_schedule_err err=%s", e)
         if os.environ.get("WHISPER_MAC_NOTIFY_SUCCESS", "1") != "0":
             prev = out[:130] + ("…" if len(out) > 130 else "")
             if paste_ok:
@@ -3276,26 +3436,11 @@ class WhisperClientMac:
             return False
 
     def _current_app_name(self) -> str | None:
-        """Имя активного приложения (Slack/Cursor/Gmail/…) для per-app vocab-профиля."""
-        if sys.platform != "darwin":
-            return None
+        """Имя активного приложения для vocab + auto AI mode."""
         try:
-            from AppKit import NSWorkspace  # type: ignore[import-untyped]
+            from whisper_app_context import frontmost_app
 
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if app is None:
-                return None
-            name = str(app.localizedName() or "").strip()
-            if not name:
-                try:
-                    bid = str(app.bundleIdentifier() or "").strip()
-                    if bid:
-                        name = bid.rsplit(".", 1)[-1]
-                except Exception:
-                    return None
-            if name.lower().startswith("python"):
-                return None
-            return name or None
+            return frontmost_app()
         except Exception as e:
             _mac_log("debug", "current_app_name_err err=%s", e)
             return None
@@ -3753,6 +3898,17 @@ class WhisperClientMac:
 
         self._paste_target_unix_id = self._snapshot_frontmost_unix_pid()
         _mac_log("info", "recording_started hotkey=%s", self._hotkey_label)
+        try:
+            from whisper_app_context import frontmost_app, suggest_ai_mode
+            from whisper_ai_modes import mode_label, normalize_ai_mode
+            from whisper_hud import hud_show
+
+            app = frontmost_app() or self._current_app_name()
+            pref = normalize_ai_mode(getattr(self, "_pref_ai_mode", None))
+            mode = suggest_ai_mode(app) if pref == "auto" else pref
+            hud_show(app=app, mode=mode_label(mode))
+        except Exception as e:
+            _mac_log("debug", "hud_show_err err=%s", e)
         threading.Thread(
             target=self._preflight_route_warning,
             name="whisper-route-preflight",
@@ -3841,6 +3997,12 @@ class WhisperClientMac:
         return audio_data, peak
 
     def _stop_recording_and_process(self) -> None:
+        try:
+            from whisper_hud import hud_hide
+
+            hud_hide()
+        except Exception:
+            pass
         with self._lock:
             if not self._recording:
                 return
@@ -4449,6 +4611,8 @@ if rumps is not None:
                 rumps.separator,
                 ("Транскрипция", self._transcribe_backend_submenu_items()),
                 ("Словарь", self._vocab_submenu_items()),
+                ("AI Mode", self._ai_mode_submenu_items()),
+                ("Whisper Cloud", self._cloud_submenu_items()),
                 ("Groq API", self._groq_api_submenu_items()),
                 ("Режим текста", self._paste_mode_submenu_items()),
                 ("Макс. длина записи", self._max_record_submenu_items()),
@@ -4595,6 +4759,7 @@ if rumps is not None:
         def _transcribe_backend_submenu_items(self) -> list:
             cur = self.client._effective_transcribe_backend_mode()
             specs = [
+                ("auto_vram", "Авто: GPU если хватает VRAM, иначе Groq"),
                 ("server", "Только мой сервер"),
                 ("groq", "Только Groq (large v3)"),
                 ("server_then_groq", "Сервер → Groq"),
@@ -4677,6 +4842,108 @@ if rumps is not None:
                 f"Файл словаря: {vocab_file_path()}"
             )
             rumps.alert("Словарь — текущая подсказка", msg)
+
+        def _ai_mode_submenu_items(self) -> list:
+            from whisper_ai_modes import ALLOWED_AI_MODE_PREFS, mode_label, normalize_ai_mode
+
+            cur = normalize_ai_mode(self.client._pref_ai_mode)
+            items = []
+            for mode in (
+                "auto",
+                "raw",
+                "polish",
+                "email",
+                "chat",
+                "code",
+                "translate_en",
+                "translate_ru",
+            ):
+                if mode not in ALLOWED_AI_MODE_PREFS:
+                    continue
+                mark = "✓ " if cur == mode else "   "
+                label = mark + mode_label(mode)
+
+                def _make(m: str):
+                    def _cb(_sender, mode=m) -> None:
+                        self.client._merge_save_mac_prefs(ai_mode=mode)
+                        self._safe_recompose_menu()
+                        mac_banner_notification("AI Mode", mode_label(mode))
+
+                    return _cb
+
+                items.append(rumps.MenuItem(label, callback=_make(mode)))
+            return items
+
+        def _cloud_submenu_items(self) -> list:
+            return [
+                rumps.MenuItem("Статус минут…", callback=self._cloud_status_menu),
+                rumps.MenuItem("Зарегистрировать Cloud…", callback=self._cloud_register_menu),
+                rumps.MenuItem("Вставить Cloud токен…", callback=self._cloud_token_menu),
+                rumps.MenuItem("Оформить Pro (Stripe)…", callback=self._cloud_checkout_menu),
+            ]
+
+        def _cloud_status_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                me = fetch_cloud_me(
+                    self.client._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+                    tok,
+                )
+                rumps.alert(
+                    "Whisper Cloud",
+                    (
+                        f"План: {me.get('plan')}\n"
+                        f"Осталось: {me.get('remaining_minutes')} мин "
+                        f"({me.get('remaining_seconds')} с)\n"
+                        f"Период: {me.get('period')}\n"
+                        f"Квота: {round(float(me.get('quota_seconds') or 0)/60, 1)} мин"
+                    ),
+                )
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Не удалось получить статус:\n{e}")
+
+        def _cloud_register_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                mac_banner_notification("Whisper Cloud", f"Токен готов ({tok[:12]}…)")
+                self._safe_recompose_menu()
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Регистрация не удалась:\n{e}")
+
+        def _cloud_token_menu(self, _sender) -> None:
+            raw = _mac_osascript_prompt_line(
+                title="Whisper Cloud токен",
+                message="Вставь wsk_… токен. Пусто + Сохранить — очистить.",
+            )
+            if raw is None:
+                return
+            s = raw.strip()
+            if s and not s.startswith("wsk_"):
+                rumps.alert("Whisper Cloud", "Токен должен начинаться с wsk_")
+                return
+            self.client._merge_save_mac_prefs(cloud_token=s if s else "")
+            self._safe_recompose_menu()
+            mac_banner_notification("Whisper Cloud", "Токен сохранён." if s else "Токен очищен.")
+
+        def _cloud_checkout_menu(self, _sender) -> None:
+            try:
+                tok = self.client._ensure_mac_cloud_token()
+                out = create_cloud_checkout(
+                    self.client._effective_groq_proxy_url() or DEFAULT_GROQ_PROXY_URL,
+                    tok,
+                )
+                url = out.get("checkout_url")
+                if not url:
+                    rumps.alert(
+                        "Whisper Cloud",
+                        "Stripe не настроен на сервере. Попроси админа выдать Pro "
+                        "(grant_pro.py) или задай STRIPE_* на Railway.",
+                    )
+                    return
+                subprocess.Popen(["open", str(url)])  # noqa: S603
+                mac_banner_notification("Whisper Cloud", "Открыта оплата Pro в браузере.")
+            except Exception as e:
+                rumps.alert("Whisper Cloud", f"Checkout:\n{e}")
 
         def _groq_api_submenu_items(self) -> list:
             proxy_enabled = self.client._effective_groq_proxy_enabled()

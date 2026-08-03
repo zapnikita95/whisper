@@ -34,6 +34,7 @@ from collections.abc import Callable
 from typing import Any
 
 from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+from whisper_text_post import apply_spoken_punctuation, finalize_transcript
 from whisper_vocab import (
     apply_replacements as vocab_apply_replacements,
     build_initial_prompt as vocab_build_initial_prompt,
@@ -141,61 +142,8 @@ def _play_record_start_sound() -> None:
 
 
 
-def apply_spoken_punctuation(text: str) -> str:
 
-    """
-
-    Заменяет произнесённые названия знаков на сами знаки (русский текст от Whisper).
-
-    Порядок: сначала многословные фразы.
-
-    """
-
-    if not text:
-
-        return text
-
-    t = text
-
-    pairs: list[tuple[str, str]] = [
-
-        (r"восклицательный\s+знак", "!"),
-
-        (r"вопросительный\s+знак", "?"),
-
-        (r"запятая", ","),
-
-        (r"точка", "."),
-
-        (r"тире", "—"),
-
-    ]
-
-    flags = re.IGNORECASE
-
-    for pattern, repl in pairs:
-
-        t = re.sub(rf"(?iu)\b(?:{pattern})\b", repl, t)
-
-    # пробелы вокруг знаков
-
-    t = re.sub(r"\s*,\s*", ", ", t)
-
-    t = re.sub(r"\s*\.\s*", ". ", t)
-
-    t = re.sub(r"\s*!\s*", "! ", t)
-
-    t = re.sub(r"\s*\?\s*", "? ", t)
-
-    t = re.sub(r"\s*—\s*", " — ", t)
-
-    t = re.sub(r"\s{2,}", " ", t).strip()
-
-    return t
-
-
-
-
+# apply_spoken_punctuation: re-exported from whisper_text_post
 
 # Фразы-галлюцинации, которые Whisper выдаёт на тишину или шум
 _HALLUCINATIONS: set[str] = {
@@ -213,6 +161,38 @@ def _filter_hallucinations(text: str) -> str:
     if text.lower() in _HALLUCINATIONS:
         return ""
     return text
+
+
+def _collapse_exact_duplicate(text: str) -> str:
+    """Whisper и двойной paste иногда дают один и тот же абзац два раза подряд."""
+    t = text.strip()
+    if len(t) < 2:
+        return t
+    n = len(t)
+    if n % 2 == 0 and t[: n // 2] == t[n // 2 :]:
+        return t[: n // 2].strip()
+    # Повтор блока без пробела между копиями: «…подставляются.Так, это…»
+    half = n // 2
+    for shift in range(-3, 4):
+        cut = half + shift
+        if cut <= 0 or cut >= n:
+            continue
+        if t[:cut] == t[cut:]:
+            return t[:cut].strip()
+    return t
+
+
+def _join_segment_texts(segments) -> str:
+    parts: list[str] = []
+    for seg in segments:
+        piece = seg.text.strip()
+        if not piece:
+            continue
+        if parts and piece == parts[-1]:
+            continue
+        parts.append(piece)
+    joined = " ".join(parts).strip()
+    return _collapse_exact_duplicate(_filter_hallucinations(joined))
 
 
 def _win32_paste_once() -> None:
@@ -260,6 +240,8 @@ class WhisperHotkey:
 
         speaker_threshold: float | None = None,
 
+        paste_mode: str = "auto",
+
     ):
 
         self.model_name = model
@@ -304,11 +286,17 @@ class WhisperHotkey:
 
         self._insert_lock = threading.Lock()
 
+        self._last_insert_text = ""
+
+        self._last_insert_mono = 0.0
+
         self._mic_fail_toast_ok = True
 
         self._speaker_verify = speaker_verify
 
         self._speaker_threshold = speaker_threshold
+
+        self._paste_mode = paste_mode if paste_mode in ("auto", "clipboard", "history_only") else "auto"
 
         self._transcribe_timeout_sec = _transcribe_timeout_sec_default()
 
@@ -511,27 +499,11 @@ class WhisperHotkey:
 
 
     def _current_app_name(self) -> str | None:
-        """Имя активного приложения (для per-app профиля словаря). Только Windows."""
-        if sys.platform != "win32":
-            return None
+        """Имя активного приложения (процесс / окно) для vocab + auto AI mode."""
         try:
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            hwnd = user32.GetForegroundWindow()
-            if not hwnd:
-                return None
-            length = user32.GetWindowTextLengthW(hwnd) or 0
-            if length <= 0:
-                return None
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = (buf.value or "").strip()
-            if not title:
-                return None
-            for sep in (" — ", " - ", " – "):
-                if sep in title:
-                    title = title.split(sep)[-1].strip()
-                    break
-            return title or None
+            from whisper_app_context import frontmost_app
+
+            return frontmost_app()
         except Exception as e:
             log.debug("current_app_name_err: %s", e)
             return None
@@ -739,6 +711,18 @@ class WhisperHotkey:
 
         _play_record_start_sound()
 
+        try:
+            from whisper_app_context import frontmost_app, suggest_ai_mode
+            from whisper_ai_modes import mode_label, read_hotkey_ai_mode_pref
+            from whisper_hud import hud_show
+
+            _app = frontmost_app()
+            _pref = read_hotkey_ai_mode_pref()
+            _mode = suggest_ai_mode(_app) if _pref == "auto" else _pref
+            hud_show(app=_app, mode=mode_label(_mode))
+        except Exception:
+            log.debug("hud_show failed", exc_info=True)
+
         print("[Запись] Зажато Ctrl+Win — говори…", flush=True)
 
         self._emit_status("Запись… (отпусти Ctrl+Win)")
@@ -750,6 +734,12 @@ class WhisperHotkey:
 
 
     def _stop_hold_recording_and_process(self) -> None:
+
+        try:
+            from whisper_hud import hud_hide
+            hud_hide()
+        except Exception:
+            pass
 
         with self._lock:
 
@@ -905,7 +895,7 @@ class WhisperHotkey:
 
                 from whisper_groq import hotkey_transcribe_backend_order
 
-                order = hotkey_transcribe_backend_order()
+                order = hotkey_transcribe_backend_order(log_info=log.info)
 
                 log.info("transcribe route=%s", order)
 
@@ -975,9 +965,13 @@ class WhisperHotkey:
 
                             from whisper_groq import (
 
+                                CloudQuotaExceeded,
+
                                 groq_http_timeout_tuple,
 
                                 post_groq_audio_transcription,
+
+                                read_hotkey_cloud_token_pref,
 
                                 read_hotkey_groq_api_key_pref,
                                 read_hotkey_groq_proxy_enabled_pref,
@@ -1020,6 +1014,8 @@ class WhisperHotkey:
 
                                     pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
                                     pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
 
                                     prompt=vocab_prompt or None,
 
@@ -1075,15 +1071,125 @@ class WhisperHotkey:
 
                 if text:
 
-                    if self.spoken_punctuation:
-
-                        text = apply_spoken_punctuation(text)
-
-                    text = self._apply_vocab_replacements_local(text, vocab_app)
+                    text = finalize_transcript(
+                        text,
+                        spoken_punctuation=self.spoken_punctuation,
+                        app_name=vocab_app,
+                    )
+                    if text:
+                        try:
+                            from whisper_ai_modes import (
+                                AiModeProRequired,
+                                apply_ai_mode,
+                                clamp_mode_for_plan,
+                                mode_label,
+                                read_hotkey_ai_mode_pref,
+                                resolve_cloud_plan_for_gate,
+                                resolve_effective_mode,
+                            )
+                            from whisper_groq import (
+                                groq_api_key_from_env,
+                                read_hotkey_cloud_token_pref,
+                                read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_enabled_pref,
+                                read_hotkey_groq_proxy_secret_pref,
+                                read_hotkey_groq_proxy_url_pref,
+                            )
+                            has_byok = bool(
+                                groq_api_key_from_env() or read_hotkey_groq_api_key_pref()
+                            )
+                            local_stt_ok = backend == "server"
+                            plan = (
+                                None
+                                if (has_byok or local_stt_ok)
+                                else resolve_cloud_plan_for_gate(
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                )
+                            )
+                            allow_auto = bool(has_byok or local_stt_ok or (plan or "") == "pro")
+                            text, mode = resolve_effective_mode(
+                                text,
+                                app_name=vocab_app,
+                                pref_mode=read_hotkey_ai_mode_pref(),
+                                allow_auto_context=allow_auto or True,
+                                free_fallback="polish" if allow_auto else "raw",
+                            )
+                            # Free Cloud: clamp email/chat/code down to polish/raw
+                            mode = clamp_mode_for_plan(
+                                mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
+                            )
+                            if mode != "raw":
+                                self._emit_status(f"AI Mode: {mode_label(mode)}…")
+                                text = apply_ai_mode(
+                                    text,
+                                    mode,
+                                    cloud_plan=plan,
+                                    has_byok=has_byok,
+                                    local_stt_ok=local_stt_ok,
+                                    pref_api_key=read_hotkey_groq_api_key_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                    pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                                    pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    log_error=log.error,
+                                )
+                        except AiModeProRequired as e:
+                            log.warning("ai_mode_pro_required: %s", e)
+                            self._emit_toast("Whisper Cloud Pro", str(e)[:200], True)
+                        except Exception as e:
+                            log.exception("ai_mode_failed")
+                            self._emit_toast("AI Mode", str(e)[:180], True)
 
                     if text and not self._cancel_processing.is_set():
 
+                        orig_len = len(text)
+
+                        text = _collapse_exact_duplicate(text.strip())
+
+                        if len(text) != orig_len:
+
+                            log.info("transcribe_deduped chars %d -> %d", orig_len, len(text))
+
+                        log.info("transcribe_ok chars=%d preview=%r", len(text), text[:120])
+
                         self._insert_text(text)
+                        try:
+                            from whisper_learn import schedule_learn_from_clipboard, suggest_add_vocab
+                            from whisper_groq import (
+                                groq_api_key_from_env,
+                                read_hotkey_cloud_token_pref,
+                                read_hotkey_groq_api_key_pref,
+                                read_hotkey_groq_proxy_url_pref,
+                            )
+                            from whisper_ai_modes import resolve_cloud_plan_for_gate
+
+                            _byok = bool(groq_api_key_from_env() or read_hotkey_groq_api_key_pref())
+                            _local = backend == "server"
+                            _plan = (
+                                None
+                                if (_byok or _local)
+                                else resolve_cloud_plan_for_gate(
+                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                )
+                            )
+                            _learn_ok = bool(_byok or _local or (_plan or "") == "pro")
+
+                            def _on_sug(frm: str, to: str) -> None:
+                                self._emit_toast(
+                                    "Словарь",
+                                    suggest_add_vocab(frm, to, auto_add=True),
+                                    False,
+                                )
+
+                            schedule_learn_from_clipboard(
+                                text,
+                                allowed=_learn_ok,
+                                on_suggest=_on_sug,
+                            )
+                        except Exception:
+                            log.debug("learn schedule failed", exc_info=True)
 
                         preview = (text[:220] + "…") if len(text) > 220 else text
 
@@ -1171,21 +1277,14 @@ class WhisperHotkey:
                 _kwargs: dict[str, Any] = {
                     "language": self.language,
                     "beam_size": 5,
+                    "condition_on_previous_text": False,
                 }
                 ip = (initial_prompt or "").strip()
                 if ip:
                     _kwargs["initial_prompt"] = ip
                 segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
-                # Собираем ВСЕ сегменты (генератор нужно полностью прочитать)
-                text_parts = []
-                for seg in segments:
-                    text = seg.text.strip()
-                    if text:
-                        text_parts.append(text)
-
-                result = " ".join(text_parts).strip()
-                result = _filter_hallucinations(result)
+                result = _join_segment_texts(segments)
 
                 if info.language:
 
@@ -1213,17 +1312,54 @@ class WhisperHotkey:
 
         if not text:
 
-            print("[Whisper] Пустой текст, пропуск.", flush=True)
+            print("[Whisper] Empty text, skipping.", flush=True)
+
+            return
+
+        text = _collapse_exact_duplicate(text.strip())
+
+        try:
+            from whisper_hotkey_history import append_history
+
+            append_history(text)
+        except Exception:
+            log.debug("history append failed", exc_info=True)
+
+        mode = self._paste_mode
+        if mode == "history_only":
+            print("[Whisper] paste_mode=history_only — saved to history only.", flush=True)
+            log.info("paste_mode=history_only chars=%d", len(text))
+            return
+
+        now = time.monotonic()
+
+        if text == self._last_insert_text and now - self._last_insert_mono < 5.0:
+
+            log.warning(
+
+                "insert_skipped duplicate paste (%.1f s since last)",
+
+                now - self._last_insert_mono,
+
+            )
 
             return
 
         with self._insert_lock:
 
-            print(f"[Whisper] Вставляю текст ({len(text)} символов): {text}", flush=True)
+            print(f"[Whisper] Output text ({len(text)} chars): {text}", flush=True)
+
+            log.info("insert_text chars=%d mode=%s", len(text), mode)
 
             pyperclip.copy(text)
 
-            time.sleep(0.25)  # буфер обмена должен успеть обновиться
+            if mode == "clipboard":
+                print("[Whisper] paste_mode=clipboard — copied to clipboard only.", flush=True)
+                self._last_insert_text = text
+                self._last_insert_mono = time.monotonic()
+                return
+
+            time.sleep(0.25)
 
             try:
 
@@ -1242,13 +1378,16 @@ class WhisperHotkey:
 
                 time.sleep(0.05)
 
-                print("[Whisper] Текст вставлен.", flush=True)
+                print("[Whisper] Text pasted.", flush=True)
+
+                self._last_insert_text = text
+
+                self._last_insert_mono = time.monotonic()
 
             except Exception:
-                print("[Whisper] Вставка не удалась, текст в буфере обмена.", flush=True)
-                print("[Whisper] Нажми Ctrl+V вручную.", flush=True)
-                log.warning("Вставка через Ctrl+V не удалась")
-                self._emit_toast("Вставка текста", "Ctrl+V не сработал — вставь вручную из буфера.", True)
+                print("[Whisper] Paste failed — text is in the clipboard.", flush=True)
+                log.warning("Ctrl+V paste failed")
+                self._emit_toast("Paste text", "Ctrl+V failed — paste manually from clipboard.", True)
 
 
 

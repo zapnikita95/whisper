@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Whisper Hotkey в фоне: иконка в трее, уведомления (запуск / запись / результат / ошибки).
-Лог: whisper_hotkey.log рядом с exe. Отключить уведомления: трей «Уведомления» или WHISPER_HOTKEY_NO_NOTIFICATIONS=1.
+Лог: whisper_hotkey.log в каталоге данных пользователя (%LOCALAPPDATA%\\WhisperHotkey при установке в Program Files). Отключить уведомления: трей «Уведомления» или WHISPER_HOTKEY_NO_NOTIFICATIONS=1.
 Groq: GROQ_API_KEY в .env или ключ в меню «Groq API ключ…» (whisper_hotkey_prefs.json); env важнее. «Транскрипция» — как на Mac (server = локальный GPU). WHISPER_TRANSCRIBE_BACKEND / WHISPER_MAC_TRANSCRIBE_BACKEND.
 Голос (как на Mac): эталон в ~/.whisper/speaker_embedding.npy, меню «Записать эталон…», «Проверка голоса» или WHISPER_SPEAKER_VERIFY=1 (нужен pip install -r requirements-speaker.txt при сборке exe).
 Без стартового тоста: WHISPER_HOTKEY_SILENT_START=1. Повторы одного и того же текста и частые тосты режутся (антиспам).
@@ -42,35 +42,70 @@ try:
 except ImportError:
     pass
 
-PREFS_PATH = ROOT / "whisper_hotkey_prefs.json"
+from whisper_file_log import user_data_dir
+from whisper_groq import (
+    ensure_hotkey_default_prefs,
+    hotkey_prefs_path,
+    load_hotkey_prefs,
+    save_hotkey_prefs,
+)
+
+USER_DATA = user_data_dir("WhisperHotkey")
+PREFS_PATH = hotkey_prefs_path()
 OLD_PREFS = ROOT / "whisper_hotkey_gui_prefs.json"
+LEGACY_PREFS = ROOT / "whisper_hotkey_prefs.json"
+
+
+def _ensure_user_data_dir() -> None:
+    try:
+        USER_DATA.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _migrate_legacy_prefs() -> None:
+    if PREFS_PATH.is_file():
+        return
+    candidates = [LEGACY_PREFS, OLD_PREFS]
+    # dist\WhisperHotkey\whisper_hotkey_prefs.json если раньше писали рядом с exe
+    for legacy in candidates:
+        try:
+            if legacy.is_file() and legacy.resolve() != PREFS_PATH.resolve():
+                PREFS_PATH.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+                return
+        except OSError:
+            continue
+
+
+_ensure_user_data_dir()
+_migrate_legacy_prefs()
+ensure_hotkey_default_prefs()
 
 
 def _load_prefs() -> dict:
-    try:
-        return json.loads(PREFS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
+    data = load_hotkey_prefs()
+    if data:
+        return data
     try:
         if OLD_PREFS.is_file():
-            data = json.loads(OLD_PREFS.read_text(encoding="utf-8"))
+            legacy = json.loads(OLD_PREFS.read_text(encoding="utf-8"))
             merged = {
-                "model_key": data.get("model_key", "large-v3"),
+                "model_key": legacy.get("model_key", "large-v3"),
                 "notifications": True,
                 "speaker_verify": False,
+                "paste_mode": "auto",
+                "transcribe_backend": "auto_vram",
             }
             _save_prefs(merged)
             return merged
     except (OSError, json.JSONDecodeError, TypeError):
         pass
-    return {"model_key": "large-v3", "notifications": True, "speaker_verify": False}
+    return ensure_hotkey_default_prefs()
 
 
 def _save_prefs(data: dict) -> None:
-    try:
-        PREFS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    _ensure_user_data_dir()
+    save_hotkey_prefs(data)
 
 
 def _notifications_enabled() -> bool:
@@ -91,7 +126,7 @@ def _notify(title: str, body: str, error: bool = False, *, force: bool = False) 
     now = time.monotonic()
     if not force:
         gap = 4.0 if error else 5.0
-        if error and title in ("Таймаут", "Распознавание", "Модель", "Сеть или диск"):
+        if error and title in ("Timeout", "Transcription", "Model", "Network or disk"):
             gap = max(gap, 20.0)
         with _NOTIFY_LOCK:
             dup_win = 45.0 if error else 25.0
@@ -102,7 +137,7 @@ def _notify(title: str, body: str, error: bool = False, *, force: bool = False) 
             tt = _NOTIFY_STATE.setdefault("title_t", {})
             if isinstance(tt, dict):
                 last_t = float(tt.get(title) or 0.0)
-                title_gap = 30.0 if title in ("Таймаут", "Распознавание") else 12.0
+                title_gap = 30.0 if title in ("Timeout", "Transcription") else 12.0
                 if error and last_t > 0.0 and now - last_t < title_gap:
                     return
                 tt[title] = now
@@ -168,7 +203,7 @@ def _run_enroll_speaker_worker(log, notify) -> None:
     rate = 16000
     chunk = 1024
     n_chunks = int(rate / chunk * sec) + 1
-    notify("Эталон голоса", f"Через 2 с запись {sec} с — говори в обычном темпе.", False, force=True)
+    notify("Voice profile", f"Recording in 2 s for {sec} s — speak naturally.", False, force=True)
     time.sleep(2.0)
     stream = None
     pa = None
@@ -197,25 +232,25 @@ def _run_enroll_speaker_worker(log, notify) -> None:
         pr["speaker_verify"] = True
         _save_prefs(pr)
         notify(
-            "Эталон голоса",
-            "Сохранён. Проверка голоса включена в настройках — перезапусти hotkey.",
+            "Voice profile",
+            "Saved. Voice verify enabled in settings — restart hotkey.",
             False,
             force=True,
         )
     except ImportError:
         log.exception("enroll: нет speaker_verify / torch")
         notify(
-            "Эталон голоса",
-            "Нужны зависимости: pip install -r requirements-speaker.txt и пересборка exe.",
+            "Voice profile",
+            "Missing deps: pip install -r requirements-speaker.txt and rebuild exe.",
             True,
             force=True,
         )
     except OSError as e:
         log.exception("enroll: микрофон")
-        notify("Эталон голоса", f"Микрофон: {e}"[:220], True, force=True)
+        notify("Voice profile", f"Microphone: {e}"[:220], True, force=True)
     except Exception as e:
         log.exception("enroll failed")
-        notify("Эталон голоса", str(e)[:220], True, force=True)
+        notify("Voice profile", str(e)[:220], True, force=True)
     finally:
         if stream is not None:
             try:
@@ -236,7 +271,7 @@ def _run_enroll_speaker_worker(log, notify) -> None:
 
 
 def _load_tray_image():
-    from PIL import Image
+    from PIL import Image, ImageDraw
 
     if getattr(sys, "frozen", False):
         base = Path(sys._MEIPASS) / "assets"
@@ -245,12 +280,143 @@ def _load_tray_image():
     for name in ("hotkey_icon.ico", "app_icon.ico"):
         ico = base / name
         if ico.is_file():
-            return Image.open(ico)
-    img = Image.new("RGB", (64, 64), color=(32, 110, 75))
+            try:
+                img = Image.open(ico).convert("RGBA")
+                return img.resize((64, 64), Image.Resampling.LANCZOS)
+            except OSError:
+                continue
+
+    # Bright fallback — visible in tray overflow (pystray/PIL ICO load often fails in frozen exe).
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((2, 2, 62, 62), fill=(34, 160, 100, 255), outline=(255, 255, 255, 220), width=3)
+    draw.rectangle((28, 18, 36, 34), fill=(255, 255, 255, 255))
+    draw.ellipse((22, 34, 42, 50), fill=(255, 255, 255, 255))
     return img
 
 
+def _is_settings_argv() -> bool:
+    return any(a.lower() in ("--settings", "-s", "/settings") for a in sys.argv[1:])
+
+
+def _show_settings_on_start_pref() -> bool:
+    v = os.environ.get("WHISPER_HOTKEY_NO_SETTINGS_ON_START", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return False
+    return bool(_load_prefs().get("show_settings_on_start", True))
+
+
+def _set_show_settings_on_start(enabled: bool) -> None:
+    p = _load_prefs()
+    p["show_settings_on_start"] = bool(enabled)
+    _save_prefs(p)
+
+
+def _acquire_single_instance() -> bool:
+    """Не даём двум WhisperHotkey одновременно ловить Ctrl+Win и вставлять текст дважды."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    ERROR_ALREADY_EXISTS = 183
+    kernel32.CreateMutexW(None, True, "Global\\WhisperHotkeySingleInstance_v1")
+    return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+
+
+def run_settings_only() -> int:
+    """Start Menu shortcut: settings without tray icon / without blocking main instance."""
+    from whisper_file_log import configure, log_dir
+
+    log = configure("whisper.hotkey", "whisper_hotkey.log")
+    log.info("Whisper Hotkey --settings (standalone)")
+
+    try:
+        from whisper_version import get_version as _ver
+    except ImportError:
+        def _ver() -> str:
+            return "dev"
+
+    hp = _load_prefs()
+
+    def paste(m: str) -> None:
+        p = _load_prefs()
+        p["paste_mode"] = m
+        _save_prefs(p)
+        _notify("Text output", "Restart Whisper Hotkey to apply paste mode.", False, force=True)
+
+    def logs() -> None:
+        d = log_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(d))  # type: ignore[attr-defined]
+        except OSError:
+            subprocess.run(["explorer", str(d)], check=False)
+
+    def tray_menu_hint() -> None:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Groq, models, vocabulary: run Whisper Hotkey from Start menu.\n"
+                "If the tray icon is missing (common when running as Admin), "
+                "use this Settings shortcut anytime.",
+                "Whisper Hotkey",
+                0x40,
+            )
+        except Exception:
+            pass
+
+    from whisper_hotkey_settings_win import launch_settings_window
+
+    launch_settings_window(
+        version=_ver(),
+        paste_mode=str(hp.get("paste_mode", "auto")),
+        show_on_start=_show_settings_on_start_pref(),
+        on_paste_mode=paste,
+        on_history_file=lambda: open_history_file_standalone(),
+        on_logs=logs,
+        on_updates=lambda: _notify("Updates", "Run Whisper Hotkey and use Check for updates.", False, force=True),
+        on_quit=lambda: None,
+        on_show_tray_menu=tray_menu_hint,
+        on_toggle_show_on_start=_set_show_settings_on_start,
+        standalone=True,
+        blocking=True,
+    )
+    return 0
+
+
+def open_history_file_standalone() -> None:
+    try:
+        from whisper_hotkey_history import HISTORY_PATH
+
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not HISTORY_PATH.is_file():
+            HISTORY_PATH.write_text("[]", encoding="utf-8")
+        os.startfile(str(HISTORY_PATH))  # type: ignore[attr-defined]
+    except Exception as e:
+        _notify("History", str(e)[:200], True)
+
+
 def main() -> int:
+    if _is_settings_argv():
+        return run_settings_only()
+    if not _acquire_single_instance():
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Whisper Hotkey is already running (system tray).\n"
+                "A second instance causes double paste — close the extra one in Task Manager.",
+                "Whisper Hotkey",
+                0x30,
+            )
+        except Exception:
+            pass
+        return 0
+
     from whisper_file_log import configure, log_dir
 
     log = configure("whisper.hotkey", "whisper_hotkey.log")
@@ -280,14 +446,14 @@ def main() -> int:
             log.warning("Запуск без прав администратора — Ctrl+Win может не работать")
             _notify(
                 "Whisper Hotkey",
-                f"v{_ver()} · Ctrl+Win — запись. Нет прав администратора: перехват может не работать — запусти exe от администратора.",
+                f"v{_ver()} · Ctrl+Win — record. No admin rights: hotkey may fail — run as administrator.",
                 True,
                 force=True,
             )
         else:
             _notify(
                 "Whisper Hotkey",
-                f"Работаю в фоне (v{_ver()}). Ctrl+Win — запись.",
+                f"Running as Admin (v{_ver()}). Tray icon may be hidden — settings window will open.",
                 False,
                 force=True,
             )
@@ -310,6 +476,7 @@ def main() -> int:
                 toast_callback=toast_cb,
                 speaker_verify=bool(hp.get("speaker_verify", False)),
                 speaker_threshold=_speaker_threshold_from_prefs(hp),
+                paste_mode=str(hp.get("paste_mode", "auto")).strip() or "auto",
             )
             try:
                 to = hp.get("transcribe_timeout_sec")
@@ -326,7 +493,7 @@ def main() -> int:
             svc.run()
         except Exception:
             log.exception("Фатальная ошибка hotkey")
-            _notify("Whisper Hotkey", "Критическая ошибка — см. whisper_hotkey.log", True, force=True)
+            _notify("Whisper Hotkey", "Critical error — see whisper_hotkey.log", True, force=True)
 
     def set_model(icon: pystray.Icon, key: str) -> None:
         p = _load_prefs()
@@ -334,17 +501,24 @@ def main() -> int:
         _save_prefs(p)
         os.environ["WHISPER_MODEL"] = key
         log.info("В prefs выбрана модель %s (нужен перезапуск)", key)
-        _notify("Модель", "Перезапусти Whisper Hotkey, чтобы применить модель.", False, force=True)
+        _notify("Model", "Restart Whisper Hotkey to apply the model.", False, force=True)
         icon.update_menu()
 
     def set_transcribe_backend(icon: pystray.Icon, mode: str) -> None:
         p = _load_prefs()
         p["transcribe_backend"] = mode
         _save_prefs(p)
-        log.info("В prefs transcribe_backend=%s (нужен перезапуск, если не переопределяет env)", mode)
+        log.info("prefs transcribe_backend=%s (применяется сразу)", mode)
+        labels = {
+            "auto_vram": "Авто: GPU или Groq",
+            "server": "Только локальный GPU",
+            "groq": "Только Groq",
+            "server_then_groq": "GPU → Groq",
+            "groq_then_server": "Groq → GPU",
+        }
         _notify(
             "Транскрипция",
-            "Перезапусти Whisper Hotkey, чтобы применить цепочку (если не задан WHISPER_TRANSCRIBE_BACKEND в среде).",
+            f"Режим: {labels.get(mode, mode)}. Уже активно — перезапуск не нужен.",
             False,
             force=True,
         )
@@ -356,7 +530,7 @@ def main() -> int:
         _save_prefs(p)
         log.info("Уведомления: %s", p["notifications"])
         if p["notifications"]:
-            _notify("Уведомления", "Включены.", False, force=True)
+            _notify("Notifications", "Enabled.", False, force=True)
         icon.update_menu()
 
     def toggle_speaker_verify(icon: pystray.Icon, item: object) -> None:
@@ -364,7 +538,7 @@ def main() -> int:
         p["speaker_verify"] = not bool(p.get("speaker_verify", False))
         _save_prefs(p)
         log.info("Проверка голоса (prefs): %s", p["speaker_verify"])
-        _notify("Голос", "Перезапусти Whisper Hotkey, чтобы применить проверку голоса.", False, force=True)
+        _notify("Voice", "Restart Whisper Hotkey to apply voice verification.", False, force=True)
         icon.update_menu()
 
     def start_enroll_speaker(icon: pystray.Icon, item: object) -> None:
@@ -399,6 +573,28 @@ def main() -> int:
         log.info("Выход по команде трея")
         icon.stop()
         os._exit(0)
+
+    def open_settings_ui(icon: pystray.Icon, item: object = None) -> None:
+        """Left-click tray icon (default action) — Mac-like settings window."""
+        from whisper_hotkey_settings_win import launch_settings_window
+
+        hp = _load_prefs()
+        launch_settings_window(
+            version=_ver(),
+            paste_mode=str(hp.get("paste_mode", "auto")),
+            show_on_start=_show_settings_on_start_pref(),
+            on_paste_mode=lambda m: set_paste_mode(icon, m),
+            on_history_file=lambda: open_history_file(icon, None),
+            on_logs=lambda: open_log_folder(icon, None),
+            on_updates=lambda: hotkey_check_for_updates(icon, None),
+            on_quit=lambda: on_quit(icon, None),
+            on_show_tray_menu=lambda: threading.Thread(target=icon._menu, daemon=True).start(),
+            on_toggle_show_on_start=_set_show_settings_on_start,
+            on_prefs_saved=lambda: icon.update_menu(),
+        )
+
+    def show_tray_menu(icon: pystray.Icon, item: object = None) -> None:
+        threading.Thread(target=icon._menu, daemon=True).start()
 
     def model_submenu():
         items = []
@@ -539,8 +735,10 @@ def main() -> int:
 
     def use_default_proxy(icon: pystray.Icon, item: object) -> None:
         p = _load_prefs()
+        from whisper_groq import DEFAULT_GROQ_PROXY_URL
+
         p["groq_proxy_enabled"] = True
-        p["groq_proxy_url"] = "https://whisper-groq-proxy-production.up.railway.app"
+        p["groq_proxy_url"] = DEFAULT_GROQ_PROXY_URL
         p.pop("groq_proxy_secret", None)
         _save_prefs(p)
         _notify(
@@ -921,12 +1119,194 @@ def main() -> int:
         _notify("Запись", "Перезапусти Whisper Hotkey.", False, force=True)
         icon.update_menu()
 
+    def set_paste_mode(icon: pystray.Icon, mode: str) -> None:
+        p = _load_prefs()
+        p["paste_mode"] = mode
+        _save_prefs(p)
+        log.info("paste_mode=%s (restart hotkey to apply)", mode)
+        _notify("Text output", "Restart Whisper Hotkey to apply paste mode.", False, force=True)
+        icon.update_menu()
+
+    def paste_mode_submenu():
+        cur = str(_load_prefs().get("paste_mode", "auto")).strip() or "auto"
+        specs = [
+            ("auto", "Paste + clipboard"),
+            ("clipboard", "Clipboard only"),
+            ("history_only", "History only"),
+        ]
+        items = []
+        for mode, label in specs:
+            mark = "✓ " if cur == mode else ""
+
+            def make_pick(m: str):
+                def pick(icon: pystray.Icon, item: object) -> None:
+                    set_paste_mode(icon, m)
+
+                return pick
+
+            items.append(Item(f"{mark}{label}", make_pick(mode)))
+        return pystray.Menu(*items)
+
+    def open_history_file(icon: pystray.Icon, item: object) -> None:
+        try:
+            from whisper_hotkey_history import HISTORY_PATH
+
+            HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if not HISTORY_PATH.is_file():
+                HISTORY_PATH.write_text("[]", encoding="utf-8")
+            os.startfile(str(HISTORY_PATH))  # type: ignore[attr-defined]
+        except Exception as e:
+            _notify("History", str(e)[:200], True)
+
+    def history_submenu():
+        from whisper_hotkey_history import load_history, preview_title
+
+        items = []
+        for entry in load_history(limit=12):
+            t = str(entry.get("text") or "")
+            title = preview_title(t)
+            if entry.get("failure"):
+                title = "✗ " + title
+
+            def make_copy(text: str):
+                def pick(icon: pystray.Icon, item: object) -> None:
+                    try:
+                        import pyperclip
+
+                        pyperclip.copy(text)
+                        _notify("History", "Copied to clipboard.", False, force=True)
+                    except Exception as ex:
+                        _notify("History", str(ex)[:200], True)
+
+                return pick
+
+            items.append(Item(title, make_copy(t)))
+        if not items:
+            items.append(Item("(empty)", None, enabled=False))
+        items.append(Item("Open history file…", open_history_file))
+        return pystray.Menu(*items)
+
     def vocab_submenu():
         return pystray.Menu(
             Item("Открыть словарь…", open_vocab_file),
             Item("Добавить из буфера…", vocab_add_from_clipboard),
             Item("Добавить замену…", vocab_add_replacement),
             Item("Показать подсказку словаря", vocab_show_prompt),
+        )
+
+    def ai_mode_submenu():
+        from whisper_ai_modes import ALLOWED_AI_MODE_PREFS, mode_label, normalize_ai_mode, read_hotkey_ai_mode_pref
+        from whisper_groq import load_hotkey_prefs, save_hotkey_prefs
+
+        cur = read_hotkey_ai_mode_pref()
+
+        def set_mode(icon: pystray.Icon, mode: str) -> None:
+            p = load_hotkey_prefs()
+            p["ai_mode"] = normalize_ai_mode(mode)
+            save_hotkey_prefs(p)
+            _notify("AI Mode", mode_label(mode), False, force=True)
+            icon.update_menu()
+
+        items = []
+        for mode in (
+            "auto",
+            "raw",
+            "polish",
+            "email",
+            "chat",
+            "code",
+            "translate_en",
+            "translate_ru",
+        ):
+            if mode not in ALLOWED_AI_MODE_PREFS:
+                continue
+            mark = "✓ " if cur == mode else "   "
+            items.append(
+                Item(
+                    mark + mode_label(mode),
+                    lambda icon, item, m=mode: set_mode(icon, m),
+                )
+            )
+        return pystray.Menu(*items)
+
+    def cloud_submenu():
+        def cloud_status(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                from whisper_groq import (
+                    DEFAULT_GROQ_PROXY_URL,
+                    ensure_cloud_token_for_proxy,
+                    fetch_cloud_me,
+                    resolve_groq_proxy_url,
+                    read_hotkey_groq_proxy_url_pref,
+                )
+
+                base = resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()) or DEFAULT_GROQ_PROXY_URL
+                tok = ensure_cloud_token_for_proxy(base)
+                me = fetch_cloud_me(base, tok)
+                _notify(
+                    "Whisper Cloud",
+                    f"{me.get('plan')}: {me.get('remaining_minutes')} мин осталось ({me.get('period')})",
+                    False,
+                    force=True,
+                )
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        def cloud_checkout(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                from whisper_groq import (
+                    DEFAULT_GROQ_PROXY_URL,
+                    create_cloud_checkout,
+                    ensure_cloud_token_for_proxy,
+                    resolve_groq_proxy_url,
+                    read_hotkey_groq_proxy_url_pref,
+                )
+
+                base = resolve_groq_proxy_url(read_hotkey_groq_proxy_url_pref()) or DEFAULT_GROQ_PROXY_URL
+                tok = ensure_cloud_token_for_proxy(base)
+                out = create_cloud_checkout(base, tok)
+                url = out.get("checkout_url")
+                if not url:
+                    _notify(
+                        "Whisper Cloud",
+                        "Stripe не настроен — нужен grant_pro.py или STRIPE_* на Railway",
+                        True,
+                        force=True,
+                    )
+                    return
+                webbrowser.open(str(url))
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        def cloud_paste_token(icon: pystray.Icon, item: object = None) -> None:
+            try:
+                import tkinter as tk
+                from tkinter import simpledialog
+
+                from whisper_groq import load_hotkey_prefs, save_hotkey_prefs
+
+                root = tk.Tk()
+                root.withdraw()
+                ans = simpledialog.askstring("Cloud токен", "wsk_… (пусто — очистить)", show="*")
+                root.destroy()
+                if ans is None:
+                    return
+                p = load_hotkey_prefs()
+                s = ans.strip()
+                if not s:
+                    p.pop("cloud_token", None)
+                else:
+                    p["cloud_token"] = s
+                save_hotkey_prefs(p)
+                _notify("Whisper Cloud", "Токен сохранён" if s else "Токен очищен", False, force=True)
+                icon.update_menu()
+            except Exception as e:
+                _notify("Whisper Cloud", str(e)[:180], True, force=True)
+
+        return pystray.Menu(
+            Item("Статус минут…", cloud_status),
+            Item("Вставить токен…", cloud_paste_token),
+            Item("Оформить Pro…", cloud_checkout),
         )
 
     def groq_api_submenu():
@@ -951,15 +1331,16 @@ def main() -> int:
             "WHISPER_MAC_TRANSCRIBE_BACKEND",
         )
         specs = [
+            ("auto_vram", "Авто: GPU если хватает VRAM, иначе Groq"),
             ("server", "Только локальный GPU"),
             ("groq", "Только Groq (large v3)"),
             ("server_then_groq", "GPU → Groq"),
             ("groq_then_server", "Groq → GPU"),
         ]
-        items = []
+        cur_label = dict(specs).get(cur, cur or "по умолчанию")
+        items = [Item(f"Сейчас: {cur_label}", None, enabled=False)]
         for mode, label in specs:
-            mark = "✓ " if cur == mode else ""
-            short = label if len(label) <= 48 else label[:45] + "…"
+            mark = "✓ " if cur == mode else "   "
 
             def make_pick(m: str):
                 def pick(icon: pystray.Icon, item: object) -> None:
@@ -967,34 +1348,45 @@ def main() -> int:
 
                 return pick
 
-            items.append(Item(f"{mark}{short}", make_pick(mode)))
+            items.append(Item(f"{mark}{label}", make_pick(mode)))
         return pystray.Menu(*items)
 
     def notif_label(item: object) -> str:
         env_off = os.environ.get("WHISPER_HOTKEY_NO_NOTIFICATIONS", "").strip().lower() in ("1", "true", "yes")
         if env_off:
-            return "Уведомления: выкл (переменная среды)"
+            return "Notifications: off (env)"
         on = bool(_load_prefs().get("notifications", True))
-        return f"Уведомления: {'вкл' if on else 'выкл'}"
+        return f"Notifications: {'on' if on else 'off'}"
 
     def spk_label(item: object) -> str:
         on = bool(_load_prefs().get("speaker_verify", False))
-        return f"Проверка голоса: {'вкл' if on else 'выкл'} (перезапуск)"
+        return f"Voice verify: {'on' if on else 'off'} (restart)"
+
+    def paste_label(item: object) -> str:
+        pm = str(_load_prefs().get("paste_mode", "auto"))
+        labels = {"auto": "paste+clipboard", "clipboard": "clipboard", "history_only": "history"}
+        return f"Text output: {labels.get(pm, pm)} (restart)"
 
     menu = pystray.Menu(
+        Item("Открыть настройки…", open_settings_ui, default=True),
         Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
+        Item("Меню трея (словарь…)…", show_tray_menu),
         Item(notif_label, toggle_notifications),
         Item(spk_label, toggle_speaker_verify),
         Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
+        Item(paste_label, paste_mode_submenu()),
         Item("Модель → (перезапуск)", model_submenu()),
-        Item("Транскрипция → (перезапуск)", transcribe_backend_submenu()),
-        Item("Порог эталона →", speaker_threshold_submenu()),
-        Item("Таймаут транскрипции (сек)…", edit_transcribe_timeout),
-        Item("Макс. удержание записи (сек)…", edit_max_hold),
+        Item("Транскрипция →", transcribe_backend_submenu()),
+        Item("Порог голоса →", speaker_threshold_submenu()),
+        Item("Таймаут распознавания (сек)…", edit_transcribe_timeout),
+        Item("Макс. длина записи (сек)…", edit_max_hold),
         Item("Словарь →", vocab_submenu()),
+        Item("История →", history_submenu()),
+        Item("AI Mode →", ai_mode_submenu()),
+        Item("Whisper Cloud →", cloud_submenu()),
         Item("Groq API →", groq_api_submenu()),
         Item("Проверить обновления…", hotkey_check_for_updates),
-        Item("Папка с логами", open_log_folder),
+        Item("Папка логов", open_log_folder),
         Item("Кэш моделей Hugging Face", open_hf_cache),
         Item("Выход", on_quit),
     )
@@ -1003,14 +1395,28 @@ def main() -> int:
     icon = pystray.Icon(
         "whisper_hotkey",
         image,
-        "Whisper Hotkey — Ctrl+Win",
+        "Whisper Hotkey — click icon for settings · Ctrl+Win record",
         menu,
     )
 
     def on_ready(ic: pystray.Icon) -> None:
+        try:
+            ic.visible = True
+            log.info("Tray icon visible=True")
+        except Exception:
+            log.exception("Tray icon visible failed")
         threading.Thread(target=run_hotkey, name="whisper-hotkey", daemon=True).start()
+        if not silent_start and _show_settings_on_start_pref():
+            threading.Timer(1.2, lambda: open_settings_ui(ic)).start()
 
-    icon.run(setup=on_ready)
+    try:
+        icon.run(setup=on_ready)
+    except Exception:
+        log.exception("pystray icon.run failed — starting hotkey without tray")
+        threading.Thread(target=run_hotkey, name="whisper-hotkey", daemon=True).start()
+        if not silent_start:
+            threading.Timer(1.0, lambda: open_settings_ui(icon)).start()
+        return 0
     return 0
 
 

@@ -32,6 +32,22 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def user_data_dir(app_name: str = "WhisperHotkey") -> Path:
+    """Каталог для prefs и прочих записываемых данных пользователя.
+
+    На Windows всегда %LOCALAPPDATA%\\<app> — и для Program Files, и для portable dist,
+    чтобы настройки (Groq / режим транскрипции) не терялись и не расходились с логом.
+    """
+    env = os.environ.get("WHISPER_USER_DATA_DIR", "").strip()
+    if env:
+        return Path(env)
+    if sys.platform == "win32":
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            return Path(la) / app_name
+    return app_root()
+
+
 def log_dir() -> Path:
     """Каталог логов: после configure() совпадает с тем, куда удалось записать файл."""
     global _RESOLVED_LOG_ROOT
@@ -71,35 +87,37 @@ def _is_windows_program_files_tree(p: Path) -> bool:
     return "program files" in low or "program files (x86)" in low
 
 
-def _pick_writable_log_root(logger_name: str) -> Path:
+def _writable_log_root_candidates(logger_name: str) -> list[Path]:
     """Установка в Program Files: каталог exe часто только для чтения — уводим лог в %LOCALAPPDATA%."""
     env = os.environ.get("WHISPER_LOG_DIR", "").strip()
     if env:
-        return Path(env)
+        return [Path(env)]
     root = app_root()
+    app_name = "WhisperHotkey" if "hotkey" in logger_name else "WhisperServer"
     candidates: list[Path] = []
     if sys.platform == "win32":
-        la = os.environ.get("LOCALAPPDATA", "").strip()
-        la_sub = (
-            Path(la)
-            / ("WhisperHotkey" if "hotkey" in logger_name else "WhisperServer")
-            if la
-            else None
-        )
-        restricted = _is_windows_program_files_tree(root)
-        if restricted:
-            # Не предлагаем Program Files — даже если mkdir/probe прошли, *.log часто запрещён политикой.
-            if la_sub is not None:
-                candidates.append(la_sub)
-        else:
+        user_dir = user_data_dir(app_name)
+        # Сначала user data (как prefs), потом рядом с exe — единый каталог на Win.
+        candidates.append(user_dir)
+        if root != user_dir:
             candidates.append(root)
-            if la_sub is not None:
-                candidates.append(la_sub)
     else:
         candidates.append(root)
     safe = logger_name.replace(".", "_")
     candidates.append(Path(tempfile.gettempdir()) / f"Whisper_{safe}")
+    # Без дубликатов, порядок сохраняем.
+    seen: set[Path] = set()
+    out: list[Path] = []
     for d in candidates:
+        key = d.resolve() if d.exists() else d
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _pick_writable_log_root(logger_name: str) -> Path:
+    for d in _writable_log_root_candidates(logger_name):
         if _try_writable_dir(d):
             return d
     return Path(tempfile.gettempdir())
@@ -123,14 +141,28 @@ def configure(
     _CONFIGURED.add(name)
 
     global _RESOLVED_LOG_ROOT
-    chosen_root = _pick_writable_log_root(name)
-    _RESOLVED_LOG_ROOT = chosen_root
-    path = chosen_root / filename
     logger = logging.getLogger(name)
     logger.setLevel(level)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     fh_cls = _FlushRotatingFileHandler if flush_each_record else RotatingFileHandler
-    fh = fh_cls(path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    fh: logging.Handler | None = None
+    path: Path | None = None
+    for chosen_root in _writable_log_root_candidates(name):
+        if not _try_writable_dir(chosen_root):
+            continue
+        candidate = chosen_root / filename
+        try:
+            fh = fh_cls(candidate, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+            path = candidate
+            _RESOLVED_LOG_ROOT = chosen_root
+            break
+        except OSError:
+            continue
+    if fh is None or path is None:
+        fallback = Path(tempfile.gettempdir()) / filename
+        fh = fh_cls(fallback, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        path = fallback
+        _RESOLVED_LOG_ROOT = fallback.parent
     fh.setLevel(level)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
