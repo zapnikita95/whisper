@@ -1,35 +1,27 @@
-# Groq proxy (Railway / VPS)
+# Groq proxy (Railway + Layero RF)
 
-Если с твоей сети **api.groq.com** не открывается (например, без VPN), подними этот сервис там, где Groq доступен (Railway EU/US и т.д.), и укажи клиентам.
+Если с твоей сети **api.groq.com** / `*.up.railway.app` не открывается (РФ без VPN):
 
-## Текущий деплой (команда)
-
-Публичный URL: **https://whisper-groq-proxy-production.up.railway.app**  
-Проект в Railway: `whisper-groq-proxy` (деплой из каталога `groq_proxy`: `railway up`).
+1. Origin остаётся на Railway: `https://whisper-groq-proxy-production.up.railway.app`
+2. Публичное зеркало для РФ — **Layero**: `https://whisper-groq-proxy.layero.app` (см. `rf-mirror-layero/`)
 
 ```env
-WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy-production.up.railway.app
-# обязателен, если на прокси задан PROXY_SHARED_SECRET (рекомендуется):
-WHISPER_GROQ_PROXY_SECRET=<тот же секрет, что в Variables на Railway>
+WHISPER_GROQ_PROXY_URL=https://whisper-groq-proxy.layero.app
 ```
 
-См. также **`.env.example`** в корне репозитория whisper.
+Mac-клиент (b53+) использует Layero URL по умолчанию, прокси включён.
 
-На Railway в Variables:
+## Railway origin
+
+Проект: `whisper-groq-proxy` (`railway up` из `groq_proxy/`).
 
 | Переменная | Значение |
 |------------|----------|
-| `GROQ_API_KEY` | ключ `gsk_…` (прокси сам подставит в Groq, клиенту ключ не нужен) |
-| `PROXY_SHARED_SECRET` | длинная случайная строка (рекомендуется) |
-
-Команда старта (Railway сам подставит `PORT`):
+| `GROQ_API_KEY` | ключ `gsk_…` |
+| `PROXY_SHARED_SECRET` | опционально |
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
 ```
 
-Root directory в Railway: `groq_proxy` (или весь репо + start из этой папки).
-
-Клиент шлёт `POST {WHISPER_GROQ_PROXY_URL}/openai/v1/audio/transcriptions` с тем же телом, что и на Groq. Если на прокси задан только `GROQ_API_KEY`, клиент может **не** хранить ключ Groq локально.
-
-Если клиент передаёт свой `Authorization: Bearer gsk_…`, прокси пробросит его в Groq (ключ на Railway не обязателен, но тогда секрет обязателен, иначе URL увидит кто угодно).
+Клиент: `POST {PROXY}/openai/v1/audio/transcriptions` (тот же multipart, что у Groq).

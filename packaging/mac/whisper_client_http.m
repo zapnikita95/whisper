@@ -38,7 +38,13 @@ static BOOL wcHttpViaURLSession(NSString *method, NSURL *url, NSData *body, NSDi
 		respBody = d;
 		dispatch_semaphore_signal(sem);
 	}] resume];
-	dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+	NSTimeInterval waitSec = timeout > 0 ? (timeout + 5.0) : 60.0;
+	if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitSec * NSEC_PER_SEC))) != 0) {
+		if (outErr)
+			*outErr = [NSError errorWithDomain:@"wc.http" code:-1001
+			                          userInfo:@{NSLocalizedDescriptionKey : @"http timeout"}];
+		return NO;
+	}
 	if (err) {
 		if (outErr) *outErr = err;
 		return NO;
