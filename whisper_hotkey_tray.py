@@ -467,10 +467,19 @@ def main() -> int:
         time.sleep(0.4)
         try:
             hp = _load_prefs()
+            from whisper_quality import resolve_quality_compute_type
+
+            _dev = os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda"
+            _ct = resolve_quality_compute_type(
+                device=_dev,
+                explicit=os.environ.get("WHISPER_COMPUTE_TYPE")
+                or str(hp.get("compute_type") or "").strip()
+                or None,
+            )
             svc = WhisperHotkey(
                 model=resolve_model(os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3"),
-                device=os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda",
-                compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8",
+                device=_dev,
+                compute_type=_ct,
                 language=os.environ.get("WHISPER_LANGUAGE", "").strip() or None,
                 status_callback=lambda m: log.info("status: %s", m),
                 toast_callback=toast_cb,

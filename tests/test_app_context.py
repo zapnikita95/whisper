@@ -10,8 +10,8 @@ class SuggestModeTests(unittest.TestCase):
 
         self.assertEqual(suggest_ai_mode("Slack"), "chat")
         self.assertEqual(suggest_ai_mode("Telegram Desktop"), "chat")
-        self.assertEqual(suggest_ai_mode("Cursor"), "code")
-        self.assertEqual(suggest_ai_mode("Code"), "code")
+        self.assertEqual(suggest_ai_mode("Cursor"), "polish")
+        self.assertEqual(suggest_ai_mode("Code"), "polish")
         self.assertEqual(suggest_ai_mode("Gmail"), "email")
         self.assertEqual(suggest_ai_mode("Chrome"), "polish")
 
@@ -29,7 +29,7 @@ class VoicePrefixTests(unittest.TestCase):
         self.assertEqual(m, "code")
         self.assertIn("print", t)
         t, m = resolve_effective_mode("привет", app_name="Cursor", pref_mode="auto")
-        self.assertEqual(m, "code")
+        self.assertEqual(m, "polish")
         t, m = resolve_effective_mode("привет", app_name="Cursor", pref_mode="chat")
         self.assertEqual(m, "chat")
 

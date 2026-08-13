@@ -341,11 +341,23 @@ def transcribe(
     fn = file.filename or "audio.wav"
     ct = file.content_type or "audio/wav"
     files = {"file": (fn, raw, ct)}
-    data: dict[str, str] = {"model": model, "response_format": response_format}
+    # Groq Whisper copies prompt style; empty prompt → often no punctuation.
+    _punct_seed = (
+        "Здравствуйте. Это диктовка с пунктуацией: запятые, точки, вопросительные знаки? Да! "
+        "Hello, this is a well-punctuated transcript."
+    )
+    prompt_s = str(prompt or "").strip()
+    if not prompt_s:
+        prompt_s = _punct_seed
+    elif _punct_seed not in prompt_s:
+        prompt_s = f"{_punct_seed} {prompt_s}"
+    data: dict[str, str] = {
+        "model": model,
+        "response_format": response_format,
+        "prompt": prompt_s,
+    }
     if language:
         data["language"] = language
-    if prompt and str(prompt).strip():
-        data["prompt"] = str(prompt).strip()
 
     try:
         r = requests.post(

@@ -2655,20 +2655,25 @@ class WhisperClientMac:
                         )
                         result["text"] = cleaned
                         if mode != "raw" and cleaned.strip():
-                            _mac_log("info", "ai_mode_apply mode=%s", mode_label(mode))
-                            result["text"] = apply_ai_mode(
-                                cleaned,
-                                mode,
-                                cloud_plan=plan,
-                                has_byok=has_byok,
-                                local_stt_ok=local_stt_ok,
-                                pref_api_key=self._pref_groq_api_key,
-                                pref_proxy_url=self._effective_groq_proxy_url(),
-                                pref_proxy_secret=self._pref_groq_proxy_secret,
-                                pref_proxy_enabled=self._effective_groq_proxy_enabled(),
-                                pref_cloud_token=self._pref_cloud_token,
-                                log_error=lambda m, *a: _mac_log("error", m, *a),
-                            )
+                            from whisper_quality import ai_rewrite_available
+
+                            if not ai_rewrite_available():
+                                _mac_log("info", "ai_mode_skip mode=%s groq_unconfigured", mode_label(mode))
+                            else:
+                                _mac_log("info", "ai_mode_apply mode=%s", mode_label(mode))
+                                result["text"] = apply_ai_mode(
+                                    cleaned,
+                                    mode,
+                                    cloud_plan=plan,
+                                    has_byok=has_byok,
+                                    local_stt_ok=local_stt_ok,
+                                    pref_api_key=self._pref_groq_api_key,
+                                    pref_proxy_url=self._effective_groq_proxy_url(),
+                                    pref_proxy_secret=self._pref_groq_proxy_secret,
+                                    pref_proxy_enabled=self._effective_groq_proxy_enabled(),
+                                    pref_cloud_token=self._pref_cloud_token,
+                                    log_error=lambda m, *a: _mac_log("error", m, *a),
+                                )
                     except AiModeProRequired as e:
                         _mac_log("warning", "ai_mode_pro_required err=%s", e)
                         try:

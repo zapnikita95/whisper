@@ -29,6 +29,11 @@ except ImportError as e:
 from whisper_file_log import configure
 from whisper_models import resolve_model
 from whisper_nvidia_path import prepend_nvidia_cuda_bin_dirs_to_path
+from whisper_quality import (
+    load_whisper_model,
+    local_transcribe_kwargs,
+    resolve_quality_compute_type,
+)
 
 _SERVER_TEMP_LOG = "WhisperServer_last_run.log"
 log = configure(
@@ -87,7 +92,10 @@ app.add_middleware(
 _model: Any = None
 _model_name = resolve_model(os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3")
 _device = (os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda")
-_compute_type = (os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8")
+_compute_type = resolve_quality_compute_type(
+    device=_device,
+    explicit=(os.environ.get("WHISPER_COMPUTE_TYPE") or "").strip() or None,
+)
 
 _clients_lock = threading.Lock()
 # ip -> (unix_ts, метка клиента из X-Whisper-Client)
@@ -198,7 +206,12 @@ def get_model() -> Any:
         print(f"[Server] Загрузка модели {_model_name} ({_device}, {_compute_type})...", flush=True)
         log.info("Загрузка модели %s (%s, %s)", _model_name, _device, _compute_type)
         try:
-            _model = WhisperModel(_model_name, device=_device, compute_type=_compute_type)
+            _model, _compute_type = load_whisper_model(
+                _model_name,
+                device=_device,
+                compute_type=_compute_type,
+                log_warning=log.warning,
+            )
         except Exception as e:
             if _device == "cuda" and _cuda_init_failure(e):
                 log.warning(
@@ -377,12 +390,10 @@ async def transcribe(
                 data = data[:, 0]
 
             model = get_model()
-            transcribe_kwargs: dict[str, Any] = {
-                "language": language,
-                "beam_size": 5,
-            }
-            if initial_prompt:
-                transcribe_kwargs["initial_prompt"] = initial_prompt
+            transcribe_kwargs = local_transcribe_kwargs(
+                language=language,
+                initial_prompt=initial_prompt,
+            )
             try:
                 segments, info = model.transcribe(tmp_path, **transcribe_kwargs)
             except Exception as e:
@@ -426,7 +437,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Whisper HTTP API сервер")
     _def_model = os.environ.get("WHISPER_MODEL", "large-v3").strip() or "large-v3"
     _def_dev = os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda"
-    _def_ct = os.environ.get("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
+    _def_ct = (os.environ.get("WHISPER_COMPUTE_TYPE") or "auto").strip() or "auto"
     p.add_argument("--host", default="0.0.0.0", help="IP для прослушивания (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Порт (default: 8000)")
     p.add_argument(
@@ -435,13 +446,13 @@ def main() -> int:
         help="Модель или ключ пресета (large-v3, ru-ct2-pav88, org/repo на HF)",
     )
     p.add_argument("--device", default=_def_dev, help="cuda | cpu")
-    p.add_argument("--compute-type", default=_def_ct, help="int8, float16, …")
+    p.add_argument("--compute-type", default=_def_ct, help="auto | int8_float16 | float16 | int8")
     args = p.parse_args()
 
     global _model_name, _device, _compute_type
     _model_name = resolve_model(args.model)
     _device = args.device
-    _compute_type = args.compute_type
+    _compute_type = resolve_quality_compute_type(device=_device, explicit=args.compute_type)
 
     print(f"[Server] Запуск на http://{args.host}:{args.port}", flush=True)
     print(f"[Server] Версия: {APP_VERSION}", flush=True)

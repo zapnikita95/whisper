@@ -220,7 +220,7 @@ class WhisperHotkey:
 
         device: str = "cuda",
 
-        compute_type: str = "int8",
+        compute_type: str = "int8_float16",
 
         language: str | None = None,
 
@@ -406,7 +406,11 @@ class WhisperHotkey:
 
             )
 
-        from faster_whisper import WhisperModel
+        from whisper_quality import load_whisper_model, resolve_quality_compute_type
+
+        self.compute_type = resolve_quality_compute_type(
+            device=self.device, explicit=self.compute_type
+        )
 
 
 
@@ -416,13 +420,15 @@ class WhisperHotkey:
 
         try:
 
-            self.model = WhisperModel(
+            self.model, self.compute_type = load_whisper_model(
 
                 self.model_name,
 
                 device=self.device,
 
                 compute_type=self.compute_type,
+
+                log_warning=log.warning,
 
             )
 
@@ -460,7 +466,7 @@ class WhisperHotkey:
 
         print("[Whisper] Модель загружена.", flush=True)
 
-        log.info("Модель загружена")
+        log.info("Модель загружена compute_type=%s", self.compute_type)
 
 
 
@@ -1112,7 +1118,7 @@ class WhisperHotkey:
                                 text,
                                 app_name=vocab_app,
                                 pref_mode=read_hotkey_ai_mode_pref(),
-                                allow_auto_context=allow_auto or True,
+                                allow_auto_context=allow_auto,
                                 free_fallback="polish" if allow_auto else "raw",
                             )
                             # Free Cloud: clamp email/chat/code down to polish/raw
@@ -1120,20 +1126,25 @@ class WhisperHotkey:
                                 mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
                             )
                             if mode != "raw":
-                                self._emit_status(f"AI Mode: {mode_label(mode)}…")
-                                text = apply_ai_mode(
-                                    text,
-                                    mode,
-                                    cloud_plan=plan,
-                                    has_byok=has_byok,
-                                    local_stt_ok=local_stt_ok,
-                                    pref_api_key=read_hotkey_groq_api_key_pref(),
-                                    pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
-                                    pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
-                                    pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
-                                    pref_cloud_token=read_hotkey_cloud_token_pref(),
-                                    log_error=log.error,
-                                )
+                                from whisper_quality import ai_rewrite_available
+
+                                if not ai_rewrite_available():
+                                    log.info("ai_mode_skip mode=%s groq_unconfigured", mode)
+                                else:
+                                    self._emit_status(f"AI Mode: {mode_label(mode)}…")
+                                    text = apply_ai_mode(
+                                        text,
+                                        mode,
+                                        cloud_plan=plan,
+                                        has_byok=has_byok,
+                                        local_stt_ok=local_stt_ok,
+                                        pref_api_key=read_hotkey_groq_api_key_pref(),
+                                        pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                                        pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                                        pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+                                        pref_cloud_token=read_hotkey_cloud_token_pref(),
+                                        log_error=log.error,
+                                    )
                         except AiModeProRequired as e:
                             log.warning("ai_mode_pro_required: %s", e)
                             self._emit_toast("Whisper Cloud Pro", str(e)[:200], True)
@@ -1274,14 +1285,12 @@ class WhisperHotkey:
             sf.write(tmp_path, audio, self.sample_rate)
 
             try:
-                _kwargs: dict[str, Any] = {
-                    "language": self.language,
-                    "beam_size": 5,
-                    "condition_on_previous_text": False,
-                }
-                ip = (initial_prompt or "").strip()
-                if ip:
-                    _kwargs["initial_prompt"] = ip
+                from whisper_quality import local_transcribe_kwargs
+
+                _kwargs = local_transcribe_kwargs(
+                    language=self.language,
+                    initial_prompt=initial_prompt,
+                )
                 segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
                 result = _join_segment_texts(segments)
@@ -1472,7 +1481,7 @@ def main() -> int:
 
     p.add_argument("--device", default="cuda", help="cuda | cpu")
 
-    p.add_argument("--compute-type", default="int8", help="int8, float16, …")
+    p.add_argument("--compute-type", default="auto", help="auto | int8_float16 | float16 | int8")
 
     p.add_argument("--language", default=None, help="ru, en или авто")
 

@@ -629,7 +629,9 @@ def post_groq_audio_transcription(
                 if log_error:
                     log_error("cloud_register_skipped_using_proxy_secret err=%s", e)
 
-    prompt_str = (prompt or "").strip()
+    from whisper_quality import merge_initial_prompt
+
+    prompt_str = merge_initial_prompt(prompt)
 
     def _post(model: str, *, auth_key: str | None) -> requests.Response:
         data: list[tuple[str, str]] = [

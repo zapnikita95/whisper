@@ -19,22 +19,30 @@ DEFAULT_CHAT_MODEL = "llama-3.3-70b-versatile"
 
 _MODE_SYSTEM: dict[str, str] = {
     "polish": (
-        "You clean up speech-to-text. Fix grammar and punctuation. "
+        "You clean up speech-to-text. Fix grammar. Keep or restore punctuation "
+        "(commas, periods, question marks, exclamation marks). Never strip punctuation. "
+        "If the input has almost none, add natural sentence punctuation. "
         "Keep the same language as the input. Do not add greetings or commentary. "
         "Return only the cleaned text."
     ),
     "email": (
         "Rewrite the dictated text as a clear professional email body. "
-        "Keep the user's language. Add a short greeting and sign-off only if natural. "
+        "Keep the user's language. Use normal punctuation. "
+        "Add a short greeting and sign-off only if natural. "
         "Return only the email text, no subject line unless the user asked for one."
     ),
     "chat": (
         "Rewrite the dictated text as a concise friendly chat message. "
-        "Keep the user's language. No hashtags. Return only the message."
+        "Keep the user's language. Keep all punctuation — commas, periods, "
+        "question marks. Do not flatten the text into a punctuation-free dump. "
+        "No hashtags. Return only the message."
     ),
     "code": (
         "The user dictated programming-related text. Format it as clean code or a "
-        "precise technical note. Prefer the language they imply. Return only the result."
+        "precise technical note. Prefer the language they imply. "
+        "If the input is natural speech (a prompt, comment, or explanation), "
+        "keep it as prose with normal punctuation — do not strip commas and periods. "
+        "Return only the result."
     ),
     "translate_en": (
         "Translate the text to natural English. Return only the translation."

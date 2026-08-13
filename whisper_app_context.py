@@ -31,7 +31,9 @@ _CHAT_HINTS = (
     "imessage",
     "viber",
 )
-_CODE_HINTS = (
+# IDEs are where people dictate prompts/comments — polish, not "format as code".
+# Voice prefix «как код» still forces code mode.
+_IDE_POLISH_HINTS = (
     "cursor",
     "code",
     "visual studio",
@@ -72,9 +74,9 @@ def suggest_ai_mode(app_name: str | None, *, free_fallback: str = "polish") -> s
     for h in _CHAT_HINTS:
         if h.strip().lower() in n:
             return "chat"
-    for h in _CODE_HINTS:
+    for h in _IDE_POLISH_HINTS:
         if h.strip().lower() in n:
-            return "code"
+            return "polish"
     return free_fallback
 
 
