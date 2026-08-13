@@ -322,27 +322,7 @@ def _stop_program_files_installer() -> None:
         capture_output=True,
         creationflags=flags,
     )
-    me = os.getpid()
-    ps = (
-        "Get-CimInstance Win32_Process | Where-Object { "
-        f"$_.ProcessId -ne {me} -and $_.CommandLine "
-        "-and ($_.CommandLine -match 'whisper_hotkey_tray') } | "
-        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-    )
-    subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            ps,
-        ],
-        capture_output=True,
-        creationflags=flags,
-        timeout=10,
-    )
-    time.sleep(0.3)
+    time.sleep(0.2)
 
 
 def _acquire_single_instance() -> bool:
@@ -353,7 +333,8 @@ def _acquire_single_instance() -> bool:
 
     kernel32 = ctypes.windll.kernel32
     ERROR_ALREADY_EXISTS = 183
-    kernel32.CreateMutexW(None, True, "Global\\WhisperHotkeySingleInstance_v1")
+    kernel32.SetLastError(0)
+    kernel32.CreateMutexW(None, True, "Local\\WhisperHotkeySingleInstance_v1")
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
