@@ -1230,12 +1230,14 @@ def main() -> int:
             if mode not in ALLOWED_AI_MODE_PREFS:
                 continue
             mark = "✓ " if cur == mode else "   "
-            items.append(
-                Item(
-                    mark + mode_label(mode),
-                    lambda icon, item, m=mode: set_mode(icon, m),
-                )
-            )
+
+            def make_set(m: str):
+                def _act(icon: pystray.Icon, item: object = None) -> None:
+                    set_mode(icon, m)
+
+                return _act
+
+            items.append(Item(mark + mode_label(mode), make_set(mode)))
         return pystray.Menu(*items)
 
     def cloud_submenu():
