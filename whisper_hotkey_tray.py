@@ -312,6 +312,19 @@ def _set_show_settings_on_start(enabled: bool) -> None:
     _save_prefs(p)
 
 
+def _stop_program_files_installer() -> None:
+    """Desktop/source launch must replace the old Program Files exe, not sit behind its mutex."""
+    if getattr(sys, "frozen", False):
+        return
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "WhisperHotkey.exe"],
+        capture_output=True,
+        creationflags=flags,
+    )
+    time.sleep(0.4)
+
+
 def _acquire_single_instance() -> bool:
     """Не даём двум WhisperHotkey одновременно ловить Ctrl+Win и вставлять текст дважды."""
     if sys.platform != "win32":
@@ -402,6 +415,7 @@ def open_history_file_standalone() -> None:
 def main() -> int:
     if _is_settings_argv():
         return run_settings_only()
+    _stop_program_files_installer()
     if not _acquire_single_instance():
         try:
             import ctypes

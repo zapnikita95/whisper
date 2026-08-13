@@ -2,20 +2,19 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
-REM Окно Whisper Hotkey (выбор модели + Ctrl+Win). Нужны права администратора для перехвата клавиш.
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Запрос прав администратора...
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs"
-    exit /b 0
-)
+REM Desktop / Start Menu entry: always this repo (float16 + punctuation), never Program Files installer.
 
-set "PY=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
-if not exist "%PY%" (
-    echo Не найден Python: %PY%
+taskkill /F /IM WhisperHotkey.exe >nul 2>&1
+
+powershell -NoProfile -WindowStyle Hidden -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -match 'whisper_hotkey_tray\.py') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
+set "PYW=%USERPROFILE%\.venvs\faster-whisper\Scripts\pythonw.exe"
+if not exist "%PYW%" set "PYW=%USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe"
+if not exist "%PYW%" (
+    echo Не найден Python: %USERPROFILE%\.venvs\faster-whisper\Scripts\python.exe
     echo См. README — установка venv.
     pause
     exit /b 1
 )
 
-start "" "%PY%" "%~dp0whisper_hotkey_tray.py" %*
+start "" "%PYW%" "%~dp0whisper_hotkey_tray.py" %*
