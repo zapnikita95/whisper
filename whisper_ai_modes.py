@@ -16,6 +16,11 @@ FREE_CLOUD_AI_MODES = frozenset({"raw", "polish"})
 PRO_AI_MODES = ALLOWED_AI_MODES
 
 DEFAULT_CHAT_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_CHAT_MODELS = (
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+)
 
 _MODE_SYSTEM: dict[str, str] = {
     "polish": (
@@ -249,7 +254,38 @@ def post_groq_chat_completion(
         "temperature": 0.3,
         "max_tokens": 2048,
     }
-    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
+
+    def _post(url_: str, headers_: dict[str, str], model_id: str) -> requests.Response:
+        payload = dict(body)
+        payload["model"] = model_id
+        return requests.post(url_, headers=headers_, data=json.dumps(payload), timeout=timeout)
+
+    primary = str(body["model"])
+    chain = [primary] + [m for m in FALLBACK_CHAT_MODELS if m != primary]
+    resp = _post(url, headers, chain[0])
+    if resp.status_code == 403 and not use_proxy:
+        # RF: api.groq.com forbids the local key. Retry via Cloud proxy.
+        if log_error:
+            log_error("ai_mode_403_direct_retry_proxy")
+        proxy_base = resolve_groq_proxy_url(pref_proxy_url) or DEFAULT_GROQ_PROXY_URL
+        url = f"{proxy_base}/openai/v1/chat/completions"
+        headers.pop("Authorization", None)
+        try:
+            tok = ensure_cloud_token_for_proxy(proxy_base, pref_token=pref_cloud_token)
+            headers["X-Whisper-Cloud-Token"] = tok
+        except Exception as e:
+            if log_error:
+                log_error("ai_mode_proxy_register_failed err=%s", e)
+        else:
+            resp = _post(url, headers, chain[0])
+            use_proxy = True
+    if resp.status_code == 403:
+        for alt in chain[1:]:
+            if log_error:
+                log_error("ai_mode_403_retry_model %s -> %s", primary, alt)
+            resp = _post(url, headers, alt)
+            if resp.status_code < 400:
+                break
     if resp.status_code >= 400:
         detail = (resp.text or "")[:400]
         if log_error:

@@ -12,7 +12,8 @@ import requests
 GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_GROQ_MODEL = "whisper-large-v3"
 FALLBACK_GROQ_MODEL = "whisper-large-v3-turbo"
-DEFAULT_GROQ_PROXY_URL = "https://whisper-groq-proxy-production.up.railway.app"
+# Layero RF mirror → Railway → Groq. Direct api.groq.com from RF is 403 Forbidden.
+DEFAULT_GROQ_PROXY_URL = "https://whisper-groq-proxy.layero.app"
 
 # Прокси (Railway/VPS), если api.groq.com с клиентской сети недоступен:
 # WHISPER_GROQ_PROXY_URL=https://xxx.up.railway.app
@@ -63,6 +64,12 @@ def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
 
 
 def resolve_groq_proxy_enabled(pref_stored: bool | None = None) -> bool:
+    """UI prefs beat a stale .env WHISPER_GROQ_PROXY_ENABLED=0.
+
+    Direct Groq from RF returns 403; the settings toggle must actually turn the proxy on.
+    """
+    if pref_stored is True:
+        return True
     for name in ("WHISPER_GROQ_PROXY_ENABLED", "GROQ_PROXY_ENABLED"):
         raw = (os.environ.get(name) or "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
