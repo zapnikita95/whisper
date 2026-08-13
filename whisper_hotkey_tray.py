@@ -322,7 +322,27 @@ def _stop_program_files_installer() -> None:
         capture_output=True,
         creationflags=flags,
     )
-    time.sleep(0.4)
+    me = os.getpid()
+    ps = (
+        "Get-CimInstance Win32_Process | Where-Object { "
+        f"$_.ProcessId -ne {me} -and $_.CommandLine "
+        "-and ($_.CommandLine -match 'whisper_hotkey_tray') } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            ps,
+        ],
+        capture_output=True,
+        creationflags=flags,
+        timeout=10,
+    )
+    time.sleep(0.3)
 
 
 def _acquire_single_instance() -> bool:
