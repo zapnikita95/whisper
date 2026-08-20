@@ -15,10 +15,11 @@ ALLOWED_AI_MODE_PREFS = ALLOWED_AI_MODES | {"auto"}
 FREE_CLOUD_AI_MODES = frozenset({"raw", "polish"})
 PRO_AI_MODES = ALLOWED_AI_MODES
 
-DEFAULT_CHAT_MODEL = "llama-3.3-70b-versatile"
+# Groq retired llama-3.3-70b-versatile / llama-3.1-8b-instant on 2026-08-16.
+DEFAULT_CHAT_MODEL = "openai/gpt-oss-120b"
 FALLBACK_CHAT_MODELS = (
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
     "openai/gpt-oss-20b",
 )
 
@@ -260,6 +261,9 @@ def post_groq_chat_completion(
         payload["model"] = model_id
         return requests.post(url_, headers=headers_, data=json.dumps(payload), timeout=timeout)
 
+    def _retryable(status: int, detail: str) -> bool:
+        return status in (403, 404) or "model_not_found" in detail
+
     primary = str(body["model"])
     chain = [primary] + [m for m in FALLBACK_CHAT_MODELS if m != primary]
     resp = _post(url, headers, chain[0])
@@ -279,13 +283,20 @@ def post_groq_chat_completion(
         else:
             resp = _post(url, headers, chain[0])
             use_proxy = True
-    if resp.status_code == 403:
-        for alt in chain[1:]:
-            if log_error:
-                log_error("ai_mode_403_retry_model %s -> %s", primary, alt)
-            resp = _post(url, headers, alt)
-            if resp.status_code < 400:
-                break
+    if resp.status_code >= 400:
+        detail0 = (resp.text or "")[:400]
+        if _retryable(resp.status_code, detail0):
+            for alt in chain[1:]:
+                if log_error:
+                    log_error(
+                        "ai_mode_model_retry %s -> %s status=%s",
+                        primary,
+                        alt,
+                        resp.status_code,
+                    )
+                resp = _post(url, headers, alt)
+                if resp.status_code < 400:
+                    break
     if resp.status_code >= 400:
         detail = (resp.text or "")[:400]
         if log_error:
