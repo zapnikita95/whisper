@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ctypes
 
+import json
+
 import os
 
 import re
@@ -43,7 +45,26 @@ from whisper_vocab import (
 
 log = logging.getLogger("whisper.hotkey")
 
+_ACTIVE_HOTKEY: Any = None
+_MENU_REFRESH_CALLBACK: Callable[[], None] | None = None
 
+
+def get_active_hotkey() -> Any:
+    return _ACTIVE_HOTKEY
+
+
+def set_menu_refresh_callback(cb: Callable[[], None] | None) -> None:
+    global _MENU_REFRESH_CALLBACK
+    _MENU_REFRESH_CALLBACK = cb
+
+
+def _notify_menu_refresh() -> None:
+    cb = _MENU_REFRESH_CALLBACK
+    if cb is not None:
+        try:
+            cb()
+        except Exception:
+            log.debug("menu refresh failed", exc_info=True)
 
 try:
 
@@ -228,7 +249,7 @@ class WhisperHotkey:
 
         channels: int = 1,
 
-        max_hold_seconds: float = 120.0,
+        max_hold_seconds: float = 600.0,
 
         spoken_punctuation: bool = True,
 
@@ -627,6 +648,8 @@ class WhisperHotkey:
 
             read_err_toasted = False
 
+            hit_max_hold = False
+
             while not self._stop_record.is_set() and n < max_chunks:
 
                 try:
@@ -661,6 +684,10 @@ class WhisperHotkey:
 
                 n += 1
 
+            if n >= max_chunks and not self._stop_record.is_set():
+
+                hit_max_hold = True
+
         finally:
 
             if stream is not None:
@@ -682,6 +709,38 @@ class WhisperHotkey:
             except Exception:
 
                 pass
+
+            if hit_max_hold:
+
+                lim = int(self.max_hold_seconds)
+
+                self._emit_toast(
+
+                    "Лимит записи",
+
+                    f"Достигнут лимит {lim} с — отпусти Ctrl+Win для распознавания.",
+
+                    False,
+
+                )
+
+                self._emit_status(f"Лимит {lim} с · отпусти Ctrl+Win")
+
+
+
+    def _archive_last_recording(self, audio: Any) -> str | None:
+
+        try:
+
+            from whisper_recording_archive import push_recording
+
+            return push_recording(audio, self.sample_rate)
+
+        except Exception:
+
+            log.debug("archive_recording failed", exc_info=True)
+
+            return None
 
 
 
@@ -803,9 +862,23 @@ class WhisperHotkey:
 
         duration_sec = audio.size / self.sample_rate
 
+        log.info(
+
+            "record_duration_sec=%.1f max_hold=%.0f samples=%d",
+
+            duration_sec,
+
+            self.max_hold_seconds,
+
+            audio.size,
+
+        )
+
         if duration_sec > 30:
 
             print(f"[Whisper] Длинная запись ({duration_sec:.1f} сек), обработка может занять время…", flush=True)
+
+        archive_rec_id = self._archive_last_recording(audio)
 
 
 
@@ -1063,6 +1136,18 @@ class WhisperHotkey:
 
                         self._emit_toast("Распознавание", str(e)[:200], True)
 
+                        self._queue_audio_numpy_for_retry(audio, reason=str(e)[:200])
+
+                        self._emit_toast(
+
+                            "Whisper — запись сохранена",
+
+                            "Трей → «Очередь отправки» → «Переотправить».",
+
+                            False,
+
+                        )
+
                         text = None
 
                         break
@@ -1150,7 +1235,11 @@ class WhisperHotkey:
                             self._emit_toast("Whisper Cloud Pro", str(e)[:200], True)
                         except Exception as e:
                             log.exception("ai_mode_failed")
-                            self._emit_toast("AI Mode", str(e)[:180], True)
+                            from whisper_ai_modes import ai_mode_error_toast
+
+                            msg = ai_mode_error_toast(e)
+                            if msg:
+                                self._emit_toast("AI Mode", msg, True)
 
                     if text and not self._cancel_processing.is_set():
 
@@ -1163,6 +1252,18 @@ class WhisperHotkey:
                             log.info("transcribe_deduped chars %d -> %d", orig_len, len(text))
 
                         log.info("transcribe_ok chars=%d preview=%r", len(text), text[:120])
+
+                        if archive_rec_id:
+
+                            try:
+
+                                from whisper_recording_archive import update_recording_transcript
+
+                                update_recording_transcript(archive_rec_id, text)
+
+                            except Exception:
+
+                                log.debug("archive_transcript_update failed", exc_info=True)
 
                         self._insert_text(text)
                         try:
@@ -1317,6 +1418,299 @@ class WhisperHotkey:
 
 
 
+    def _effective_transcribe_route_label(self) -> str:
+        from whisper_groq import hotkey_transcribe_backend_order
+
+        return ",".join(hotkey_transcribe_backend_order(log_info=None) or ["auto"])
+
+    def _queue_failed_audio_for_retry(self, wav_path: str, *, reason: str) -> None:
+        try:
+            from whisper_hotkey_history import append_history
+            from whisper_pending_queue import enqueue_pending_transcription
+
+            item = enqueue_pending_transcription(
+                wav_path,
+                reason=reason,
+                route=self._effective_transcribe_route_label(),
+            )
+            r = " ".join(str(reason or "").split())
+            if len(r) > 100:
+                r = r[:99] + "…"
+            append_history(
+                f"⏸ Не отправлено: {r} — «Очередь отправки» → переотправить",
+                failure=True,
+            )
+            log.warning("pending_audio_queued id=%s reason=%s", item.get("id"), reason[:120])
+            _notify_menu_refresh()
+        except Exception as e:
+            log.error("pending_audio_queue_failed err=%s", e)
+
+    def _queue_audio_numpy_for_retry(self, audio: Any, *, reason: str) -> None:
+        tmp: str | None = None
+        try:
+            import soundfile as sf
+
+            fd, tmp = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            sf.write(tmp, audio, self.sample_rate)
+            self._queue_failed_audio_for_retry(tmp, reason=reason)
+        except Exception as e:
+            log.error("pending_audio_numpy_failed err=%s", e)
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def retry_pending_transcription_by_id(self, item_id: str) -> bool:
+        from whisper_pending_queue import load_pending_transcriptions, remove_pending_transcription
+
+        rid = (item_id or "").strip()
+        if not rid:
+            return False
+        pending = load_pending_transcriptions(limit=500)
+        item = next((x for x in pending if str(x.get("id") or "") == rid), None)
+        if item is None:
+            self._emit_toast("Whisper", "Запись уже отправлена или удалена из очереди.", False)
+            _notify_menu_refresh()
+            return False
+        return self._retry_pending_item(item)
+
+    def retry_latest_pending_transcription(self) -> bool:
+        from whisper_pending_queue import load_pending_transcriptions
+
+        pending = load_pending_transcriptions(limit=1)
+        if not pending:
+            self._emit_toast("Whisper", "Очередь отправки пуста.", False)
+            return False
+        try:
+            return self._retry_pending_item(pending[0])
+        except Exception as e:
+            self._emit_toast("Whisper — очередь", str(e)[:180], True)
+            return False
+
+    def _retry_pending_item(self, item: dict[str, Any]) -> bool:
+        from whisper_pending_queue import remove_pending_transcription
+
+        wav = str(item.get("wav_path") or "")
+        rid = str(item.get("id") or "")
+        if not wav or not Path(wav).is_file():
+            if rid:
+                remove_pending_transcription(rid)
+                _notify_menu_refresh()
+            return False
+
+        import soundfile as sf
+
+        audio, sr = sf.read(wav, dtype="float32")
+        if hasattr(audio, "ndim") and audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if int(sr) != int(self.sample_rate):
+            log.warning("pending_retry_sr_mismatch wav=%s sr=%s expected=%s", wav, sr, self.sample_rate)
+
+        with self._lock:
+            if self._busy:
+                raise RuntimeError("Сначала дождись окончания текущей записи.")
+            self._busy = True
+        self._cancel_processing.clear()
+        try:
+            self._process_recorded_audio(audio, from_pending=True)
+        except Exception:
+            raise
+        finally:
+            with self._lock:
+                self._busy = False
+        if rid:
+            remove_pending_transcription(rid)
+            _notify_menu_refresh()
+        return True
+
+    def retry_archive_recording_by_id(self, rec_id: str) -> bool:
+        from whisper_recording_archive import get_recording_by_id
+
+        rid = (rec_id or "").strip()
+        item = get_recording_by_id(rid)
+        if item is None:
+            self._emit_toast("Архив записей", "Файл не найден.", False)
+            return False
+        wav = str(item.get("wav_path") or "")
+        import soundfile as sf
+
+        audio, sr = sf.read(wav, dtype="float32")
+        if hasattr(audio, "ndim") and audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if int(sr) != int(self.sample_rate):
+            log.warning("archive_retry_sr_mismatch wav=%s sr=%s expected=%s", wav, sr, self.sample_rate)
+        with self._lock:
+            if self._busy:
+                raise RuntimeError("Сначала дождись окончания текущей записи.")
+            self._busy = True
+        self._cancel_processing.clear()
+        try:
+            self._process_recorded_audio(audio, from_pending=True)
+        finally:
+            with self._lock:
+                self._busy = False
+        return True
+
+    def _process_recorded_audio(self, audio: Any, *, from_pending: bool = False) -> None:
+        """Shared transcribe + AI mode + insert pipeline (hotkey release or pending retry)."""
+        import numpy as np
+
+        if not isinstance(audio, np.ndarray):
+            audio = np.asarray(audio, dtype=np.float32)
+        vocab_prompt, vocab_app = self._vocab_prompt_for_current_app()
+        text: str | None = None
+        backend_used = "server"
+        tmo = self._transcribe_timeout_sec
+        from whisper_groq import hotkey_transcribe_backend_order
+
+        order = hotkey_transcribe_backend_order(log_info=log.info)
+        log.info("transcribe route=%s pending=%s", order, from_pending)
+        for idx, backend in enumerate(order):
+            if self._cancel_processing.is_set():
+                return
+            backend_used = backend
+            try:
+                if backend == "server":
+                    fut = self._gpu_pool_get().submit(
+                        self._local_gpu_transcribe_for_chain,
+                        audio,
+                        initial_prompt=vocab_prompt or None,
+                    )
+                    raw = fut.result(timeout=tmo)
+                    text = (raw or "").strip() or None
+                else:
+                    from whisper_groq import (
+                        groq_http_timeout_tuple,
+                        post_groq_audio_transcription,
+                        read_hotkey_cloud_token_pref,
+                        read_hotkey_groq_api_key_pref,
+                        read_hotkey_groq_proxy_enabled_pref,
+                        read_hotkey_groq_proxy_secret_pref,
+                        read_hotkey_groq_proxy_url_pref,
+                    )
+                    import soundfile as sf
+
+                    self._emit_status("Распознавание (Groq)…")
+                    tmp_groq: str | None = None
+                    try:
+                        fd, tmp_groq = tempfile.mkstemp(suffix=".wav")
+                        os.close(fd)
+                        sf.write(tmp_groq, audio, self.sample_rate)
+                        conn, read = groq_http_timeout_tuple(read_cap=600.0)
+                        out = post_groq_audio_transcription(
+                            tmp_groq,
+                            language=self.language,
+                            timeout=(conn, read),
+                            log_error=log.error,
+                            pref_api_key=read_hotkey_groq_api_key_pref(),
+                            pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                            pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                            pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+                            pref_cloud_token=read_hotkey_cloud_token_pref(),
+                            prompt=vocab_prompt or None,
+                        )
+                        text = (out.get("text") or "").strip() or None
+                    finally:
+                        if tmp_groq:
+                            try:
+                                os.unlink(tmp_groq)
+                            except OSError:
+                                pass
+                if text:
+                    break
+                if idx + 1 < len(order):
+                    continue
+            except Exception as e:
+                log.exception("transcribe backend=%s pending=%s", backend, from_pending)
+                if idx + 1 < len(order):
+                    continue
+                if not from_pending:
+                    self._queue_audio_numpy_for_retry(audio, reason=str(e)[:200])
+                raise
+        if not text or self._cancel_processing.is_set():
+            if from_pending:
+                raise RuntimeError("pending_transcribe_empty")
+            return
+        text = finalize_transcript(
+            text,
+            spoken_punctuation=self.spoken_punctuation,
+            app_name=vocab_app,
+        )
+        if text:
+            try:
+                from whisper_ai_modes import (
+                    AiModeProRequired,
+                    apply_ai_mode,
+                    clamp_mode_for_plan,
+                    mode_label,
+                    read_hotkey_ai_mode_pref,
+                    resolve_cloud_plan_for_gate,
+                    resolve_effective_mode,
+                )
+                from whisper_groq import (
+                    groq_api_key_from_env,
+                    read_hotkey_cloud_token_pref,
+                    read_hotkey_groq_api_key_pref,
+                    read_hotkey_groq_proxy_enabled_pref,
+                    read_hotkey_groq_proxy_secret_pref,
+                    read_hotkey_groq_proxy_url_pref,
+                )
+
+                has_byok = bool(groq_api_key_from_env() or read_hotkey_groq_api_key_pref())
+                local_stt_ok = backend_used == "server"
+                plan = (
+                    None
+                    if (has_byok or local_stt_ok)
+                    else resolve_cloud_plan_for_gate(
+                        pref_cloud_token=read_hotkey_cloud_token_pref(),
+                        pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                    )
+                )
+                allow_auto = bool(has_byok or local_stt_ok or (plan or "") == "pro")
+                text, mode = resolve_effective_mode(
+                    text,
+                    app_name=vocab_app,
+                    pref_mode=read_hotkey_ai_mode_pref(),
+                    allow_auto_context=allow_auto,
+                    free_fallback="polish" if allow_auto else "raw",
+                )
+                mode = clamp_mode_for_plan(
+                    mode, plan, has_byok=has_byok, local_stt_ok=local_stt_ok
+                )
+                if mode != "raw":
+                    from whisper_quality import ai_rewrite_available
+
+                    if ai_rewrite_available():
+                        self._emit_status(f"AI Mode: {mode_label(mode)}…")
+                        text = apply_ai_mode(
+                            text,
+                            mode,
+                            cloud_plan=plan,
+                            has_byok=has_byok,
+                            local_stt_ok=local_stt_ok,
+                            pref_api_key=read_hotkey_groq_api_key_pref(),
+                            pref_proxy_url=read_hotkey_groq_proxy_url_pref(),
+                            pref_proxy_secret=read_hotkey_groq_proxy_secret_pref(),
+                            pref_proxy_enabled=read_hotkey_groq_proxy_enabled_pref(),
+                            pref_cloud_token=read_hotkey_cloud_token_pref(),
+                            log_error=log.error,
+                        )
+            except AiModeProRequired as e:
+                log.warning("ai_mode_pro_required: %s", e)
+                self._emit_toast("Whisper Cloud Pro", str(e)[:200], True)
+            except Exception:
+                log.exception("ai_mode_failed")
+        if text and not self._cancel_processing.is_set():
+            text = _collapse_exact_duplicate(text.strip())
+            log.info("transcribe_ok chars=%d preview=%r pending=%s", len(text), text[:120], from_pending)
+            self._insert_text(text)
+            preview = (text[:220] + "…") if len(text) > 220 else text
+            self._emit_toast("Готово", preview, False)
+
+
     def _insert_text(self, text: str) -> None:
 
         if not text:
@@ -1401,6 +1795,10 @@ class WhisperHotkey:
 
 
     def run(self) -> None:
+
+        global _ACTIVE_HOTKEY
+
+        _ACTIVE_HOTKEY = self
 
         print("[Whisper] Зажми Ctrl+Win — запись (звук), отпусти — распознавание.", flush=True)
 

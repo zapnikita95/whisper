@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Callable
 
 import requests
@@ -68,6 +69,10 @@ _MODE_LABELS_RU: dict[str, str] = {
     "translate_en": "→ English",
     "translate_ru": "→ Русский",
 }
+
+
+class AiModeUnavailable(RuntimeError):
+    """Proxy/network down — caller should keep raw STT text."""
 
 
 class AiModeProRequired(RuntimeError):
@@ -193,7 +198,7 @@ def post_groq_chat_completion(
     messages: list[dict[str, str]],
     *,
     model: str | None = None,
-    timeout: tuple[float, float] = (30.0, 90.0),
+    timeout: tuple[float, float] = (3.0, 25.0),
     pref_api_key: str | None = None,
     pref_proxy_url: str | None = None,
     pref_proxy_secret: str | None = None,
@@ -202,52 +207,69 @@ def post_groq_chat_completion(
     log_error: Callable[..., None] | None = None,
 ) -> str:
     from whisper_groq import (
-        DEFAULT_GROQ_PROXY_URL,
+        PROXY_CONNECT_DEADLINE_SEC,
         ensure_cloud_token_for_proxy,
         groq_api_key_from_env,
+        groq_proxy_url_candidates,
+        http_call_deadline,
+        is_proxy_cold_start_response,
+        is_proxy_unreachable,
+        mark_proxy_reachable,
+        mark_proxy_unreachable,
+        _is_layero_proxy,
         resolve_cloud_token,
         resolve_groq_api_key,
         resolve_groq_proxy_enabled,
         resolve_groq_proxy_secret,
-        resolve_groq_proxy_url,
     )
 
     proxy_enabled = resolve_groq_proxy_enabled(pref_proxy_enabled)
-    proxy_base = resolve_groq_proxy_url(pref_proxy_url) if proxy_enabled else ""
-    use_proxy = bool(proxy_base)
-    url = (
-        f"{proxy_base}/openai/v1/chat/completions"
-        if use_proxy
-        else "https://api.groq.com/openai/v1/chat/completions"
-    )
     key = resolve_groq_api_key(pref_api_key) or groq_api_key_from_env()
     proxy_secret = resolve_groq_proxy_secret(pref_proxy_secret) if proxy_enabled else ""
-    headers: dict[str, str] = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "WhisperClient/1.0 (AI Modes)",
-    }
-    if proxy_secret:
-        headers["X-Whisper-Groq-Proxy-Secret"] = proxy_secret
     passthrough = (os.environ.get("WHISPER_GROQ_PROXY_PASSTHROUGH_AUTH") or "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
-    if key and (not use_proxy or passthrough):
-        headers["Authorization"] = f"Bearer {key}"
-    elif not use_proxy:
-        raise ValueError("Нужен GROQ_API_KEY для AI Modes без прокси.")
 
-    if use_proxy and not passthrough and not (key and passthrough):
-        if not proxy_secret or resolve_cloud_token(pref_cloud_token):
-            try:
-                tok = ensure_cloud_token_for_proxy(proxy_base or DEFAULT_GROQ_PROXY_URL, pref_token=pref_cloud_token)
-                headers["X-Whisper-Cloud-Token"] = tok
-            except Exception as e:
-                if not proxy_secret and not key:
-                    raise RuntimeError(f"AI Modes: нет Cloud токена / ключа: {e}") from e
+    def _build_headers(proxy_base: str) -> dict[str, str]:
+        hdrs: dict[str, str] = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "WhisperClient/1.0 (AI Modes)",
+        }
+        if proxy_secret:
+            hdrs["X-Whisper-Groq-Proxy-Secret"] = proxy_secret
+        if proxy_base:
+            if key and passthrough:
+                hdrs["Authorization"] = f"Bearer {key}"
+            elif not passthrough and (not proxy_secret or resolve_cloud_token(pref_cloud_token)):
+                try:
+                    tok = ensure_cloud_token_for_proxy(proxy_base, pref_token=pref_cloud_token)
+                    hdrs["X-Whisper-Cloud-Token"] = tok
+                except Exception as e:
+                    if not proxy_secret and not key:
+                        raise RuntimeError(f"AI Modes: нет Cloud токена / ключа: {e}") from e
+        elif key:
+            hdrs["Authorization"] = f"Bearer {key}"
+        elif not proxy_base:
+            raise ValueError("Нужен GROQ_API_KEY для AI Modes без прокси.")
+        return hdrs
+
+    routes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if proxy_enabled:
+        for base in groq_proxy_url_candidates(pref_proxy_url):
+            u = f"{base}/openai/v1/chat/completions"
+            if u not in seen:
+                seen.add(u)
+                routes.append((u, base))
+    direct = "https://api.groq.com/openai/v1/chat/completions"
+    if key and direct not in seen:
+        routes.append((direct, ""))
+    if not routes:
+        raise ValueError("AI Modes: включи Groq прокси или задай GROQ_API_KEY.")
 
     body = {
         "model": (model or os.environ.get("WHISPER_AI_MODE_MODEL") or DEFAULT_CHAT_MODEL).strip(),
@@ -256,58 +278,121 @@ def post_groq_chat_completion(
         "max_tokens": 2048,
     }
 
-    def _post(url_: str, headers_: dict[str, str], model_id: str) -> requests.Response:
+    def _post(
+        url_: str,
+        headers_: dict[str, str],
+        model_id: str,
+        to: tuple[float, float],
+        auth_key: str | None = None,
+    ) -> requests.Response:
         payload = dict(body)
         payload["model"] = model_id
-        return requests.post(url_, headers=headers_, data=json.dumps(payload), timeout=timeout)
+        hdrs = dict(headers_)
+        if auth_key:
+            hdrs["Authorization"] = f"Bearer {auth_key}"
+
+        def _call() -> requests.Response:
+            return requests.post(url_, headers=hdrs, data=json.dumps(payload), timeout=to)
+
+        if _is_layero_proxy(url_):
+            return http_call_deadline(_call, deadline_sec=PROXY_CONNECT_DEADLINE_SEC)
+        return _call()
 
     def _retryable(status: int, detail: str) -> bool:
         return status in (403, 404) or "model_not_found" in detail
 
     primary = str(body["model"])
     chain = [primary] + [m for m in FALLBACK_CHAT_MODELS if m != primary]
-    resp = _post(url, headers, chain[0])
-    if resp.status_code == 403 and not use_proxy:
-        # RF: api.groq.com forbids the local key. Retry via Cloud proxy.
-        if log_error:
-            log_error("ai_mode_403_direct_retry_proxy")
-        proxy_base = resolve_groq_proxy_url(pref_proxy_url) or DEFAULT_GROQ_PROXY_URL
-        url = f"{proxy_base}/openai/v1/chat/completions"
-        headers.pop("Authorization", None)
+    conn_cap = min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC)
+    read_cap = min(float(timeout[1]), 25.0)
+    route_timeout = (conn_cap, read_cap)
+
+    last_detail = ""
+    last_status = 0
+    for url, proxy_base in routes:
+        if proxy_base and is_proxy_unreachable(proxy_base):
+            continue
         try:
-            tok = ensure_cloud_token_for_proxy(proxy_base, pref_token=pref_cloud_token)
-            headers["X-Whisper-Cloud-Token"] = tok
+            headers = _build_headers(proxy_base)
         except Exception as e:
             if log_error:
-                log_error("ai_mode_proxy_register_failed err=%s", e)
-        else:
-            resp = _post(url, headers, chain[0])
-            use_proxy = True
-    if resp.status_code >= 400:
-        detail0 = (resp.text or "")[:400]
-        if _retryable(resp.status_code, detail0):
-            for alt in chain[1:]:
-                if log_error:
-                    log_error(
-                        "ai_mode_model_retry %s -> %s status=%s",
-                        primary,
-                        alt,
-                        resp.status_code,
-                    )
-                resp = _post(url, headers, alt)
-                if resp.status_code < 400:
-                    break
-    if resp.status_code >= 400:
-        detail = (resp.text or "")[:400]
-        if log_error:
-            log_error("ai_mode_chat_http status=%s body=%r", resp.status_code, detail)
-        raise RuntimeError(f"ai_mode_http_{resp.status_code}:{detail}")
-    out = resp.json()
-    try:
-        content = out["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError("ai_mode_bad_response") from e
-    return (content or "").strip()
+                log_error("ai_mode_headers_failed base=%r err=%s", proxy_base[:80], e)
+            last_detail = str(e)[:400]
+            if proxy_base:
+                mark_proxy_unreachable(proxy_base)
+            continue
+        try:
+            resp = _post(url, headers, chain[0], route_timeout)
+            if is_proxy_cold_start_response(resp.status_code, resp.text or ""):
+                time.sleep(2.0)
+                resp = _post(url, headers, chain[0], route_timeout)
+            use_proxy = "api.groq.com/openai" not in url
+            if use_proxy and not passthrough and resp.status_code == 401:
+                body_low = (resp.text or "").lower()
+                if "invalid api key" in body_low or "invalid_api_key" in body_low:
+                    for fk in [k for k in (resolve_groq_api_key(pref_api_key), groq_api_key_from_env()) if k]:
+                        if log_error:
+                            log_error("ai_mode_proxy_401_retry_with_client_key")
+                        resp = _post(url, headers, chain[0], route_timeout, auth_key=fk)
+                        if resp.status_code != 401:
+                            break
+            if resp.status_code >= 400:
+                detail0 = (resp.text or "")[:400]
+                if _retryable(resp.status_code, detail0):
+                    for alt in chain[1:]:
+                        if log_error:
+                            log_error(
+                                "ai_mode_model_retry %s -> %s status=%s",
+                                primary,
+                                alt,
+                                resp.status_code,
+                            )
+                        resp = _post(url, headers, alt, route_timeout)
+                        if resp.status_code < 400:
+                            break
+            if resp.status_code < 400:
+                out = resp.json()
+                try:
+                    content = out["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError) as e:
+                    raise RuntimeError("ai_mode_bad_response") from e
+                if proxy_base:
+                    mark_proxy_reachable(proxy_base)
+                return (content or "").strip()
+            last_status = resp.status_code
+            last_detail = (resp.text or "")[:400]
+            if log_error:
+                log_error("ai_mode_route status=%s url=%r", resp.status_code, url[:100])
+            if resp.status_code not in (403, 502, 503, 504):
+                break
+        except requests.RequestException as e:
+            last_detail = str(e)[:400]
+            last_status = 0
+            if proxy_base:
+                mark_proxy_unreachable(proxy_base)
+            if log_error:
+                log_error("ai_mode_route_error url=%r err=%s", url[:100], e)
+            continue
+
+    if log_error:
+        log_error("ai_mode_chat_http status=%s body=%r", last_status, last_detail)
+    raise AiModeUnavailable(
+        "ai_mode_proxy_unreachable: Groq прокси недоступен, оставляем сырой текст."
+    )
+
+
+def ai_mode_error_toast(err: Exception) -> str:
+    s = str(err)
+    if isinstance(err, AiModeUnavailable) or "ai_mode_proxy_unreachable" in s:
+        return ""
+    low = s.lower()
+    if "layero_warming" in s or "запускается" in low:
+        return ""
+    if "<!doctype" in low:
+        return ""
+    if "HTTPSConnectionPool" in s or "ConnectTimeout" in s:
+        return ""
+    return s[:180]
 
 
 def apply_ai_mode(
@@ -336,18 +421,25 @@ def apply_ai_mode(
     system = _MODE_SYSTEM.get(mode)
     if not system:
         return text
-    return post_groq_chat_completion(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": text},
-        ],
-        pref_api_key=pref_api_key,
-        pref_proxy_url=pref_proxy_url,
-        pref_proxy_secret=pref_proxy_secret,
-        pref_proxy_enabled=pref_proxy_enabled,
-        pref_cloud_token=pref_cloud_token,
-        log_error=log_error,
-    )
+    try:
+        return post_groq_chat_completion(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            pref_api_key=pref_api_key,
+            pref_proxy_url=pref_proxy_url,
+            pref_proxy_secret=pref_proxy_secret,
+            pref_proxy_enabled=pref_proxy_enabled,
+            pref_cloud_token=pref_cloud_token,
+            log_error=log_error,
+        )
+    except AiModeProRequired:
+        raise
+    except Exception as e:
+        if log_error:
+            log_error("ai_mode_skipped_raw err=%s", e)
+        return text
 
 
 def resolve_cloud_plan_for_gate(

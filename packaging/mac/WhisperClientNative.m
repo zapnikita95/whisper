@@ -15,7 +15,7 @@ static const NSInteger kDefaultServerPort = 8001;
 static NSString *const kGroqURL = @"https://api.groq.com/openai/v1/audio/transcriptions";
 static NSString *const kGroqModel = @"whisper-large-v3";
 /* Layero RF mirror → Railway groq_proxy (без VPN из РФ). */
-static NSString *const kDefaultGroqProxyURL = @"https://whisper-groq-proxy.layero.app";
+static NSString *const kDefaultGroqProxyURL = @"https://whisper-groq-proxy-production.up.railway.app";
 
 static const CGEventFlags kModFn = kCGEventFlagMaskSecondaryFn;
 static const CGEventFlags kOtherMods =

@@ -313,10 +313,24 @@ def _set_show_settings_on_start(enabled: bool) -> None:
 
 
 def _stop_program_files_installer() -> None:
-    """Desktop/source launch must replace the old Program Files exe, not sit behind its mutex."""
-    if getattr(sys, "frozen", False):
+    """Source launch kills frozen exe; frozen launch kills other WhisperHotkey PIDs (not self)."""
+    if sys.platform != "win32":
         return
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    me = os.getpid()
+    if getattr(sys, "frozen", False):
+        ps = (
+            "Get-Process WhisperHotkey -ErrorAction SilentlyContinue | "
+            f"Where-Object {{ $_.Id -ne {me} }} | "
+            "Stop-Process -Force -ErrorAction SilentlyContinue"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True,
+            creationflags=flags,
+        )
+        time.sleep(0.35)
+        return
     subprocess.run(
         ["taskkill", "/F", "/IM", "WhisperHotkey.exe"],
         capture_output=True,
@@ -418,24 +432,36 @@ def main() -> int:
         return run_settings_only()
     _stop_program_files_installer()
     if not _acquire_single_instance():
-        try:
-            import ctypes
+        _stop_program_files_installer()
+        if not _acquire_single_instance():
+            try:
+                import ctypes
 
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "Whisper Hotkey is already running (system tray).\n"
-                "A second instance causes double paste — close the extra one in Task Manager.",
-                "Whisper Hotkey",
-                0x30,
-            )
-        except Exception:
-            pass
-        return 0
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "Whisper Hotkey уже запущен (иконка в трее).\n"
+                    "Второй экземпляр даёт двойную вставку — закройте дубликат в диспетчере задач.",
+                    "Whisper Hotkey",
+                    0x30,
+                )
+            except Exception:
+                pass
+            return 0
 
     from whisper_file_log import configure, log_dir
 
     log = configure("whisper.hotkey", "whisper_hotkey.log")
     log.info("Старт Whisper Hotkey (трей), ROOT=%s", ROOT)
+
+    def _warmup_proxy() -> None:
+        try:
+            from whisper_groq import DEFAULT_GROQ_PROXY_URL, wake_groq_proxy_mirror
+
+            wake_groq_proxy_mirror(DEFAULT_GROQ_PROXY_URL, log_info=log.info)
+        except Exception:
+            log.debug("proxy_warmup_failed", exc_info=True)
+
+    threading.Thread(target=_warmup_proxy, daemon=True, name="groq-proxy-warmup").start()
 
     import pystray
     from pystray import MenuItem as Item
@@ -1207,7 +1233,7 @@ def main() -> int:
             items.append(Item(title, make_copy(t)))
         if not items:
             items.append(Item("(empty)", None, enabled=False))
-        items.append(Item("Open history file…", open_history_file))
+        items.append(Item("Открыть файл истории…", open_history_file))
         return pystray.Menu(*items)
 
     def vocab_submenu():
@@ -1393,29 +1419,185 @@ def main() -> int:
         labels = {"auto": "paste+clipboard", "clipboard": "clipboard", "history_only": "history"}
         return f"Text output: {labels.get(pm, pm)} (restart)"
 
-    menu = pystray.Menu(
-        Item("Открыть настройки…", open_settings_ui, default=True),
-        Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
-        Item("Меню трея (словарь…)…", show_tray_menu),
-        Item(notif_label, toggle_notifications),
-        Item(spk_label, toggle_speaker_verify),
-        Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
-        Item(paste_label, paste_mode_submenu()),
-        Item("Модель → (перезапуск)", model_submenu()),
-        Item("Транскрипция →", transcribe_backend_submenu()),
-        Item("Порог голоса →", speaker_threshold_submenu()),
-        Item("Таймаут распознавания (сек)…", edit_transcribe_timeout),
-        Item("Макс. длина записи (сек)…", edit_max_hold),
-        Item("Словарь →", vocab_submenu()),
-        Item("История →", history_submenu()),
-        Item("AI Mode →", ai_mode_submenu()),
-        Item("Whisper Cloud →", cloud_submenu()),
-        Item("Groq API →", groq_api_submenu()),
-        Item("Проверить обновления…", hotkey_check_for_updates),
-        Item("Папка логов", open_log_folder),
-        Item("Кэш моделей Hugging Face", open_hf_cache),
-        Item("Выход", on_quit),
-    )
+    def recognition_submenu():
+        return pystray.Menu(
+            Item("Порог голоса →", speaker_threshold_submenu()),
+            Item("Записать эталон голоса (~45 с)…", start_enroll_speaker),
+            Item(spk_label, toggle_speaker_verify),
+            pystray.Menu.SEPARATOR,
+            Item("Транскрипция →", transcribe_backend_submenu()),
+            Item("Словарь →", vocab_submenu()),
+            Item("AI Mode →", ai_mode_submenu()),
+            Item("Whisper Cloud →", cloud_submenu()),
+            Item("Groq API →", groq_api_submenu()),
+            Item("Режим текста →", paste_mode_submenu()),
+            Item("Макс. длина записи (сек)…", edit_max_hold),
+            Item("Таймаут распознавания (сек)…", edit_transcribe_timeout),
+            Item("Модель → (перезапуск)", model_submenu()),
+        )
+
+    def pending_submenu():
+        from whisper_pending_queue import (
+            clear_pending_transcriptions,
+            load_pending_transcriptions,
+            pending_audio_dir,
+            pending_item_menu_title,
+        )
+
+        pending = load_pending_transcriptions(limit=8)
+        total = len(load_pending_transcriptions(limit=500))
+        items: list = []
+        if pending:
+            items.append(Item(f"В очереди: {total}", None, enabled=False))
+            items.append(pystray.Menu.SEPARATOR)
+            for item in pending:
+                rid = str(item.get("id") or "")
+
+                def make_retry(r: str):
+                    def pick(icon: pystray.Icon, _it: object = None) -> None:
+                        def work() -> None:
+                            try:
+                                from whisper_hotkey_core import get_active_hotkey
+
+                                svc = get_active_hotkey()
+                                if svc is None:
+                                    raise RuntimeError("Whisper Hotkey не запущен")
+                                svc.retry_pending_transcription_by_id(r)
+                            except Exception as ex:
+                                _notify("Очередь отправки", str(ex)[:180], True, force=True)
+                            finally:
+                                icon.update_menu()
+
+                        threading.Thread(target=work, name="whisper-pending-retry", daemon=True).start()
+
+                    return pick
+
+                items.append(Item("↻ " + pending_item_menu_title(item), make_retry(rid)))
+            items.append(pystray.Menu.SEPARATOR)
+            items.append(Item("Переотправить последнюю", retry_latest_pending_menu))
+            items.append(Item("Очистить очередь", clear_pending_queue_menu))
+        else:
+            items.append(Item("(пусто)", None, enabled=False))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(Item("Открыть папку очереди…", open_pending_folder_menu))
+        return pystray.Menu(*items)
+
+    def archive_submenu():
+        from whisper_recording_archive import (
+            archive_item_menu_title,
+            load_recording_archive,
+            recording_archive_dir,
+        )
+
+        archived = load_recording_archive(limit=10)
+        items: list = []
+        if archived:
+            items.append(Item(f"Сохранено: {len(archived)} (макс. 10)", None, enabled=False))
+            items.append(pystray.Menu.SEPARATOR)
+            for item in archived:
+                rid = str(item.get("id") or "")
+
+                def make_retry(r: str):
+                    def pick(icon: pystray.Icon, _it: object = None) -> None:
+                        def work() -> None:
+                            try:
+                                from whisper_hotkey_core import get_active_hotkey
+
+                                svc = get_active_hotkey()
+                                if svc is None:
+                                    raise RuntimeError("Whisper Hotkey не запущен")
+                                svc.retry_archive_recording_by_id(r)
+                            except Exception as ex:
+                                _notify("Архив записей", str(ex)[:180], True, force=True)
+
+                        threading.Thread(target=work, name="whisper-archive-retry", daemon=True).start()
+
+                    return pick
+
+                items.append(Item("↻ " + archive_item_menu_title(item), make_retry(rid)))
+        else:
+            items.append(Item("(пусто — после записи появятся wav)", None, enabled=False))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(Item("Открыть папку архива…", open_archive_folder_menu))
+        return pystray.Menu(*items)
+
+    def open_archive_folder_menu(icon: pystray.Icon, _item: object = None) -> None:
+        from whisper_recording_archive import recording_archive_dir
+
+        d = recording_archive_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(d))  # type: ignore[attr-defined]
+
+    def retry_latest_pending_menu(icon: pystray.Icon, _item: object = None) -> None:
+        def work() -> None:
+            try:
+                from whisper_hotkey_core import get_active_hotkey
+
+                svc = get_active_hotkey()
+                if svc is None:
+                    raise RuntimeError("Whisper Hotkey не запущен")
+                svc.retry_latest_pending_transcription()
+            except Exception as ex:
+                _notify("Очередь отправки", str(ex)[:180], True, force=True)
+            finally:
+                icon.update_menu()
+
+        threading.Thread(target=work, name="whisper-pending-retry", daemon=True).start()
+
+    def clear_pending_queue_menu(icon: pystray.Icon, _item: object = None) -> None:
+        from whisper_pending_queue import clear_pending_transcriptions
+
+        clear_pending_transcriptions()
+        _notify("Whisper", "Очередь отправки очищена.", False, force=True)
+        icon.update_menu()
+
+    def open_pending_folder_menu(_icon: pystray.Icon, _item: object = None) -> None:
+        from whisper_pending_queue import pending_audio_dir
+
+        d = pending_audio_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(d))  # type: ignore[attr-defined]
+
+    def build_tray_menu():
+        from whisper_pending_queue import load_pending_transcriptions
+
+        pending_total = len(load_pending_transcriptions(limit=500))
+        items: list = [
+            Item("Открыть настройки…", open_settings_ui, default=True),
+            Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
+        ]
+        if pending_total > 0:
+            items.append(
+                Item(f"⚠ Переотправить запись ({pending_total})", retry_latest_pending_menu),
+            )
+        items.extend(
+            [
+                pystray.Menu.SEPARATOR,
+                Item("Распознавание и текст →", recognition_submenu()),
+                pystray.Menu.SEPARATOR,
+                Item("Очередь отправки →", pending_submenu()),
+                Item("Архив записей (10) →", archive_submenu()),
+                Item("История расшифровок →", history_submenu()),
+                pystray.Menu.SEPARATOR,
+                Item(notif_label, toggle_notifications),
+                Item("Проверить обновления…", hotkey_check_for_updates),
+                Item("Папка логов", open_log_folder),
+                Item("Кэш моделей Hugging Face", open_hf_cache),
+                Item("Выход", on_quit),
+            ]
+        )
+        return pystray.Menu(*items)
+
+    try:
+        menu = build_tray_menu()
+    except Exception:
+        log.exception("build_tray_menu failed — fallback menu")
+        menu = pystray.Menu(
+            Item("Открыть настройки…", open_settings_ui, default=True),
+            Item(f"Whisper Hotkey v{_ver()}", None, enabled=False),
+            Item("Ошибка меню — см. whisper_hotkey.log", None, enabled=False),
+            Item("Выход", on_quit),
+        )
 
     image = _load_tray_image()
     icon = pystray.Icon(
@@ -1426,6 +1608,14 @@ def main() -> int:
     )
 
     def on_ready(ic: pystray.Icon) -> None:
+        from whisper_hotkey_core import set_menu_refresh_callback
+
+        set_menu_refresh_callback(
+            lambda: (
+                setattr(ic, "menu", build_tray_menu()),
+                ic.update_menu(),
+            )
+        )
         try:
             ic.visible = True
             log.info("Tray icon visible=True")
