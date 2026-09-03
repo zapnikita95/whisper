@@ -390,9 +390,14 @@ async def transcribe(
                 data = data[:, 0]
 
             model = get_model()
+            try:
+                audio_sec = float(len(data)) / float(sr or 16000)
+            except Exception:
+                audio_sec = None
             transcribe_kwargs = local_transcribe_kwargs(
                 language=language,
                 initial_prompt=initial_prompt,
+                audio_sec=audio_sec,
             )
             try:
                 segments, info = model.transcribe(tmp_path, **transcribe_kwargs)

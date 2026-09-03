@@ -1388,9 +1388,11 @@ class WhisperHotkey:
             try:
                 from whisper_quality import local_transcribe_kwargs
 
+                audio_sec = float(len(audio)) / float(self.sample_rate or 16000)
                 _kwargs = local_transcribe_kwargs(
                     language=self.language,
                     initial_prompt=initial_prompt,
+                    audio_sec=audio_sec,
                 )
                 segments, info = self.model.transcribe(tmp_path, **_kwargs)
 

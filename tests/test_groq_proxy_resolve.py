@@ -109,5 +109,42 @@ class AiModeFailOpenTests(unittest.TestCase):
         self.assertEqual(ai_mode_error_toast(err), "")
 
 
+class DictationSpeedPrefsTests(unittest.TestCase):
+    def test_migrates_server_to_groq_first(self) -> None:
+        from whisper_groq import ensure_hotkey_default_prefs
+
+        prefs = {
+            "transcribe_backend": "server",
+            "groq_proxy_enabled": True,
+            "cloud_token": "wsk_test_token_for_migrate",
+            "model_key": "large-v3",
+            "notifications": True,
+            "paste_mode": "auto",
+            "ai_mode": "raw",
+            "groq_proxy_url": "https://whisper-groq-proxy-production.up.railway.app",
+        }
+        with mock.patch("whisper_groq.load_hotkey_prefs", return_value=dict(prefs)):
+            with mock.patch("whisper_groq.save_hotkey_prefs") as save:
+                with mock.patch("whisper_groq.groq_api_key_from_env", return_value=None):
+                    out = ensure_hotkey_default_prefs()
+        self.assertEqual(out["transcribe_backend"], "groq_then_server")
+        self.assertTrue(out.get("dictation_speed_v1"))
+        save.assert_called()
+
+    def test_auto_vram_prefers_groq_when_configured(self) -> None:
+        from whisper_groq import resolve_auto_vram_backend_order
+
+        with mock.patch("whisper_groq.groq_is_configured", return_value=True):
+            with mock.patch(
+                "whisper_system_profile.nvidia_vram_snapshot",
+                return_value={"vram_free_gb": 12.0},
+            ):
+                with mock.patch("whisper_groq.read_hotkey_model_key_pref", return_value="large-v3"):
+                    with mock.patch("whisper_groq.read_hotkey_auto_vram_margin_pref", return_value=0.8):
+                        order = resolve_auto_vram_backend_order("large-v3")
+        self.assertEqual(order[0], "groq")
+        self.assertIn("server", order)
+
+
 if __name__ == "__main__":
     unittest.main()

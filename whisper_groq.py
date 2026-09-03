@@ -172,24 +172,70 @@ def proxy_cold_start_delays() -> tuple[float, ...]:
     return PROXY_COLD_START_DELAYS_SEC
 
 
+def probe_proxy_alive(
+    base: str,
+    *,
+    deadline_sec: float | None = None,
+    log_info: Callable[..., None] | None = None,
+) -> bool:
+    """Hard-capped reachability check. Windows often ignores requests' connect timeout."""
+    b = (base or "").strip().rstrip("/")
+    if not b:
+        return False
+    if is_proxy_unreachable(b):
+        return False
+    cap = float(deadline_sec if deadline_sec is not None else PROXY_CONNECT_DEADLINE_SEC)
+    url = f"{b}/"
+
+    def _call() -> requests.Response:
+        return requests.get(url, timeout=(min(1.5, cap), min(2.0, cap)))
+
+    try:
+        http_call_deadline(_call, deadline_sec=cap)
+        mark_proxy_reachable(b)
+        if log_info:
+            log_info("proxy_probe ok url=%r", url[:80])
+        return True
+    except requests.RequestException as e:
+        mark_proxy_unreachable(b)
+        if log_info:
+            log_info("proxy_probe fail url=%r err=%s", url[:80], e)
+        return False
+
+
 def wake_groq_proxy_mirror(base: str, *, log_info: Callable[..., None] | None = None) -> None:
     """Warm Railway so the first dictation does not wait for a cold start."""
     b = (base or "").strip().rstrip("/")
     if not b or _is_layero_proxy(b) or is_proxy_unreachable(b):
         return
-    url = f"{b}/"
-    try:
-        requests.get(url, timeout=(4.0, 15.0))
-        mark_proxy_reachable(b)
-        if log_info:
-            log_info("proxy_wake_ping ok url=%r", url[:80])
-    except requests.ConnectTimeout as e:
-        mark_proxy_unreachable(b)
-        if log_info:
-            log_info("proxy_wake_ping timeout url=%r err=%s", url[:80], e)
-    except requests.RequestException as e:
-        if log_info:
-            log_info("proxy_wake_ping failed url=%r err=%s", url[:80], e)
+    probe_proxy_alive(b, deadline_sec=PROXY_CONNECT_DEADLINE_SEC, log_info=log_info)
+
+
+def any_live_groq_proxy(pref_stored: str | None = None) -> bool:
+    """True if at least one proxy candidate is not marked dead (and preferably probes OK)."""
+    cands = [u for u in groq_proxy_url_candidates(pref_stored) if not _is_layero_proxy(u)]
+    if not cands:
+        cands = list(groq_proxy_url_candidates(pref_stored))
+    for base in cands:
+        if is_proxy_unreachable(base):
+            continue
+        if probe_proxy_alive(base):
+            return True
+    return False
+
+
+def groq_rewrite_ready() -> bool:
+    """AI polish needs a usable path — skip dead Cloud proxies instead of hanging 30–60s."""
+    if groq_api_key_from_env() or read_hotkey_groq_api_key_pref():
+        # Direct api.groq.com from RF is usually 403; still allow BYOK if proxy is on.
+        proxy_on = resolve_groq_proxy_enabled(read_hotkey_groq_proxy_enabled_pref())
+        if not proxy_on:
+            return True
+        return any_live_groq_proxy(read_hotkey_groq_proxy_url_pref())
+    proxy_on = resolve_groq_proxy_enabled(read_hotkey_groq_proxy_enabled_pref())
+    if proxy_on is False:
+        return False
+    return any_live_groq_proxy(read_hotkey_groq_proxy_url_pref())
 
 
 def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
@@ -239,12 +285,16 @@ def groq_transcription_model_primary() -> str:
 
 
 def groq_http_timeout_tuple(*, read_cap: float = 600.0) -> tuple[float, float]:
-    """Connect / read для requests; читает те же env, что и клиенты."""
+    """Connect / read для requests; читает те же env, что и клиенты.
+
+    Connect default 12s: Railway cold-start часто >4s; короткий connect
+    ронял облако и кидал на медленный local GPU.
+    """
     try:
-        conn = float((os.environ.get("WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT") or "").strip() or "4")
+        conn = float((os.environ.get("WHISPER_MAC_TRANSCRIBE_CONNECT_TIMEOUT") or "").strip() or "12")
     except ValueError:
-        conn = 4.0
-    conn = max(2.0, min(30.0, conn))
+        conn = 12.0
+    conn = max(4.0, min(45.0, conn))
     hotkey = (os.environ.get("WHISPER_HOTKEY_TRANSCRIBE_TIMEOUT") or "").strip()
     mac = (os.environ.get("WHISPER_MAC_TRANSCRIBE_TIMEOUT") or "").strip()
     raw = hotkey or mac or "900"
@@ -339,11 +389,25 @@ def save_hotkey_prefs(data: dict) -> None:
 
 
 def ensure_hotkey_default_prefs() -> dict:
-    """Первый запуск Windows Hotkey: режим auto_vram (как удобный старт на Mac)."""
+    """Windows Hotkey: облако первым (секунды, как Cursor), GPU — запасной путь."""
     data = load_hotkey_prefs()
     changed = False
     if not isinstance(data.get("transcribe_backend"), str) or not str(data.get("transcribe_backend")).strip():
-        data["transcribe_backend"] = "auto_vram"
+        data["transcribe_backend"] = "groq_then_server"
+        changed = True
+    # One-shot: старый «только GPU» + Cloud уже настроен → иначе диктовка минутами/часами.
+    if not data.get("dictation_speed_v1"):
+        backend = str(data.get("transcribe_backend") or "").strip()
+        cloud_ready = bool(
+            (isinstance(data.get("cloud_token"), str) and data["cloud_token"].startswith("wsk_"))
+            or (isinstance(data.get("groq_api_key"), str) and data["groq_api_key"].strip())
+            or groq_api_key_from_env()
+            or data.get("groq_proxy_enabled") is not False
+        )
+        if cloud_ready and backend in ("server", "auto_vram", "server_then_groq"):
+            data["transcribe_backend"] = "groq_then_server"
+            changed = True
+        data["dictation_speed_v1"] = True
         changed = True
     if "model_key" not in data:
         data["model_key"] = "large-v3"
@@ -630,9 +694,13 @@ def resolve_auto_vram_backend_order(
     margin_gb: float | None = None,
     log_info: Callable[..., None] | None = None,
 ) -> list[str]:
-    """Перед каждой расшифровкой: достаточно свободной VRAM → локально, иначе Groq."""
+    """Диктовка: при Cloud/Groq — облако первым (секунды), GPU только запасной.
+
+    Раньше при свободной VRAM брали только local large-v3 — на длинных кусках
+    это минуты; Cursor-like UX = groq → server.
+    """
     from whisper_models import SPEC_BY_KEY
-    from whisper_system_profile import nvidia_free_vram_gb, nvidia_vram_snapshot
+    from whisper_system_profile import nvidia_vram_snapshot
 
     key = (model_key or read_hotkey_model_key_pref() or "large-v3").strip() or "large-v3"
     spec = SPEC_BY_KEY.get(key) or SPEC_BY_KEY["large-v3"]
@@ -648,7 +716,18 @@ def resolve_auto_vram_backend_order(
     needed = max(0.5, spec.min_vram_gb + margin)
     snap = nvidia_vram_snapshot()
     free = snap.get("vram_free_gb")
-    if free is not None and float(free) >= needed:
+    local_ok = free is not None and float(free) >= needed
+    if groq_is_configured():
+        if log_info:
+            log_info(
+                "auto_vram groq_then_local model=%s free=%s needed=%.2f local_ok=%s",
+                key,
+                free,
+                needed,
+                local_ok,
+            )
+        return ["groq", "server"] if local_ok else ["groq"]
+    if local_ok:
         if log_info:
             log_info(
                 "auto_vram local model=%s free=%.2f needed=%.2f",
@@ -657,15 +736,6 @@ def resolve_auto_vram_backend_order(
                 needed,
             )
         return ["server"]
-    if groq_is_configured():
-        if log_info:
-            log_info(
-                "auto_vram groq model=%s free=%s needed=%.2f",
-                key,
-                free,
-                needed,
-            )
-        return ["groq"]
     if log_info:
         log_info(
             "auto_vram fallback_local model=%s free=%s needed=%.2f groq_unconfigured",
@@ -683,7 +753,7 @@ def resolve_transcribe_backend_mode(pref: str | None, *env_names: str) -> str:
         v = (os.environ.get(name) or "").strip().lower()
         if v in ALLOWED_TRANSCRIBE_MODES:
             return v
-    return "auto_vram"
+    return "groq_then_server"
 
 
 def transcribe_backend_order(mode: str) -> list[str]:
@@ -831,7 +901,9 @@ def post_groq_audio_transcription(
     routes: list[tuple[str, dict[str, str], str | None]] = []
     seen_urls: set[str] = set()
     if proxy_enabled:
-        for base in groq_proxy_url_candidates(pref_proxy_url):
+        # Prefer working Railway/VPS; Layero often blackholes from RF — try after BYOK.
+        non_layero = [b for b in groq_proxy_url_candidates(pref_proxy_url) if not _is_layero_proxy(b)]
+        for base in non_layero:
             route_url = f"{base}/openai/v1/audio/transcriptions"
             if route_url in seen_urls:
                 continue
@@ -840,6 +912,17 @@ def post_groq_audio_transcription(
             routes.append((route_url, _build_route_headers(base), auth_key))
     if key and GROQ_TRANSCRIPTIONS_URL not in seen_urls:
         routes.append((GROQ_TRANSCRIPTIONS_URL, _build_route_headers(""), key))
+        seen_urls.add(GROQ_TRANSCRIPTIONS_URL)
+    if proxy_enabled:
+        for base in groq_proxy_url_candidates(pref_proxy_url):
+            if not _is_layero_proxy(base):
+                continue
+            route_url = f"{base}/openai/v1/audio/transcriptions"
+            if route_url in seen_urls:
+                continue
+            seen_urls.add(route_url)
+            auth_key = key if passthrough_auth else None
+            routes.append((route_url, _build_route_headers(base), auth_key))
 
     if not routes:
         raise ValueError(
@@ -934,11 +1017,17 @@ def post_groq_audio_transcription(
 
     last_detail = ""
     last_status = 0
-    conn_cap = min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC + 1.0)
-    route_timeout = (conn_cap, timeout[1])
     for url, req_headers, auth_key in routes:
         if is_proxy_unreachable(proxy_base_from_url(url)):
             continue
+        # Layero: hard-cap (Windows blackhole). Railway/direct: full STT timeout.
+        if _is_layero_proxy(url):
+            route_timeout = (
+                min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC + 1.0),
+                min(float(timeout[1]), 20.0),
+            )
+        else:
+            route_timeout = (float(timeout[0]), float(timeout[1]))
         try:
             resp: requests.Response | None = None
             for cold_try, delay in enumerate((0.0, *proxy_cold_start_delays())):

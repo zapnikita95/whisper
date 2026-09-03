@@ -51,14 +51,34 @@ def merge_initial_prompt(*parts: str | None, max_chars: int = _PROMPT_MAX_CHARS)
     return out
 
 
+def resolve_dictation_beam_size(*, audio_sec: float | None = None) -> int:
+    """Hotkey dictation: beam 1 is ~3–5× faster on GPU with near-identical quality.
+
+    Keep beam 5 for long files / server batch (explicit env wins).
+    """
+    raw = (os.environ.get("WHISPER_BEAM_SIZE") or "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), 10))
+        except ValueError:
+            pass
+    if audio_sec is not None and float(audio_sec) > 90.0:
+        return 5
+    # Default for Ctrl+Win clips: prefer latency.
+    return 1
+
+
 def local_transcribe_kwargs(
     *,
     language: str | None = None,
     initial_prompt: str | None = None,
+    audio_sec: float | None = None,
+    beam_size: int | None = None,
 ) -> dict[str, Any]:
     """Decode settings shared by Hotkey GPU and HTTP server."""
+    beam = beam_size if beam_size is not None else resolve_dictation_beam_size(audio_sec=audio_sec)
     kwargs: dict[str, Any] = {
-        "beam_size": 5,
+        "beam_size": beam,
         "temperature": 0.0,
         "condition_on_previous_text": False,
         "without_timestamps": True,
@@ -130,11 +150,33 @@ def load_whisper_model(
         raise
 
 
-def ai_rewrite_available() -> bool:
-    """LLM polish/chat/code needs Groq (direct key or Cloud proxy)."""
-    try:
-        from whisper_groq import groq_is_configured
+def strip_prompt_echo(text: str, *, prompt: str | None = None) -> str:
+    """Drop Whisper copies of the punctuation seed when there was no real speech."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    seed = PUNCTUATION_PROMPT_SEED.strip()
+    low = t.lower().strip(" .")
+    if low in {
+        seed.lower().strip(" ."),
+        "hello, this is a well-punctuated transcript",
+        "здравствуйте. это диктовка с пунктуацией: запятые, точки, вопросительные знаки? да",
+    }:
+        return ""
+    if t.startswith(seed) and len(t) <= len(seed) + 8:
+        return ""
+    if prompt:
+        p = prompt.strip()
+        if p and t == p:
+            return ""
+    return t
 
-        return bool(groq_is_configured())
+
+def ai_rewrite_available() -> bool:
+    """LLM polish/chat/code needs a live Groq path (key or reachable Cloud proxy)."""
+    try:
+        from whisper_groq import groq_rewrite_ready
+
+        return bool(groq_rewrite_ready())
     except Exception:
         return False

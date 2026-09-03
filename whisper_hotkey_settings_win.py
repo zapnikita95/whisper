@@ -12,11 +12,11 @@ _window_thread: threading.Thread | None = None
 DEFAULT_PROXY = "https://whisper-groq-proxy-production.up.railway.app"
 
 _BACKEND_SPECS = (
-    ("auto_vram", "Авто: GPU если хватает VRAM, иначе Groq"),
-    ("server", "Только локальный GPU"),
-    ("groq", "Только Groq (large v3)"),
-    ("server_then_groq", "GPU → Groq"),
-    ("groq_then_server", "Groq → GPU"),
+    ("groq_then_server", "Рекомендуется: облако → GPU (быстро, как Cursor)"),
+    ("groq", "Только облако Groq (large v3)"),
+    ("auto_vram", "Авто: облако, GPU если хватает VRAM"),
+    ("server_then_groq", "GPU → облако"),
+    ("server", "Только локальный GPU (медленно на длинных)"),
 )
 
 

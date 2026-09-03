@@ -35,12 +35,20 @@ class TranscribeKwargsTests(unittest.TestCase):
         from whisper_quality import local_transcribe_kwargs
 
         kw = local_transcribe_kwargs(language="ru", initial_prompt="Portal")
-        self.assertEqual(kw["beam_size"], 5)
+        self.assertEqual(kw["beam_size"], 1)
         self.assertEqual(kw["temperature"], 0.0)
         self.assertFalse(kw["condition_on_previous_text"])
         self.assertEqual(kw["language"], "ru")
         self.assertIn("Portal", kw["initial_prompt"])
         self.assertIn(",", kw["initial_prompt"])
+
+    def test_long_audio_keeps_beam5(self) -> None:
+        from whisper_quality import local_transcribe_kwargs
+
+        kw = local_transcribe_kwargs(audio_sec=120.0)
+        self.assertEqual(kw["beam_size"], 5)
+        kw_short = local_transcribe_kwargs(audio_sec=12.0)
+        self.assertEqual(kw_short["beam_size"], 1)
 
 
 class ComputeTypeTests(unittest.TestCase):
