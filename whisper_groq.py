@@ -211,31 +211,18 @@ def wake_groq_proxy_mirror(base: str, *, log_info: Callable[..., None] | None = 
     probe_proxy_alive(b, deadline_sec=PROXY_CONNECT_DEADLINE_SEC, log_info=log_info)
 
 
-def any_live_groq_proxy(pref_stored: str | None = None) -> bool:
-    """True if at least one proxy candidate is not marked dead (and preferably probes OK)."""
-    cands = [u for u in groq_proxy_url_candidates(pref_stored) if not _is_layero_proxy(u)]
-    if not cands:
-        cands = list(groq_proxy_url_candidates(pref_stored))
-    for base in cands:
-        if is_proxy_unreachable(base):
-            continue
-        if probe_proxy_alive(base):
-            return True
-    return False
-
-
 def groq_rewrite_ready() -> bool:
-    """AI polish needs a usable path — skip dead Cloud proxies instead of hanging 30–60s."""
-    if groq_api_key_from_env() or read_hotkey_groq_api_key_pref():
-        # Direct api.groq.com from RF is usually 403; still allow BYOK if proxy is on.
-        proxy_on = resolve_groq_proxy_enabled(read_hotkey_groq_proxy_enabled_pref())
-        if not proxy_on:
-            return True
-        return any_live_groq_proxy(read_hotkey_groq_proxy_url_pref())
+    """AI polish: skip instantly if every Cloud proxy is marked dead (no 30s Windows hang)."""
+    byok = bool(groq_api_key_from_env() or read_hotkey_groq_api_key_pref())
     proxy_on = resolve_groq_proxy_enabled(read_hotkey_groq_proxy_enabled_pref())
-    if proxy_on is False:
+    if byok and proxy_on is False:
+        return True
+    if proxy_on is False and not byok:
         return False
-    return any_live_groq_proxy(read_hotkey_groq_proxy_url_pref())
+    cands = groq_proxy_url_candidates(read_hotkey_groq_proxy_url_pref())
+    if not cands:
+        return bool(byok and proxy_on is False)
+    return any(not is_proxy_unreachable(u) for u in cands)
 
 
 def resolve_groq_proxy_secret(pref_stored: str | None = None) -> str:
@@ -961,8 +948,12 @@ def post_groq_audio_transcription(
                     timeout=req_timeout or timeout,
                 )
 
-        if _is_layero_proxy(url):
-            return http_call_deadline(_call, deadline_sec=PROXY_CONNECT_DEADLINE_SEC)
+        # Always hard-cap proxy routes: Windows often ignores requests connect timeouts.
+        use_proxy = GROQ_TRANSCRIPTIONS_URL not in url
+        to = req_timeout or timeout
+        if use_proxy or _is_layero_proxy(url):
+            cap = float(to[0]) + float(to[1])
+            return http_call_deadline(_call, deadline_sec=max(PROXY_CONNECT_DEADLINE_SEC, cap))
         return _call()
 
     def _raise_quota(resp: requests.Response) -> None:
@@ -1017,15 +1008,18 @@ def post_groq_audio_transcription(
 
     last_detail = ""
     last_status = 0
+    conn_cap = min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC + 1.0)
+    route_timeout_default = (conn_cap, min(float(timeout[1]), 90.0))
     for url, req_headers, auth_key in routes:
-        if is_proxy_unreachable(proxy_base_from_url(url)):
+        base = proxy_base_from_url(url)
+        if is_proxy_unreachable(base):
             continue
-        # Layero: hard-cap (Windows blackhole). Railway/direct: full STT timeout.
-        if _is_layero_proxy(url):
-            route_timeout = (
-                min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC + 1.0),
-                min(float(timeout[1]), 20.0),
-            )
+        if GROQ_TRANSCRIPTIONS_URL not in url:
+            if not probe_proxy_alive(base, log_info=log_error):
+                if log_error:
+                    log_error("groq_proxy_dead_skip url=%r", url[:100])
+                continue
+            route_timeout = route_timeout_default
         else:
             route_timeout = (float(timeout[0]), float(timeout[1]))
         try:

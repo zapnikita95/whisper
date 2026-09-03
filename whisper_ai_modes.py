@@ -216,6 +216,7 @@ def post_groq_chat_completion(
         is_proxy_unreachable,
         mark_proxy_reachable,
         mark_proxy_unreachable,
+        probe_proxy_alive,
         _is_layero_proxy,
         resolve_cloud_token,
         resolve_groq_api_key,
@@ -294,8 +295,12 @@ def post_groq_chat_completion(
         def _call() -> requests.Response:
             return requests.post(url_, headers=hdrs, data=json.dumps(payload), timeout=to)
 
-        if _is_layero_proxy(url_):
-            return http_call_deadline(_call, deadline_sec=PROXY_CONNECT_DEADLINE_SEC)
+        # Windows ignores soft connect timeouts to dead hosts — always hard-cap.
+        use_proxy = "api.groq.com/openai" not in (url_ or "")
+        if use_proxy or _is_layero_proxy(url_):
+            # Chat rewrite must not stall dictation; 8s total is enough when proxy is up.
+            cap = min(float(to[0]) + float(to[1]), 8.0)
+            return http_call_deadline(_call, deadline_sec=max(PROXY_CONNECT_DEADLINE_SEC, cap))
         return _call()
 
     def _retryable(status: int, detail: str) -> bool:
@@ -304,13 +309,17 @@ def post_groq_chat_completion(
     primary = str(body["model"])
     chain = [primary] + [m for m in FALLBACK_CHAT_MODELS if m != primary]
     conn_cap = min(float(timeout[0]), PROXY_CONNECT_DEADLINE_SEC)
-    read_cap = min(float(timeout[1]), 25.0)
+    read_cap = min(float(timeout[1]), 6.0)
     route_timeout = (conn_cap, read_cap)
 
     last_detail = ""
     last_status = 0
     for url, proxy_base in routes:
         if proxy_base and is_proxy_unreachable(proxy_base):
+            continue
+        if proxy_base and not probe_proxy_alive(proxy_base):
+            if log_error:
+                log_error("ai_mode_proxy_dead_skip base=%r", proxy_base[:80])
             continue
         try:
             headers = _build_headers(proxy_base)
@@ -324,7 +333,8 @@ def post_groq_chat_completion(
         try:
             resp = _post(url, headers, chain[0], route_timeout)
             if is_proxy_cold_start_response(resp.status_code, resp.text or ""):
-                time.sleep(2.0)
+                # One short retry only — no multi-minute cold-start chain after dictation.
+                time.sleep(1.0)
                 resp = _post(url, headers, chain[0], route_timeout)
             use_proxy = "api.groq.com/openai" not in url
             if use_proxy and not passthrough and resp.status_code == 401:
