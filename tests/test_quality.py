@@ -50,6 +50,16 @@ class TranscribeKwargsTests(unittest.TestCase):
         kw_short = local_transcribe_kwargs(audio_sec=12.0)
         self.assertEqual(kw_short["beam_size"], 1)
 
+    def test_strip_prompt_echo(self) -> None:
+        from whisper_quality import PUNCTUATION_PROMPT_SEED, strip_prompt_echo
+
+        self.assertEqual(strip_prompt_echo(PUNCTUATION_PROMPT_SEED), "")
+        self.assertEqual(
+            strip_prompt_echo("Hello, this is a well-punctuated transcript."),
+            "",
+        )
+        self.assertIn("привет", strip_prompt_echo("привет, как дела?").lower())
+
 
 class ComputeTypeTests(unittest.TestCase):
     def test_explicit_wins(self) -> None:

@@ -212,16 +212,23 @@ def wake_groq_proxy_mirror(base: str, *, log_info: Callable[..., None] | None = 
 
 
 def groq_rewrite_ready() -> bool:
-    """AI polish: skip instantly if every Cloud proxy is marked dead (no 30s Windows hang)."""
+    """AI polish: skip instantly if every usable Cloud proxy is marked dead.
+
+    Layero is a known Windows TCP blackhole — never treat it as a live path.
+    """
     byok = bool(groq_api_key_from_env() or read_hotkey_groq_api_key_pref())
     proxy_on = resolve_groq_proxy_enabled(read_hotkey_groq_proxy_enabled_pref())
     if byok and proxy_on is False:
         return True
     if proxy_on is False and not byok:
         return False
-    cands = groq_proxy_url_candidates(read_hotkey_groq_proxy_url_pref())
+    cands = [
+        u
+        for u in groq_proxy_url_candidates(read_hotkey_groq_proxy_url_pref())
+        if not _is_layero_proxy(u)
+    ]
     if not cands:
-        return bool(byok and proxy_on is False)
+        return False
     return any(not is_proxy_unreachable(u) for u in cands)
 
 
@@ -382,8 +389,9 @@ def ensure_hotkey_default_prefs() -> dict:
     if not isinstance(data.get("transcribe_backend"), str) or not str(data.get("transcribe_backend")).strip():
         data["transcribe_backend"] = "groq_then_server"
         changed = True
-    # One-shot: старый «только GPU» + Cloud уже настроен → иначе диктовка минутами/часами.
-    if not data.get("dictation_speed_v1"):
+    # One-shot: старый «только GPU» + Cloud → облако первым (как Cursor). Мёртвый прокси
+    # отсекается probe_proxy_alive за ~3с, дальше локальный GPU.
+    if not data.get("dictation_speed_v2"):
         backend = str(data.get("transcribe_backend") or "").strip()
         cloud_ready = bool(
             (isinstance(data.get("cloud_token"), str) and data["cloud_token"].startswith("wsk_"))
@@ -391,9 +399,10 @@ def ensure_hotkey_default_prefs() -> dict:
             or groq_api_key_from_env()
             or data.get("groq_proxy_enabled") is not False
         )
-        if cloud_ready and backend in ("server", "auto_vram", "server_then_groq"):
+        if cloud_ready and backend in ("server", "auto_vram", "server_then_groq", ""):
             data["transcribe_backend"] = "groq_then_server"
             changed = True
+        data["dictation_speed_v2"] = True
         data["dictation_speed_v1"] = True
         changed = True
     if "model_key" not in data:
@@ -512,22 +521,33 @@ def register_cloud_device(
     return out
 
 
-def fetch_cloud_me(proxy_base: str, token: str, *, timeout: float = 20.0) -> dict:
+def fetch_cloud_me(proxy_base: str, token: str, *, timeout: float = 8.0) -> dict:
     base = (proxy_base or DEFAULT_GROQ_PROXY_URL).rstrip("/")
-    r = requests.get(
-        f"{base}/v1/me",
-        headers={
-            "Accept": "application/json",
-            "X-Whisper-Cloud-Token": token,
-            "User-Agent": "WhisperClient/1.0",
-        },
-        timeout=timeout,
-    )
+    if is_proxy_unreachable(base):
+        raise RuntimeError("cloud_me_proxy_dead")
+
+    def _call() -> requests.Response:
+        return requests.get(
+            f"{base}/v1/me",
+            headers={
+                "Accept": "application/json",
+                "X-Whisper-Cloud-Token": token,
+                "User-Agent": "WhisperClient/1.0",
+            },
+            timeout=min(float(timeout), 8.0),
+        )
+
+    try:
+        r = http_call_deadline(_call, deadline_sec=min(float(timeout), PROXY_CONNECT_DEADLINE_SEC + 5.0))
+    except requests.RequestException:
+        mark_proxy_unreachable(base)
+        raise
     if r.status_code >= 400:
         raise RuntimeError(f"cloud_me_http_{r.status_code}:{(r.text or '')[:300]}")
     out = r.json()
     if not isinstance(out, dict):
         raise RuntimeError("cloud_me_bad_response")
+    mark_proxy_reachable(base)
     return out
 
 
