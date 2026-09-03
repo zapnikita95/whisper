@@ -340,15 +340,40 @@ def _stop_program_files_installer() -> None:
 
 
 def _acquire_single_instance() -> bool:
-    """Не даём двум WhisperHotkey одновременно ловить Ctrl+Win и вставлять текст дважды."""
+    """Не даём двум WhisperHotkey одновременно ловить Ctrl+Win и вставлять текст дважды.
+
+    Windows venv `Scripts\\python.exe` — stub, который сразу поднимает base python с теми же
+    argv. Mutex нельзя брать в stub-процессе (его нет в Python), но иногда оба видны в
+    Task Manager; берём mutex только в реальном интерпретаторе и пишем pid-lock на диск.
+    """
     if sys.platform != "win32":
         return True
     import ctypes
 
+    # Pid lock — переживает stub→base re-exec лучше голого mutex alone.
+    try:
+        lock_path = user_data_dir("WhisperHotkey") / "hotkey_instance.pid"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.is_file():
+            try:
+                old = int(lock_path.read_text(encoding="utf-8").strip().splitlines()[0])
+            except (OSError, ValueError):
+                old = 0
+            if old and old != os.getpid():
+                # Still alive?
+                SYNCHRONIZE = 0x00100000
+                handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, old)
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return False
+        lock_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
     kernel32 = ctypes.windll.kernel32
     ERROR_ALREADY_EXISTS = 183
     kernel32.SetLastError(0)
-    kernel32.CreateMutexW(None, True, "Local\\WhisperHotkeySingleInstance_v1")
+    kernel32.CreateMutexW(None, False, "Local\\WhisperHotkeySingleInstance_v2")
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 

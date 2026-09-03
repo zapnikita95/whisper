@@ -25,6 +25,15 @@ def _candidate_roots() -> list[Path]:
             roots.append(Path(meip))
         roots.append(exe_dir / "_internal")
         roots.append(exe_dir)
+    # When launching base pythonw + venv site-packages via PYTHONPATH / VIRTUAL_ENV
+    # (Windows venv Scripts\\pythonw.exe is a stub), site.getsitepackages() misses the venv.
+    venv = (os.environ.get("VIRTUAL_ENV") or "").strip()
+    if venv:
+        roots.append(Path(venv) / "Lib" / "site-packages")
+    for part in (os.environ.get("PYTHONPATH") or "").split(os.pathsep):
+        p = (part or "").strip()
+        if p:
+            roots.append(Path(p))
     try:
         roots.append(Path(site.getusersitepackages()))
     except Exception:
