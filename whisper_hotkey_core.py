@@ -35,13 +35,20 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from whisper_win_cuda_path import prepend_nvidia_cuda_bins_to_path
+from whisper_win_cuda_path import ensure_cuda_dlls_on_path, prepend_nvidia_cuda_bins_to_path
 from whisper_text_post import apply_spoken_punctuation, finalize_transcript
 from whisper_vocab import (
     apply_replacements as vocab_apply_replacements,
     build_initial_prompt as vocab_build_initial_prompt,
 )
 
+
+# CUDA DLL search path before any CTranslate2 load (Windows).
+if sys.platform == "win32":
+    try:
+        ensure_cuda_dlls_on_path()
+    except Exception:
+        pass
 
 log = logging.getLogger("whisper.hotkey")
 
@@ -1386,7 +1393,7 @@ class WhisperHotkey:
             sf.write(tmp_path, audio, self.sample_rate)
 
             try:
-                from whisper_quality import local_transcribe_kwargs
+                from whisper_quality import local_transcribe_kwargs, strip_prompt_echo
 
                 audio_sec = float(len(audio)) / float(self.sample_rate or 16000)
                 _kwargs = local_transcribe_kwargs(
@@ -1397,6 +1404,10 @@ class WhisperHotkey:
                 segments, info = self.model.transcribe(tmp_path, **_kwargs)
 
                 result = _join_segment_texts(segments)
+                result = strip_prompt_echo(
+                    result or "",
+                    prompt=_kwargs.get("initial_prompt"),
+                )
 
                 if info.language:
 
